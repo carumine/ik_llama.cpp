@@ -3080,6 +3080,14 @@ struct ggml_compute_state_shared {
     atomic_int current_chunk; // currently processing chunk during mul_mat, shared between all the threads
 
     enum ggml_status ec;
+
+    atomic_int z6_chunk[2]; // Z6: code dei pezzi degli esperti per nodo NUMA (GGML_Z6_NUMA_EXPERTS)
+    struct { atomic_int value; char pad[CACHE_LINE_SIZE - sizeof(atomic_int)]; } z6_local_chunk[2];
+    // Z6: coda per socket dei freddi a un token (GGML_Z6_FREDDI_CODA): lo stato nasce a zero a ogni grafo CPU
+    struct { atomic_int value; char pad[CACHE_LINE_SIZE - sizeof(atomic_int)]; } z6_coda_su[2], z6_coda_giu[2];
+    int z6_locale; // Z6: thread i in [0, n/2) sul nodo 0, gli altri sul nodo 1 (vedi z6_locale_valido)
+    // Z6: barriera gerarchica per socket (GGML_Z6_BARRIERA_SOCKET), contatori su linee di cache distinte
+    struct { atomic_int v; char pad[CACHE_LINE_SIZE - sizeof(atomic_int)]; } z6_bar_sock[2], z6_bar_glob, z6_bar_gen;
 };
 
 struct ggml_compute_state {
@@ -4713,10 +4721,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "MASK_TO_IDX",
     "LATENT_ATTN",
     "DS4_COMP",
+    "Z6_HC",
     "FMA",
 };
 
-static_assert(GGML_OP_COUNT == 112, "GGML_OP_COUNT != 112");
+static_assert(GGML_OP_COUNT == 113, "GGML_OP_COUNT != 113");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -4843,11 +4852,12 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "mask_to_idx(masl)",
     "latent_attn_prefix(q,c,pk,pv,mask)",
     "ds4_comp(state, score, idx)",
+    "z6_hc(x)",
     "c + a*b",
 
 };
 
-static_assert(GGML_OP_COUNT == 112, "GGML_OP_COUNT != 112");
+static_assert(GGML_OP_COUNT == 113, "GGML_OP_COUNT != 113");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -4962,8 +4972,43 @@ static inline void ggml_barrier_impl(struct ggml_compute_state_shared * shared) 
 }
 
 #ifdef GGML_USE_OPENMP
+// Z6 (GGML_Z6_BARRIERA_SOCKET=1, solo nel percorso locale: thread [0, n/2) sul nodo 0): ogni socket conta i suoi
+// thread su una linea di cache propria e solo l'ultimo di ciascuno tocca il contatore comune, che attraversa
+// il collegamento fra i socket una volta per lato invece che una per thread come la barriera di OpenMP.
+static bool z6_barriera_socket_attiva(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char * e = getenv("GGML_Z6_BARRIERA_SOCKET");
+        v = e && atoi(e) > 0;
+    }
+    return v;
+}
+
+static void z6_barriera_socket(struct ggml_compute_state_shared * sh) {
+    const int meta = sh->n_threads/2;
+    const int s = omp_get_thread_num() >= meta;
+    const int gen = atomic_load_explicit(&sh->z6_bar_gen.v, memory_order_acquire);
+    if (atomic_fetch_add_explicit(&sh->z6_bar_sock[s].v, 1, memory_order_acq_rel) == meta - 1) {
+        atomic_store_explicit(&sh->z6_bar_sock[s].v, 0, memory_order_relaxed);
+        if (atomic_fetch_add_explicit(&sh->z6_bar_glob.v, 1, memory_order_acq_rel) == 1) {
+            atomic_store_explicit(&sh->z6_bar_glob.v, 0, memory_order_relaxed);
+            atomic_store_explicit(&sh->z6_bar_gen.v, gen + 1, memory_order_release);
+            return;
+        }
+    }
+    while (atomic_load_explicit(&sh->z6_bar_gen.v, memory_order_acquire) == gen) {
+#if defined(__SSE3__)
+        _mm_pause();
+#endif
+    }
+}
+
 static void ggml_barrier(struct ggml_compute_state_shared * shared) {
     if (shared->n_threads == 1) {
+        return;
+    }
+    if (shared->z6_locale && z6_barriera_socket_attiva()) {
+        z6_barriera_socket(shared);
         return;
     }
     if (shared && shared->n_batch > 32) {
@@ -6678,6 +6723,19 @@ struct ggml_tensor * ggml_mul_multi_add(
     result->src[0] = a;
     result->src[1] = b;
 
+    return result;
+}
+
+struct ggml_tensor * ggml_mul_multi_add_id(
+        struct ggml_context * ctx,
+        struct ggml_tensor * a,
+        struct ggml_tensor * b,
+        struct ggml_tensor * ids) {
+    GGML_ASSERT(ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(ids->ne[0] == a->ne[1] && ids->ne[1] == a->ne[2]);
+    GGML_ASSERT(ids->nb[0] == sizeof(int32_t));
+    struct ggml_tensor * result = ggml_mul_multi_add(ctx, a, b);
+    result->src[4] = ids;
     return result;
 }
 
@@ -10792,6 +10850,123 @@ struct ggml_tensor * ggml_hc_post(
     result->op = GGML_OP_HC_POST;
 
     return result;
+}
+
+// Z6: op_params[0] = modo: 0 combine, 1 gate_sum, 2 norm, 3 gather, 4 norm/inject, 5 down/sum CPU, 6 SSM.
+static struct ggml_tensor * z6_hc_new(struct ggml_context * ctx, struct ggml_tensor * result, int modo, float p0, float p1) {
+    result->op = GGML_OP_Z6_HC;
+    result->op_params[0] = modo;
+    memcpy(&result->op_params[1], &p0, sizeof(p0));
+    memcpy(&result->op_params[2], &p1, sizeof(p1));
+    GGML_UNUSED(ctx);
+    return result;
+}
+
+struct ggml_tensor * ggml_z6_hc_combine(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * res,
+            struct ggml_tensor  * b,
+            struct ggml_tensor  * inj,
+            float                 s_in,
+            float                 s_out) {
+    GGML_ASSERT(res->type == GGML_TYPE_F32 && b->type == GGML_TYPE_F32 && inj->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(res) && ggml_is_contiguous(b) && ggml_is_contiguous(inj));
+    GGML_ASSERT(res->ne[3] == 1 && b->ne[0] == res->ne[0] && ggml_nelements(b) == res->ne[0]*res->ne[2]);
+    GGML_ASSERT(ggml_nelements(inj) == res->ne[1]*res->ne[2]);
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, res);
+    result->src[0] = res;
+    result->src[1] = b;
+    result->src[2] = inj;
+    return z6_hc_new(ctx, result, 0, s_in, s_out);
+}
+
+struct ggml_tensor * ggml_z6_hc_gate_sum(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * up,
+            struct ggml_tensor  * xn,
+            int                   H,
+            float                 scale) {
+    GGML_ASSERT(up->type == GGML_TYPE_F32 && xn->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(up) && ggml_is_contiguous(xn) && ggml_are_same_shape(up, xn));
+    GGML_ASSERT(H > 0 && up->ne[0] % H == 0 && up->ne[2] == 1 && up->ne[3] == 1);
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, up->ne[0]/H, up->ne[1]);
+    result->src[0] = up;
+    result->src[1] = xn;
+    result->op_params[3] = H;
+    return z6_hc_new(ctx, result, 1, scale, 0.0f);
+}
+
+struct ggml_tensor * ggml_z6_hc_norm(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * w,
+            float                 eps) {
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && w->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(x) && ggml_is_contiguous(w) && x->ne[3] == 1);
+    GGML_ASSERT(ggml_nelements(w) == x->ne[0]*x->ne[1]);
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, x->ne[0]*x->ne[1], x->ne[2]);
+    result->src[0] = x;
+    result->src[1] = w;
+    return z6_hc_new(ctx, result, 2, eps, 0.0f);
+}
+
+struct ggml_tensor * ggml_z6_hc_norm_inject(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * w,
+            struct ggml_tensor  * w_inject,
+            float                 eps) {
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && w->type == GGML_TYPE_F32 && w_inject->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(x) && ggml_is_contiguous(w) && ggml_is_contiguous(w_inject));
+    GGML_ASSERT(x->ne[1] == 4 && x->ne[2] == 1 && x->ne[3] == 1 && x->ne[0] % 256 == 0);
+    const int64_t n = x->ne[0]*x->ne[1];
+    GGML_ASSERT(ggml_nelements(w) == n && w_inject->ne[0] == n && w_inject->ne[1] == 4 && ggml_nrows(w_inject) == 4);
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n + 4);
+    result->src[0] = x;
+    result->src[1] = w;
+    result->src[2] = w_inject;
+    return z6_hc_new(ctx, result, 4, eps, 0.0f);
+}
+
+struct ggml_tensor * ggml_z6_ssm_silu_norm(
+            struct ggml_context * ctx, struct ggml_tensor * x, int key_dim, int head_dim, float eps) {
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && ggml_is_contiguous(x) && ggml_nrows(x) == 1);
+    GGML_ASSERT(head_dim > 0 && head_dim <= 256 && head_dim % 32 == 0 && key_dim % head_dim == 0);
+    GGML_ASSERT(x->ne[0] >= 2*key_dim && x->ne[0] % head_dim == 0);
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, x);
+    result->src[0] = x;
+    result->op_params[3] = key_dim;
+    result->op_params[4] = head_dim;
+    return z6_hc_new(ctx, result, 6, eps, 0.0f);
+}
+
+struct ggml_tensor * ggml_z6_moe_down_sum(
+            struct ggml_context * ctx, struct ggml_tensor * experts, struct ggml_tensor * x,
+            struct ggml_tensor * ids, struct ggml_tensor * weights) {
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && ids->type == GGML_TYPE_I32 && weights->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(experts) && ggml_is_contiguous(x) && ggml_is_contiguous(ids) && ggml_is_contiguous(weights));
+    GGML_ASSERT(experts->ne[0] == x->ne[0] && ids->ne[1] == 1 && x->ne[2] == 1 && x->ne[3] == 1);
+    GGML_ASSERT(x->ne[1] == ids->ne[0] && ggml_nelements(weights) == ids->ne[0]);
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, experts->ne[1], 1);
+    result->src[0] = experts;
+    result->src[1] = x;
+    result->src[2] = ids;
+    result->src[3] = weights;
+    return z6_hc_new(ctx, result, 5, 0.0f, 0.0f);
+}
+
+struct ggml_tensor * ggml_z6_gather_f16(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * cache,
+            struct ggml_tensor  * idx,
+            int64_t               ne0,
+            int64_t               ne1) {
+    GGML_ASSERT(cache->type == GGML_TYPE_Q8_0 && idx->type == GGML_TYPE_I32 && ggml_is_contiguous(idx));
+    GGML_ASSERT((ne0*ne1) % ggml_blck_size(cache->type) == 0);
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, ne0, ne1, ggml_nelements(idx));
+    result->src[0] = cache;
+    result->src[1] = idx;
+    return z6_hc_new(ctx, result, 3, 0.0f, 0.0f);
 }
 
 struct ggml_tensor * ggml_mask_to_index(
@@ -18824,6 +18999,448 @@ static int ggml_compute_forward_mul_mat(
 
 // ggml_compute_forward_mul_mat_id
 
+// Z6: esperti MoE divisi fra i due nodi NUMA (GGML_Z6_NUMA_EXPERTS=1). Gli esperti [0, k) stanno
+// nella RAM del nodo 0, [k, n) in quella del nodo 1 (k = GGML_Z6_NUMA_SPLIT * n, default metà); ogni thread calcola prima gli esperti del
+// proprio nodo e poi ruba dall'altra coda. I thread vanno legati ai core (--cpu-range).
+#if defined(__gnu_linux__)
+#include <sys/syscall.h>
+#endif
+
+static bool z6_numa_experts(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char * e = getenv("GGML_Z6_NUMA_EXPERTS");
+        v = e && atoi(e) > 0;
+    }
+    return v;
+}
+
+static int z6_thread_node(void) {
+#if defined(__gnu_linux__)
+    unsigned cpu = 0, node = 0;
+    if (syscall(SYS_getcpu, &cpu, &node, NULL) == 0 && node < 2) return (int) node;
+#endif
+    return 0;
+}
+
+// GGML_Z6_NUMA_SPLIT: quota degli esperti sul nodo 0 (default 0.5), per un nodo 1 con poca RAM
+static int z6_split(int n_as) {
+    static float f = -1.0f;
+    if (f < 0.0f) {
+        const char * e = getenv("GGML_Z6_NUMA_SPLIT");
+        f = e ? (float) atof(e) : 0.5f;
+        if (f < 0.0f || f > 1.0f) f = 0.5f;
+    }
+    return (int) (f * n_as + 0.5f);
+}
+
+static inline int z6_expert_node(int a, int n_as) { return a >= z6_split(n_as); }
+
+// GGML_Z6_NUMA_STEAL=0: un thread non prende pezzi dell'altro nodo (letture remote lente = ritardatari)
+static int z6_giri(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char * e = getenv("GGML_Z6_NUMA_STEAL");
+        v = (e && atoi(e) == 0) ? 1 : 2;
+    }
+    return v;
+}
+
+// Initialize once before entering OpenMP; no getenv/string scan in the chunk loop.
+static struct { bool queue, affinity, barrier, pinned, rows, batch_quant; int chunks, unit, batch_chunks; } z6_options;
+static atomic_int z6_options_ready = 0;
+
+static bool z6_env_on(const char * key) {
+    const char * e = getenv(key);
+    return e && atoi(e) > 0;
+}
+
+static void z6_options_init(void) {
+    if (atomic_load_explicit(&z6_options_ready, memory_order_acquire) == 2) return;
+    int expected = 0;
+    if (atomic_compare_exchange_strong(&z6_options_ready, &expected, 1)) {
+        z6_options.queue = z6_env_on("GGML_Z6_NUMA_QUEUE");
+        z6_options.affinity = z6_env_on("GGML_Z6_NUMA_AFFINITY");
+        z6_options.barrier = z6_env_on("GGML_Z6_NUMA_BARRIER");
+        z6_options.pinned = z6_env_on("GGML_Z6_NUMA_PINNED");
+        z6_options.rows = z6_env_on("GGML_Z6_NUMA_ROWS");
+        z6_options.batch_quant = z6_env_on("GGML_Z6_BATCH_QUANT");
+        const char * batch_chunks = getenv("GGML_Z6_BATCH_CHUNKS");
+        z6_options.batch_chunks = batch_chunks ? MAX(0, MIN(4096, atoi(batch_chunks))) : 0;
+        const char * unit = getenv("GGML_Z6_NUMA_UNIT"); // righe per unità di lavoro: 16 (default), 8, 4
+        z6_options.unit = unit && (atoi(unit) == 8 || atoi(unit) == 4) ? atoi(unit) : 16;
+        const char * chunks = getenv("GGML_Z6_NUMA_CHUNKS");
+        z6_options.chunks = chunks ? atoi(chunks) : 0;
+        atomic_store_explicit(&z6_options_ready, 2, memory_order_release);
+    } else {
+        while (atomic_load_explicit(&z6_options_ready, memory_order_acquire) != 2) sched_yield();
+    }
+}
+
+// Opt-in: separate queue counters onto distinct cache lines. With stealing off,
+// adjacent counters otherwise still bounce the same line between sockets.
+static atomic_int * z6_queue(struct ggml_compute_state_shared * shared, int node) {
+    return z6_options.queue ? &shared->z6_local_chunk[node].value : &shared->z6_chunk[node];
+}
+
+static int z6_chunks(int nth, int rows) {
+    const int requested = z6_options.chunks;
+    return MAX(1, MIN(requested > 0 && z6_numa_experts() ? MIN(requested, nth) : nth, rows / 32));
+}
+
+// GGML_Z6_NUMA_ROWS=1: ogni esperto è diviso per righe, [0, r) sul nodo 0 e [r, ne01) sul nodo 1.
+// Ogni socket ha la stessa quota di lavoro per qualunque scelta del router (con la divisione per
+// esperti un token con 7 esperti su un nodo e 3 sull'altro lascia un socket ad aspettare).
+// r è multiplo di 32 righe, per i blocchi di righe dei kernel iqk.
+static int z6_row_split(int64_t rows) {
+    const int64_t r = (int64_t) ((float) z6_split(1000) / 1000.0f * rows / 32.0f + 0.5f) * 32;
+    return (int) MAX(MIN(r, rows - 32), 32);
+}
+
+#if defined(__gnu_linux__)
+static bool z6_mbind(const struct ggml_tensor * t, uintptr_t a, uintptr_t b, int nodo) {
+    if (b <= a) return true;
+    unsigned long maschera = 1UL << nodo;
+    // MPOL_BIND=2, MPOL_MF_STRICT|MPOL_MF_MOVE=3: fail rather than silently pin remote pages.
+    if (syscall(SYS_mbind, (void *) a, (unsigned long) (b - a), 2, &maschera, 64, 3) != 0) {
+        fprintf(stderr, "z6: mbind %s nodo %d fallito (%s)\n", t->name, nodo, strerror(errno));
+        return false;
+    }
+    return true;
+}
+#endif
+
+// Establish policy before load; MPOL_MF_MOVE also supports already resident weights.
+bool ggml_z6_numa_place_tensor(const struct ggml_tensor * t) {
+#if defined(__gnu_linux__)
+    if (!z6_numa_experts() || !t || !t->data || t->ne[2] < 2) return true;
+    z6_options_init();
+    const uintptr_t pagina = (uintptr_t) sysconf(_SC_PAGESIZE);
+    const int n_as = (int) t->ne[2];
+    if (z6_options.rows && t->ne[1] >= 64) {
+        // Confini arrotondati alla pagina più vicina: al più mezza pagina per confine resta remota.
+        const int r = z6_row_split(t->ne[1]);
+        const uintptr_t base = (uintptr_t) t->data;
+        const uintptr_t fine = base + (uintptr_t) n_as * t->nb[2];
+        uintptr_t prima = (base + pagina - 1) & ~(pagina - 1);
+        for (int a = 0; a < n_as; ++a) {
+            uintptr_t taglio = base + (uintptr_t) a * t->nb[2] + (uintptr_t) r * t->nb[1];
+            uintptr_t dopo = a + 1 < n_as ? base + (uintptr_t) (a + 1) * t->nb[2] : fine;
+            taglio = (taglio + pagina / 2) & ~(pagina - 1);
+            dopo = a + 1 < n_as ? (dopo + pagina / 2) & ~(pagina - 1) : dopo & ~(pagina - 1);
+            if (!z6_mbind(t, prima, taglio, 0) || !z6_mbind(t, taglio, dopo, 1)) return false;
+            prima = dopo;
+        }
+        fprintf(stderr, "z6 numa: %s rows=%d/%d range=%p-%p before pin\n",
+                t->name, r, (int) t->ne[1], (void *) base, (void *) fine);
+        return true;
+    }
+    for (int nodo = 0; nodo < 2; ++nodo) {
+        const int k = z6_split(n_as);
+        uintptr_t a = (uintptr_t) t->data + (uintptr_t) (nodo ? k : 0) * t->nb[2];
+        uintptr_t b = (uintptr_t) t->data + (uintptr_t) (nodo ? n_as : k) * t->nb[2];
+        a = (a + pagina - 1) & ~(pagina - 1);
+        b &= ~(pagina - 1);
+        if (b <= a) continue;
+        unsigned long maschera = 1UL << nodo;
+        // MPOL_BIND=2, MPOL_MF_STRICT|MPOL_MF_MOVE=3: fail rather than silently pin remote pages.
+        if (syscall(SYS_mbind, (void *) a, (unsigned long) (b - a), 2, &maschera, 64, 3) != 0) {
+            fprintf(stderr, "z6: mbind %s nodo %d fallito (%s)\n", t->name, nodo, strerror(errno));
+            return false;
+        }
+        fprintf(stderr, "z6 numa: %s node=%d range=%p-%p bytes=%zu before pin\n",
+                t->name, nodo, (void *) a, (void *) b, (size_t) (b-a));
+    }
+#else
+    (void) t;
+#endif
+    return true;
+}
+
+// Legacy non-pinned experiments place lazily. Pinned weights were placed by the loader.
+static void z6_place_experts(const struct ggml_tensor * t) {
+    if (z6_options.pinned) return;
+    static const void * fatti[2048];
+    static int n_fatti = 0;
+    if (!t || !t->data || t->ne[2] < 2) return;
+    for (int i = 0; i < n_fatti; ++i) if (fatti[i] == t->data) return;
+    if (ggml_z6_numa_place_tensor(t) && n_fatti < 2048) fatti[n_fatti++] = t->data;
+}
+
+// Pezzi della coda q (0 o 1) per gli esperti attivi: in att[q] gli indici, restituisce quanti
+static int z6_esperti_attivi(const int64_t * conteggi, int n_as, int q, int * att) {
+    int n = 0;
+    for (int a = 0; a < n_as; ++a) {
+        if (conteggi[a] > 0 && (z6_options.rows || z6_expert_node(a, n_as) == q)) att[n++] = a;
+    }
+    return n;
+}
+
+// Divisione per righe: il nodo q calcola le righe [*lo, *hi) di ogni esperto attivo. Il lavoro è
+// in unità da 16 righe (il blocco più grande dei tipi iqk) messe in fila su tutti gli esperti: ogni
+// thread del socket prende con un solo fetch_add una parte uguale, che può attraversare più esperti.
+static int z6_row_range(int64_t rows, int q, int nth, int * lo, int * hi) {
+    const int r = z6_row_split(rows);
+    *lo = q ? r : 0;
+    *hi = q ? (int) rows : r;
+    return MAX(1, z6_options.chunks > 0 ? z6_options.chunks : nth / 2);
+}
+
+// Parte c di n: segmenti (esperto, prima riga, righe) in seg, restituisce quanti
+struct z6_seg { int a, r, n; };
+// unit: 16 righe in generale; più piccola solo con un token (nessuna conversione a blocchi da 16)
+static int z6_row_part(const int * att, int n_att, int lo, int hi, int c, int n, int unit, struct z6_seg * seg) {
+    const int per = (hi - lo) / unit;
+    const int totale = n_att * per;
+    int u = (int) ((int64_t) totale * c / n);
+    const int fine = (int) ((int64_t) totale * (c + 1) / n);
+    int k = 0;
+    while (u < fine) {
+        const int e = u / per, dentro = u % per;
+        const int quante = MIN(per - dentro, fine - u);
+        int righe = quante * unit;
+        // le righe oltre l'ultima unità intera vanno all'ultima parte di quell'esperto
+        if (dentro + quante == per) righe += (hi - lo) - per * unit;
+        seg[k++] = (struct z6_seg) { att[e], lo + dentro * unit, righe };
+        u += quante;
+    }
+    return k;
+}
+
+// Z6 (GGML_Z6_NUMA_ROWS, un token o pochi): ogni thread converte da sé l'ingresso e conta gli esperti
+// in un buffer suo, poi calcola una parte fissa delle righe del proprio nodo. Niente barriera interna
+// all'operazione e niente contatori condivisi fra socket. Vale solo se tutti i thread sono legati
+// in ordine ai nodi (z6_locale_valido), deciso una volta per chiamata e uguale per tutti.
+struct z6_mmid { int32_t i1, i2; };
+
+static int z6_cpu_node(int cpu) {
+    static int nodi[1024];
+    static atomic_int pronto = 0;
+    if (atomic_load_explicit(&pronto, memory_order_acquire) == 0) {
+        for (int c = 0; c < 1024; ++c) {
+            nodi[c] = -1;
+            for (int n = 0; n < 2; ++n) {
+                char path[96];
+                snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/node%d", c, n);
+                if (access(path, F_OK) == 0) { nodi[c] = n; break; }
+            }
+        }
+        atomic_store_explicit(&pronto, 1, memory_order_release);
+    }
+    return cpu >= 0 && cpu < 1024 ? nodi[cpu] : -1;
+}
+
+static int z6_locale_valido(const struct ggml_cplan * cplan, int nth) {
+    if (!z6_options.rows || !z6_numa_experts() || !z6_options.affinity || nth < 2 || nth % 2) return 0;
+    if (!cplan->cpu_affinity || cplan->n_cpu_affinity < nth) return 0;
+    for (int i = 0; i < nth; ++i) {
+        if (z6_cpu_node(cplan->cpu_affinity[i]) != (i >= nth / 2)) return 0;
+    }
+    return 1;
+}
+
+static bool z6_prepara_locale(const struct ggml_compute_params * params, const struct ggml_tensor * src1,
+        const struct ggml_tensor * ids, enum ggml_type vec_dot_type, int n_as,
+        const char ** B, int64_t ** conteggi, struct z6_mmid ** righe) {
+    if (!params->shared->z6_locale || ids->ne[1] > 8 || src1->ne[3] != 1 || n_as > 512) return false;
+    const int64_t ne10 = src1->ne[0], ne11 = src1->ne[1], ne12 = src1->ne[2];
+    const size_t nbw1 = ggml_row_size(vec_dot_type, ne10);
+    const size_t conv = src1->type == vec_dot_type ? 0 : GGML_PAD(nbw1*ne11*ne12, 64);
+    const size_t serve = conv + n_as*sizeof(int64_t) + (size_t) n_as*ne12*sizeof(struct z6_mmid);
+    static __thread char * buf = NULL;
+    static __thread size_t cap = 0;
+    if (serve > cap) {
+        free(buf);
+        buf = malloc(serve);
+        GGML_ASSERT(buf);
+        cap = serve;
+    }
+    GGML_ASSERT(!conv || src1->type == GGML_TYPE_F32);
+    *B = conv ? buf : (const char *) src1->data;
+    int64_t * cnt = (int64_t *) (buf + conv);
+    struct z6_mmid * map = (struct z6_mmid *) (cnt + n_as);
+    memset(cnt, 0, n_as*sizeof(int64_t));
+    const int n_ids = (int) ids->ne[0];
+    for (int64_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
+        for (int id = 0; id < n_ids; ++id) {
+            const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
+            if (i02 < 0 || i02 >= n_as) continue;
+            map[i02*ne12 + cnt[i02]] = (struct z6_mmid) { id, (int32_t) iid1 };
+            cnt[i02] += 1;
+        }
+    }
+    *conteggi = cnt;
+    *righe = map;
+    return true;
+}
+
+// Converte solo le righe dell'ingresso usate dagli esperti dei segmenti di questo thread: per il down
+// sono 1-2 dei 10 vettori intermedi (convertirli tutti in ogni thread costava circa l'11% del calcolo)
+static void z6_converti_righe(const struct ggml_tensor * src1, enum ggml_type vec_dot_type, const char * B,
+        const int64_t * cnt, const struct z6_mmid * map, const struct z6_seg * seg, int k, char * fatta) {
+    if (src1->type == vec_dot_type) return;
+    const int64_t ne10 = src1->ne[0], ne11 = src1->ne[1], ne12 = src1->ne[2];
+    const size_t nbw1 = ggml_row_size(vec_dot_type, ne10);
+    ggml_from_float_t const from_float = type_traits[vec_dot_type].from_float;
+    GGML_ASSERT(ne11*ne12 <= 512);
+    for (int i = 0; i < k; ++i) {
+        if (i > 0 && seg[i].a == seg[i-1].a) continue;
+        const int a = seg[i].a;
+        for (int64_t j = 0; j < cnt[a]; ++j) {
+            const struct z6_mmid m = map[a*ne12 + j];
+            const int64_t i11 = m.i1 % ne11, i12 = m.i2, riga = i11 + i12*ne11;
+            if (fatta[riga]) continue;
+            fatta[riga] = 1;
+            from_float((const float *)((const char *) src1->data + i12*src1->nb[2] + i11*src1->nb[1]),
+                       (char *) B + riga*nbw1, ne10);
+        }
+    }
+}
+
+// GGML_Z6_FREDDI_CODA=<parti per thread>: con un token i thread dello stesso socket prendono le parti da una coda
+// invece di avere ciascuno la sua: chi finisce prima continua. Ogni riga resta nella sua posizione: stessi numeri.
+static int z6_freddi_coda(void) {
+    static int v = -1;
+    if (v < 0) { const char * e = getenv("GGML_Z6_FREDDI_CODA"); v = e ? atoi(e) : 0; }
+    return v;
+}
+// GGML_Z6_PRINCIPALE_LIBERO=1, con la coda: il thread principale non calcola i freddi, così niente licenza AVX-512
+// sul suo core e lanci GPU, ingressi e campionamento più veloci. Il calcolo è limitato dalla banda RAM, non dai core.
+static int z6_principale_libero(int ith) {
+    static int v = -1;
+    if (v < 0) { const char * e = getenv("GGML_Z6_PRINCIPALE_LIBERO"); v = e ? atoi(e) > 0 : 0; }
+    return v && ith == 0;
+}
+
+// Medium prompts use the shared queue, not the <=8-token local path.
+// Flatten all input rows so ne11=1 (up/gate) does not serialize quantization.
+static bool z6_batch_medio(const struct ggml_tensor * ids) {
+    return ids->ne[1] > 32 && ids->ne[1] <= 2048;
+}
+
+static void z6_batch_converti(const struct ggml_compute_params * params, const struct ggml_tensor * src,
+        enum ggml_type type) {
+    const size_t row_size = ggml_row_size(type, src->ne[0]);
+    ggml_from_float_t const convert = type_traits[type].from_float;
+    for (int64_t row = params->ith; row < ggml_nrows(src); row += params->nth) {
+        const int64_t i1 = row % src->ne[1];
+        const int64_t i2 = row / src->ne[1] % src->ne[2];
+        const int64_t i3 = row / (src->ne[1]*src->ne[2]);
+        convert((const float *) ((const char *) src->data + i1*src->nb[1] + i2*src->nb[2] + i3*src->nb[3]),
+                (char *) params->wdata + row*row_size, src->ne[0]);
+    }
+}
+
+// Z6 (GGML_Z6_PRELEGGI=<thread per socket>): prelettura dei pesi dei freddi nei fratelli HT dei core, mentre la CPU
+// aspetta la densa. Finiti i freddi del livello L, i thread leggono in cache gli esperti scelti al token precedente per
+// il livello L+1: il 40% circa si ripete. Tocca solo la cache, non i numeri.
+#define Z6_PRE_LIVELLI 128
+static struct z6_pre_livello {
+    const char * base[3];
+    size_t passo[3], riga[3];
+    int righe[3], n, att[16];
+} z6_pre[Z6_PRE_LIVELLI];
+static atomic_int z6_pre_gen = 0;  // dispari: prelettura in corso
+static atomic_int z6_pre_liv = 0;
+static struct { int n, att[16]; } z6_scelti[Z6_PRE_LIVELLI];
+int ggml_z6_freddi_scelti(int il, int * out, int max) {
+    if (il < 0 || il >= Z6_PRE_LIVELLI) return 0;
+    const int n = MIN(z6_scelti[il].n, max);
+    memcpy(out, z6_scelti[il].att, n * sizeof(int));
+    z6_scelti[il].n = 0;
+    return n;
+}
+static int z6_dinamici(void) {
+    static int v = -1;
+    if (v < 0) { const char * e = getenv("GGML_Z6_CALDI_DINAMICI"); v = e ? atoi(e) : 0; }
+    return v;
+}
+static int z6_pre_thread(void) {
+    static int v = -1;
+    if (v < 0) { const char * e = getenv("GGML_Z6_PRELEGGI"); v = e ? atoi(e) : 0; }
+    return v;
+}
+static void z6_pre_ferma(void) {
+    if (atomic_load_explicit(&z6_pre_gen, memory_order_relaxed) & 1) atomic_fetch_add(&z6_pre_gen, 1);
+}
+static void * z6_pre_lavoro(void * arg) {
+    const int id = (int) (intptr_t) arg, n = z6_pre_thread(), q = id >= n, loc = id % n;
+    // fratello HT degli ultimi core di ogni socket: i core 0-39 fanno i conti
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    CPU_SET(q ? 80 - n + loc : 60 - n + loc, &set);
+    pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+    int visto = 0;
+    for (;;) {
+        const int g = atomic_load_explicit(&z6_pre_gen, memory_order_acquire);
+        if (g == visto || !(g & 1)) { __builtin_ia32_pause(); continue; }
+        visto = g;
+        const struct z6_pre_livello * l = &z6_pre[atomic_load_explicit(&z6_pre_liv, memory_order_relaxed)];
+        for (int e = 0; e < l->n; ++e) {
+            for (int w = 0; w < 3; ++w) {
+                if (!l->base[w]) continue;
+                const int r = z6_row_split(l->righe[w]);
+                const int lo = q ? r : 0, hi = q ? l->righe[w] : r;
+                const int a = lo + (int) ((int64_t) (hi - lo) * loc / n), b = lo + (int) ((int64_t) (hi - lo) * (loc + 1) / n);
+                const char * p = l->base[w] + l->att[e] * l->passo[w] + a * l->riga[w];
+                const char * fine = l->base[w] + l->att[e] * l->passo[w] + b * l->riga[w];
+                for (int c = 0; p < fine; p += 64, ++c) {
+                    __builtin_prefetch(p, 0, 2);
+                    if ((c & 255) == 255 && atomic_load_explicit(&z6_pre_gen, memory_order_relaxed) != g) goto prossimo;
+                }
+            }
+        }
+prossimo:;
+    }
+    return NULL;
+}
+static void z6_pre_avvia_thread(void) {
+    static int fatto = 0;
+    if (fatto) return;
+    fatto = 1;
+    for (int i = 0; i < 2 * z6_pre_thread(); ++i) {
+        pthread_t t;
+        if (pthread_create(&t, NULL, z6_pre_lavoro, (void *) (intptr_t) i) == 0) pthread_detach(t);
+    }
+}
+static int z6_pre_indice(const struct ggml_tensor * w) {
+    int l = -1;
+    return sscanf(w->name, "blk.%d.", &l) == 1 && l >= 0 && l < Z6_PRE_LIVELLI ? l : -1;
+}
+static void z6_registra_scelti(const struct ggml_tensor * up, const int64_t * cnt, int n_as) {
+    const int i = z6_pre_indice(up);
+    if (i < 0) return;
+    int n = 0;
+    for (int a = 0; a < n_as && n < 16; ++a) if (cnt[a] > 0) z6_scelti[i].att[n++] = a;
+    z6_scelti[i].n = n;
+}
+// inizio dei freddi del livello: ferma la prelettura e registra le scelte di questo token
+static void z6_pre_su(const struct ggml_tensor * up, const struct ggml_tensor * gate, const int64_t * cnt, int n_as) {
+    z6_pre_ferma();
+    z6_pre_avvia_thread();
+    const int i = z6_pre_indice(up);
+    if (i < 0) return;
+    struct z6_pre_livello * l = &z6_pre[i];
+    const struct ggml_tensor * ws[2] = { up, gate };
+    for (int w = 0; w < 2; ++w) {
+        l->base[w] = ws[w] ? (const char *) ws[w]->data : NULL;
+        if (ws[w]) { l->passo[w] = ws[w]->nb[2]; l->riga[w] = ws[w]->nb[1]; l->righe[w] = (int) ws[w]->ne[1]; }
+    }
+    int n = 0;
+    for (int a = 0; a < n_as && n < 16; ++a) if (cnt[a] > 0) l->att[n++] = a;
+    l->n = n;
+}
+// fine dei freddi del livello: registra il down e parte la prelettura del livello dopo
+static void z6_pre_giu(const struct ggml_tensor * down) {
+    const int i = z6_pre_indice(down);
+    if (i < 0) return;
+    struct z6_pre_livello * l = &z6_pre[i];
+    l->base[2] = (const char *) down->data; l->passo[2] = down->nb[2]; l->riga[2] = down->nb[1]; l->righe[2] = (int) down->ne[1];
+    const int prossimo = i + 1 < Z6_PRE_LIVELLI && z6_pre[i + 1].n > 0 ? i + 1 : 0;
+    atomic_store_explicit(&z6_pre_liv, prossimo, memory_order_relaxed);
+    if (!(atomic_load_explicit(&z6_pre_gen, memory_order_relaxed) & 1)) atomic_fetch_add(&z6_pre_gen, 1);
+}
+
 static void ggml_compute_forward_mul_mat_id(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst) {
@@ -18866,6 +19483,43 @@ static void ggml_compute_forward_mul_mat_id(
         ggml_moe_prefetch_kernel_hook(dst, ith);
     }
 
+#if GGML_USE_IQK_MULMAT && defined GGML_EXPERT_CHUNKING
+    {
+        const char * B; int64_t * cnt; struct z6_mmid * map;
+        if (ne13 == 1 && dst->type == GGML_TYPE_F32 && ne01 >= 64 &&
+            z6_prepara_locale(params, src1, ids, vec_dot_type, n_as, &B, &cnt, &map)) {
+            int att[512];
+            const int mio = ith >= nth / 2, loc = ith % (nth / 2);
+            int lo, hi;
+            z6_row_range(ne01, mio, nth, &lo, &hi);
+            const int n_att = z6_esperti_attivi(cnt, n_as, mio, att);
+            struct z6_seg seg[512];
+            const int coda = ids->ne[1] == 1 ? z6_freddi_coda() : 0, parti = coda ? coda * (nth / 2) : nth / 2;
+            char fatta[512] = {0};
+            if (coda && z6_principale_libero(ith)) {
+                if (ids->ne[1] == 1 && z6_pre_thread() > 0) z6_pre_giu(src0);
+                return;
+            }
+            for (int c = coda ? atomic_fetch_add_explicit(&params->shared->z6_coda_giu[mio].value, 1, memory_order_relaxed) : loc;
+                 c < parti;
+                 c = coda ? atomic_fetch_add_explicit(&params->shared->z6_coda_giu[mio].value, 1, memory_order_relaxed) : parti) {
+            const int k = z6_row_part(att, n_att, lo, hi, c, parti, ids->ne[1] == 1 ? z6_options.unit : 16, seg);
+            z6_converti_righe(src1, vec_dot_type, B, cnt, map, seg, k, fatta);
+            for (int i = 0; i < k; ++i) {
+                const int cur_a = seg[i].a;
+                if (!iqk_mul_mat_moe(seg[i].n, cnt[cur_a], ne00, ne11,
+                            src0->type, (const char *) src0->data + cur_a*nb02 + seg[i].r*nb01, nb01,
+                            vec_dot_type, B, ggml_row_size(vec_dot_type, ne10),
+                            (float *)dst->data + seg[i].r, nb1, nb2,
+                            map + cur_a*ne12, 0, 1)) GGML_ABORT("z6: iqk_mul_mat_moe non disponibile");
+            }
+            }
+            if (ith == 0 && ids->ne[1] == 1 && z6_pre_thread() > 0) z6_pre_giu(src0);
+            return;
+        }
+    }
+#endif
+
     char * wdata_src1_end = (src1->type == vec_dot_type) ?
             (char *) params->wdata :
             (char *) params->wdata + GGML_PAD(ggml_row_size(vec_dot_type, src1->ne[0])*ggml_nrows(src1), sizeof(int64_t));
@@ -18892,8 +19546,9 @@ static void ggml_compute_forward_mul_mat_id(
         const int64_t dr1  = (nr1 + nth - 1)/nth;
         const int64_t ir10 = dr1*ith;
         const int64_t ir11 = MIN(ir10 + dr1, nr1);
-
-        for (int64_t ir1 = ir10; ir1 < ir11; ++ir1) {
+        if (z6_options.batch_quant && z6_batch_medio(ids)) {
+            z6_batch_converti(params, src1, vec_dot_type);
+        } else for (int64_t ir1 = ir10; ir1 < ir11; ++ir1) {
             const int64_t i13 = ir1/(ne11*ne12);
             const int64_t i12 = (ir1 - i13*ne11*ne12)/ne11;
             const int64_t i11 = ir1 - i13*ne11*ne12 - i12*ne11;
@@ -18937,6 +19592,11 @@ static void ggml_compute_forward_mul_mat_id(
 
     if (ith == 0) {
         atomic_store(&params->shared->current_chunk, nth);
+        if (z6_numa_experts()) {
+            z6_place_experts(src0);
+            atomic_store(z6_queue(params->shared, 0), 0);
+            atomic_store(z6_queue(params->shared, 1), 0);
+        }
     }
 
     ggml_barrier(params->shared);
@@ -18947,7 +19607,50 @@ static void ggml_compute_forward_mul_mat_id(
         const void * wdata_mm    = (src1->type == vec_dot_type) ? src1->data : params->wdata;
         const size_t row_size_mm = ggml_row_size(vec_dot_type, ne10);
 
-        const int chunks_per_expert = MAX(1, MIN(nth, (int)(ne01 / 32)));
+        const int chunks_per_expert = z6_chunks(nth, (int) ne01);
+
+        if (z6_numa_experts()) {
+            int att[512];
+            GGML_ASSERT(n_as <= 512);
+            const int mio = z6_thread_node();
+            if (z6_options.rows && ne01 >= 64) {
+                int lo, hi;
+                const int original_parts = z6_row_range(ne01, mio, nth, &lo, &hi);
+                const int parti = z6_options.batch_chunks > 0 && z6_batch_medio(ids) ? z6_options.batch_chunks : original_parts;
+                const int n_att = z6_esperti_attivi(matrix_row_counts, n_as, mio, att);
+                struct z6_seg seg[512];
+                for (;;) {
+                    const int c = atomic_fetch_add(z6_queue(params->shared, mio), 1);
+                    if (c >= parti) break;
+                    const int k = z6_row_part(att, n_att, lo, hi, c, parti, 16, seg);
+                    for (int i = 0; i < k; ++i) {
+                        const int cur_a = seg[i].a;
+                        if (!iqk_mul_mat_moe(seg[i].n, matrix_row_counts[cur_a], ne00, ne11,
+                                    src0->type, (const char *) src0->data + cur_a*nb02 + seg[i].r*nb01, nb01,
+                                    vec_dot_type, (const char *)wdata_mm, row_size_mm,
+                                    (float *)dst->data + seg[i].r, nb1, nb2,
+                                    matrix_rows + cur_a*ne12, 0, 1)) GGML_ABORT("z6: iqk_mul_mat_moe non disponibile");
+                    }
+                }
+                return;
+            }
+            for (int giro = 0; giro < z6_giri(); ++giro) {
+                const int q = giro == 0 ? mio : 1 - mio;
+                const int totale = z6_esperti_attivi(matrix_row_counts, n_as, q, att) * chunks_per_expert;
+                for (;;) {
+                    const int c = atomic_fetch_add(z6_queue(params->shared, q), 1);
+                    if (c >= totale) break;
+                    const int cur_a = att[c / chunks_per_expert];
+                    const char * src0_cur = (const char *) src0->data + cur_a*nb02;
+                    if (!iqk_mul_mat_moe(ne01, matrix_row_counts[cur_a], ne00, ne11,
+                                src0->type, src0_cur, nb01,
+                                vec_dot_type, (const char *)wdata_mm, row_size_mm,
+                                (float *)dst->data, nb1, nb2,
+                                matrix_rows + cur_a*ne12, c % chunks_per_expert, chunks_per_expert)) GGML_ABORT("z6: iqk_mul_mat_moe non disponibile");
+                }
+            }
+            return;
+        }
 
         int total_chunks = 0;
         for (int a = 0; a < n_as; a++) {
@@ -19147,6 +19850,40 @@ IQK_MulMat_Not_Available:;
 }
 
 #if GGML_USE_IQK_MULMAT
+// Z6: conteggio delle scelte degli esperti per livello (GGML_Z6_ESPERTI=<file>), scritto ogni 500 chiamate
+// come righe "livello esperto scelte". Serve a capire quanto lavoro coprirebbero gli esperti più usati in VRAM.
+static void z6_conta_esperti(const struct ggml_tensor * w, const int64_t * conteggi, int n_as) {
+    static const char * file = NULL;
+    static int letto = 0;
+    static int64_t tabella[128][512];
+    static int64_t chiamate = 0;
+    // GGML_Z6_ESPERTI_TRACCIA=<file>: una riga "livello esperti..." per chiamata a un token, per la ripetizione fra token
+    static FILE * traccia = NULL;
+    static int traccia_letta = 0;
+    if (!traccia_letta) { const char * t = getenv("GGML_Z6_ESPERTI_TRACCIA"); if (t) traccia = fopen(t, "w"); traccia_letta = 1; }
+    if (traccia && n_as <= 512) {
+        int liv = -1, tot = 0;
+        for (int a = 0; a < n_as; ++a) tot += conteggi[a] > 0;
+        if (tot <= 10 && sscanf(w->name, "blk.%d.", &liv) == 1) {
+            fprintf(traccia, "%d", liv);
+            for (int a = 0; a < n_as; ++a) if (conteggi[a] > 0) fprintf(traccia, " %d", a);
+            fputc('\n', traccia);
+            fflush(traccia);
+        }
+    }
+    if (!letto) { file = getenv("GGML_Z6_ESPERTI"); letto = 1; }
+    if (!file || n_as > 512) return;
+    int livello = -1;
+    if (sscanf(w->name, "blk.%d.", &livello) != 1 || livello < 0 || livello >= 128) return;
+    for (int a = 0; a < n_as; ++a) tabella[livello][a] += conteggi[a];
+    if (++chiamate % 500 == 0) {
+        FILE * f = fopen(file, "w");
+        if (!f) return;
+        for (int l = 0; l < 128; ++l) for (int a = 0; a < n_as; ++a) if (tabella[l][a]) fprintf(f, "%d %d %lld\n", l, a, (long long) tabella[l][a]);
+        fclose(f);
+    }
+}
+
 static void ggml_compute_forward_mul_mat_id_up_gate(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst) {
@@ -19196,6 +19933,56 @@ static void ggml_compute_forward_mul_mat_id_up_gate(
         ggml_moe_prefetch_kernel_hook(dst, ith);
     }
 
+#if defined GGML_EXPERT_CHUNKING
+    {
+        const int64_t nr0 = src0_2 ? ne01 : ne01/2;
+        const char * B; int64_t * cnt; struct z6_mmid * map;
+        if (src0_2 && nr0 >= 64 && z6_prepara_locale(params, src1, ids, vec_dot_type, n_as, &B, &cnt, &map)) {
+            // SER: righe di esperti non attivati azzerate, come nel percorso normale
+            for (int64_t iid1 = ith; iid1 < ids->ne[1]; iid1 += nth) {
+                for (int id = 0; id < n_ids; ++id) {
+                    const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
+                    if (i02 < 0 || i02 >= n_as) memset((char *)dst->data + id*dst->nb[1] + iid1*dst->nb[2], 0, dst->ne[0]*sizeof(float));
+                }
+            }
+            if (ith == 0) z6_conta_esperti(src0_1, cnt, n_as);
+            if (ith == 0 && ids->ne[1] == 1 && z6_pre_thread() > 0) z6_pre_su(src0_1, src0_2, cnt, n_as);
+            if (ith == 0 && ids->ne[1] == 1 && z6_dinamici() > 0) z6_registra_scelti(src0_1, cnt, n_as);
+            const float limit = *(const float *)(dst->op_params + 1);
+            int att[512];
+            const int mio = ith >= nth / 2, loc = ith % (nth / 2);
+            int lo, hi;
+            z6_row_range(nr0, mio, nth, &lo, &hi);
+            const int n_att = z6_esperti_attivi(cnt, n_as, mio, att);
+            struct z6_seg seg[512];
+            const int coda = ids->ne[1] == 1 ? z6_freddi_coda() : 0, parti = coda ? coda * (nth / 2) : nth / 2;
+            char fatta[512] = {0};
+            if (coda && z6_principale_libero(ith)) {
+                return;
+            }
+            for (int c = coda ? atomic_fetch_add_explicit(&params->shared->z6_coda_su[mio].value, 1, memory_order_relaxed) : loc;
+                 c < parti;
+                 c = coda ? atomic_fetch_add_explicit(&params->shared->z6_coda_su[mio].value, 1, memory_order_relaxed) : parti) {
+            const int k = z6_row_part(att, n_att, lo, hi, c, parti, ids->ne[1] == 1 ? z6_options.unit : 16, seg);
+            z6_converti_righe(src1, vec_dot_type, B, cnt, map, seg, k, fatta);
+            for (int i = 0; i < k; ++i) {
+                const int cur_a = seg[i].a, r = seg[i].r;
+                const char * up_b_cur   = up_b   ? (const char *)up_b->data   + cur_a*nb41 + r*sizeof(float) : NULL;
+                const char * gate_b_cur = gate_b ? (const char *)gate_b->data + cur_a*nb51 + r*sizeof(float) : NULL;
+                if (!iqk_moe_fused_up_gate(seg[i].n, cnt[cur_a], ne00, ne11, dst->op_params[0],
+                                    type, (const char *) src0_1->data + cur_a*nb02 + r*nb01,
+                                    (const char *) src0_2->data + cur_a*nb02 + r*nb01, nb01,
+                                    vec_dot_type, B, ggml_row_size(vec_dot_type, ne10),
+                                    up_b_cur, gate_b_cur,
+                                    (float *)dst->data + r, nb1, nb2,
+                                    map + cur_a*ne12, limit, *(const float *)(dst->op_params + 2), *(const float *)(dst->op_params + 3), 0, 1)) GGML_ABORT("fatal error");
+            }
+            }
+            return;
+        }
+    }
+#endif
+
     char * wdata_src1_end = (src1->type == vec_dot_type) ?
             (char *) params->wdata :
             (char *) params->wdata + GGML_PAD(ggml_row_size(vec_dot_type, src1->ne[0])*ggml_nrows(src1), sizeof(int64_t));
@@ -19225,8 +20012,9 @@ static void ggml_compute_forward_mul_mat_id_up_gate(
         const int64_t dr1  = (nr1 + nth - 1)/nth;
         const int64_t ir10 = dr1*ith;
         const int64_t ir11 = MIN(ir10 + dr1, nr1);
-
-        for (int64_t ir1 = ir10; ir1 < ir11; ++ir1) {
+        if (z6_options.batch_quant && z6_batch_medio(ids)) {
+            z6_batch_converti(params, src1, vec_dot_type);
+        } else for (int64_t ir1 = ir10; ir1 < ir11; ++ir1) {
             const int64_t i13 = ir1/(ne11*ne12);
             const int64_t i12 = (ir1 - i13*ne11*ne12)/ne11;
             const int64_t i11 = ir1 - i13*ne11*ne12 - i12*ne11;
@@ -19266,12 +20054,19 @@ static void ggml_compute_forward_mul_mat_id_up_gate(
                 matrix_row_counts[i02] += 1;
             }
         }
+        z6_conta_esperti(src0_1, matrix_row_counts, n_as);
     }
 
 #if defined GGML_EXPERT_CHUNKING
 
     if (ith == 0) {
         atomic_store(&params->shared->current_chunk, nth);
+        if (z6_numa_experts()) {
+            z6_place_experts(src0_1);
+            z6_place_experts(src0_2);
+            atomic_store(z6_queue(params->shared, 0), 0);
+            atomic_store(z6_queue(params->shared, 1), 0);
+        }
     }
 
     ggml_barrier(params->shared);
@@ -19284,7 +20079,69 @@ static void ggml_compute_forward_mul_mat_id_up_gate(
     const size_t row_size_ug = ggml_row_size(vec_dot_type, ne10);
     const int64_t nr0_base = src0_2 ? ne01 : ne01/2;
 
-    const int chunks_per_expert_ug = MAX(1, MIN(nth, (int)(nr0_base / 32)));
+    const int chunks_per_expert_ug = z6_chunks(nth, (int) nr0_base);
+
+    if (z6_numa_experts()) {
+        int att[512];
+        GGML_ASSERT(n_as <= 512);
+        const int mio = z6_thread_node();
+        if (z6_options.rows && src0_2 && nr0_base >= 64) {
+            int lo, hi;
+            const int original_parts = z6_row_range(nr0_base, mio, nth, &lo, &hi);
+            const int parti = z6_options.batch_chunks > 0 && z6_batch_medio(ids) ? z6_options.batch_chunks : original_parts;
+            const int n_att = z6_esperti_attivi(matrix_row_counts, n_as, mio, att);
+            struct z6_seg seg[512];
+            for (;;) {
+                const int c = atomic_fetch_add(z6_queue(params->shared, mio), 1);
+                if (c >= parti) break;
+                const int k = z6_row_part(att, n_att, lo, hi, c, parti, 16, seg);
+                for (int i = 0; i < k; ++i) {
+                    const int cur_a = seg[i].a, r = seg[i].r;
+                    const char * up_b_cur   = up_b   ? (const char *)up_b->data   + cur_a*nb41 + r*sizeof(float) : NULL;
+                    const char * gate_b_cur = gate_b ? (const char *)gate_b->data + cur_a*nb51 + r*sizeof(float) : NULL;
+                    if (!iqk_moe_fused_up_gate(seg[i].n, matrix_row_counts[cur_a], ne00, ne11, dst->op_params[0],
+                                        type, (const char *) src0_1->data + cur_a*nb02 + r*nb01,
+                                        (const char *) src0_2->data + cur_a*nb02 + r*nb01, nb01,
+                                        vec_dot_type, (const char *)wdata_ug, row_size_ug,
+                                        up_b_cur, gate_b_cur,
+                                        (float *)dst->data + r, nb1, nb2,
+                                        matrix_rows + cur_a*ne12, limit, *(const float *)(dst->op_params + 2), *(const float *)(dst->op_params + 3), 0, 1)) GGML_ABORT("fatal error");
+                }
+            }
+            return;
+        }
+        for (int giro = 0; giro < z6_giri(); ++giro) {
+            const int q = giro == 0 ? mio : 1 - mio;
+            const int totale = z6_esperti_attivi(matrix_row_counts, n_as, q, att) * chunks_per_expert_ug;
+            for (;;) {
+                const int c = atomic_fetch_add(z6_queue(params->shared, q), 1);
+                if (c >= totale) break;
+                const int cur_a = att[c / chunks_per_expert_ug];
+                const char *src0_1_cur, *src0_2_cur, *up_b_cur = NULL, *gate_b_cur = NULL;
+                if (src0_2) {
+                    src0_1_cur = (const char *) src0_1->data + cur_a*nb02;
+                    src0_2_cur = (const char *) src0_2->data + cur_a*nb02;
+                    up_b_cur   = up_b   ? (const char *)up_b->data + cur_a*nb41 : NULL;
+                    gate_b_cur = gate_b ? (const char *)gate_b->data + cur_a*nb51 : NULL;
+                } else {
+                    src0_2_cur = (const char *) src0_1->data + cur_a*nb02;
+                    src0_1_cur = src0_2_cur + nb02/2;
+                    if (up_b) {
+                        GGML_ASSERT(!gate_b);
+                        gate_b_cur = (const char *)up_b->data + cur_a*nb41;
+                        up_b_cur   = gate_b_cur + nb41/2;
+                    }
+                }
+                if (!iqk_moe_fused_up_gate(nr0_base, matrix_row_counts[cur_a], ne00, ne11, dst->op_params[0],
+                                    type, src0_1_cur, src0_2_cur, nb01,
+                                    vec_dot_type, (const char *)wdata_ug, row_size_ug,
+                                    up_b_cur, gate_b_cur,
+                                    (float *)dst->data, nb1, nb2,
+                                    matrix_rows + cur_a*ne12, limit, *(const float *)(dst->op_params + 2), *(const float *)(dst->op_params + 3), c % chunks_per_expert_ug, chunks_per_expert_ug)) GGML_ABORT("fatal error");
+            }
+        }
+        return;
+    }
 
     int total_chunks_ug = 0;
     for (int a = 0; a < n_as; a++) {
@@ -25313,6 +26170,166 @@ static void ggml_compute_forward_hc_post_f32(
     }
 }
 
+// Opt-in decode down+weighted sum: each worker owns a row interval across
+// all experts, so it publishes one reduced vector without an extra barrier.
+static void z6_compute_down_sum(const struct ggml_compute_params * params, struct ggml_tensor * dst) {
+    const struct ggml_tensor * a = dst->src[0], * x = dst->src[1];
+    const int32_t * ids = (const int32_t *) dst->src[2]->data;
+    const float * weights = (const float *) dst->src[3]->data;
+    const int ith = params->ith, nth = params->nth, E = a->ne[1], nk = x->ne[1];
+    const enum ggml_type bt = type_traits[a->type].vec_dot_type;
+    const size_t row_size = ggml_row_size(bt, x->ne[0]);
+    int lo = 0, hi = E, worker = ith, workers = nth;
+    if (params->shared->z6_locale) {
+        const int node = ith >= nth/2;
+        lo = node ? z6_row_split(E) : 0;
+        hi = node ? E : z6_row_split(E);
+        worker = ith % (nth/2);
+        workers = nth/2;
+    }
+    const int units = (hi - lo)/16;
+    const int first = lo + units*worker/workers*16;
+    const int last = worker + 1 == workers ? hi : lo + units*(worker + 1)/workers*16;
+    const int rows = last - first;
+    if (rows <= 0) return;
+    const size_t quant_bytes = GGML_PAD(row_size*nk, 64);
+    const size_t bytes = quant_bytes + rows*sizeof(float);
+    static __thread char * buffer = NULL;
+    static __thread size_t capacity = 0;
+    if (bytes > capacity) {
+        free(buffer);
+        buffer = malloc(bytes);
+        GGML_ASSERT(buffer);
+        capacity = bytes;
+    }
+    float * tmp = (float *) (buffer + quant_bytes);
+    float * out = (float *) dst->data + first;
+    memset(out, 0, rows*sizeof(float));
+    for (int id = 0; id < nk; ++id) {
+        const int expert = ids[id];
+        if (expert < 0 || expert >= a->ne[2]) continue;
+        char * b = buffer + id*row_size;
+        const float * input = (const float *) ((const char *) x->data + id*x->nb[1]);
+        if (bt == GGML_TYPE_F32) {
+            memcpy(b, input, row_size);
+        } else {
+            GGML_ASSERT(type_traits[bt].from_float);
+            type_traits[bt].from_float(input, b, x->ne[0]);
+        }
+        const char * matrix = (const char *) a->data + expert*a->nb[2] + first*a->nb[1];
+        bool computed = false;
+#if GGML_USE_IQK_MULMAT
+        computed = iqk_mul_mat(rows, 1, a->ne[0], a->type, matrix, a->nb[1], bt, b, row_size, tmp, rows, 0, 1);
+#endif
+        if (!computed) {
+            for (int row = 0; row < rows; ++row) {
+                type_traits[a->type].vec_dot(a->ne[0], tmp + row, 0, matrix + row*a->nb[1], 0, b, 0, 1);
+            }
+        }
+        // CUDA's reference mul_multi_add_id traverses slots in this order and uses FMA.
+        for (int row = 0; row < rows; ++row) out[row] = fmaf(tmp[row], weights[id], out[row]);
+    }
+}
+
+// Z6: hyper-connection fuse (vedi ggml_z6_hc_*); stesso ordine delle somme delle operazioni separate
+static void ggml_compute_forward_z6_hc(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst) {
+    const int modo = dst->op_params[0];
+    float p0, p1;
+    memcpy(&p0, &dst->op_params[1], sizeof(p0));
+    memcpy(&p1, &dst->op_params[2], sizeof(p1));
+    const int ith = params->ith, nth = params->nth;
+    float * d = (float *) dst->data;
+    if (modo == 5) {
+        z6_compute_down_sum(params, dst);
+    } else if (modo == 6) {
+        const float * x = (const float *) dst->src[0]->data;
+        const int key_dim = dst->op_params[3], head_dim = dst->op_params[4];
+        for (int64_t row = ith; row < dst->ne[0]/head_dim; row += nth) {
+            ggml_float sum = 0.0;
+            for (int e = 0; e < head_dim; ++e) {
+                const int64_t i = row*head_dim + e;
+                d[i] = x[i] / (1.0f + expf(-x[i]));
+                sum += (ggml_float) (d[i]*d[i]);
+            }
+            if (row*head_dim < 2*key_dim) {
+                const float scale = 1.0f/sqrtf(MAX((float) sum, p0*p0));
+                for (int e = 0; e < head_dim; ++e) d[row*head_dim + e] *= scale;
+            }
+        }
+    } else if (modo == 4) {
+        // CPU fallback: a single worker owns both parts of the packed output.
+        if (ith != 0) return;
+        const struct ggml_tensor * x = dst->src[0];
+        const float * xs = (const float *) x->data;
+        const float * w = (const float *) dst->src[1]->data;
+        const float * wi = (const float *) dst->src[2]->data;
+        const int64_t E = x->ne[0], H = x->ne[1], n = E*H;
+        for (int64_t h = 0; h < H; ++h) {
+            ggml_float sum = 0.0;
+            for (int64_t e = 0; e < E; ++e) { const float v = xs[h*E + e]; sum += (ggml_float) (v*v); }
+            const float scale = 1.0f/sqrtf((float) (sum/E) + p0);
+            for (int64_t e = 0; e < E; ++e) d[h*E + e] = xs[h*E + e]*scale*w[h*E + e];
+        }
+        for (int64_t h = 0; h < H; ++h) {
+            ggml_float sum = 0.0;
+            for (int64_t e = 0; e < n; ++e) sum += (ggml_float) d[e]*wi[h*n + e];
+            d[n + h] = (float) sum;
+        }
+    } else if (modo == 0) {
+        const struct ggml_tensor * res = dst->src[0];
+        const float * r = (const float *) res->data;
+        const float * b = (const float *) dst->src[1]->data;
+        const float * inj = (const float *) dst->src[2]->data;
+        const int64_t E = res->ne[0], H = res->ne[1], T = res->ne[2];
+        for (int64_t row = ith; row < H*T; row += nth) {
+            const int64_t h = row % H, t = row / H;
+            const float w = p1 / (1.0f + expf(-p0*inj[h + H*t]));
+            for (int64_t e = 0; e < E; ++e) d[row*E + e] = r[row*E + e] + b[t*E + e]*w;
+        }
+    } else if (modo == 1) {
+        const float * up = (const float *) dst->src[0]->data;
+        const float * xn = (const float *) dst->src[1]->data;
+        const int64_t H = dst->op_params[3], E = dst->ne[0], T = dst->ne[1];
+        for (int64_t t = ith; t < T; t += nth) {
+            for (int64_t e = 0; e < E; ++e) {
+                float s = 0.0f;
+                for (int64_t h = 0; h < H; ++h) {
+                    const int64_t i = t*E*H + h*E + e;
+                    s += xn[i] / (1.0f + expf(-up[i]));
+                }
+                d[t*E + e] = s*p0;
+            }
+        }
+    } else if (modo == 3) {
+        // gather_f16: una cella è ne0*ne1 valori consecutivi della cache
+        const struct ggml_tensor * cache = dst->src[0];
+        const int32_t * idx = (const int32_t *) dst->src[1]->data;
+        const int64_t per_cella = dst->ne[0]*dst->ne[1], n = dst->ne[2];
+        const size_t passo = ggml_row_size(cache->type, per_cella);
+        float * tmp = (float *) params->wdata + (per_cella + CACHE_LINE_SIZE_F32)*ith;
+        ggml_fp16_t * out = (ggml_fp16_t *) dst->data;
+        for (int64_t c = ith; c < n; c += nth) {
+            type_traits[cache->type].to_float((const char *) cache->data + idx[c]*passo, tmp, per_cella);
+            ggml_fp32_to_fp16_row(tmp, out + c*per_cella, per_cella);
+        }
+    } else {
+        const struct ggml_tensor * x = dst->src[0];
+        const float * xs = (const float *) x->data;
+        const float * w = (const float *) dst->src[1]->data;
+        const int64_t E = x->ne[0], H = x->ne[1], T = x->ne[2];
+        for (int64_t row = ith; row < H*T; row += nth) {
+            const float * xr = xs + row*E;
+            ggml_float sum = 0.0;
+            for (int64_t e = 0; e < E; ++e) sum += (ggml_float) (xr[e]*xr[e]);
+            const float scale = 1.0f/sqrtf((float) (sum/E) + p0);
+            const int64_t h = row % H;
+            for (int64_t e = 0; e < E; ++e) d[row*E + e] = xr[e]*scale*w[h*E + e];
+        }
+    }
+}
+
 static void ggml_compute_forward_hc_post(
         const struct ggml_compute_params * params,
         struct ggml_tensor * dst) {
@@ -27699,6 +28716,10 @@ static int ggml_compute_forward(struct ggml_compute_params * params, struct ggml
             {
                 ggml_compute_forward_hc_post(params, tensor);
             } break;
+        case GGML_OP_Z6_HC:
+            {
+                ggml_compute_forward_z6_hc(params, tensor);
+            } break;
         case GGML_OP_MASK_TO_IDX:
             {
                 ggml_compute_forward_mask_to_idx(params, tensor);
@@ -28799,6 +29820,7 @@ static void ggml_compute_backward(struct ggml_context * ctx, struct ggml_tensor 
         case GGML_OP_SINKHORN:
         case GGML_OP_HC_PRE:
         case GGML_OP_HC_POST:
+        case GGML_OP_Z6_HC:
         case GGML_OP_MASK_TO_IDX:
         case GGML_OP_LATENT_ATTN:
         case GGML_OP_DS4_COMP:
@@ -29449,9 +30471,18 @@ static void set_cpu_thread_affinity(const struct ggml_cplan * cplan, int thread_
         return;
     }
 
+    // Z6 (GGML_Z6_NUMA_AFFINITY): i thread del pool OpenMP restano gli stessi fra le chiamate e
+    // nessuno cambia la loro maschera, quindi basta legarli una volta (circa 27 µs per chiamata a
+    // 40 thread). Il thread 0 è il chiamante, che ggml_graph_compute riporta alla maschera iniziale.
+    static __thread int z6_cpu_legata = -1;
+    if (z6_options.affinity && thread_n != 0 && z6_cpu_legata == cpu) {
+        return;
+    }
+
     cpu_set_t mask;
     CPU_ZERO(&mask);
     CPU_SET(cpu, &mask);
+    z6_cpu_legata = thread_n != 0 ? cpu : -1;
 
     const int rv = pthread_setaffinity_np(pthread_self(), sizeof(mask), &mask);
     if (rv) {
@@ -29582,6 +30613,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_SINKHORN:
         case GGML_OP_HC_PRE:
         case GGML_OP_HC_POST:
+        case GGML_OP_Z6_HC:
         case GGML_OP_MASK_TO_IDX:
         case GGML_OP_LATENT_ATTN:
         case GGML_OP_DS4_COMP:
@@ -29896,6 +30928,13 @@ struct ggml_cplan ggml_graph_plan(const struct ggml_cgraph * cgraph, int n_threa
                     cur = MAX(cur, size);
 #endif
                 } break;
+            case GGML_OP_Z6_HC:
+                {
+                    // gather_f16: una cella convertita in f32 per thread
+                    if (node->op_params[0] == 3) {
+                        cur = sizeof(float)*(node->ne[0]*node->ne[1] + CACHE_LINE_SIZE_F32)*n_tasks;
+                    }
+                } break;
             case GGML_OP_LATENT_ATTN:
                 {
                     // per thread: [P+dense-or-gathered rows] f32 scores + one [Dk] dequant row
@@ -29967,14 +31006,84 @@ struct ggml_cplan ggml_graph_plan(const struct ggml_cgraph * cgraph, int n_threa
     return cplan;
 }
 
+// Z6: tempi per thread in generazione (GGML_Z6_TEMPI=1): esperti, altre operazioni, attese alle barriere.
+// Ogni 2000 chiamate di ggml_graph_compute scrive su stderr medie per chiamata e azzera.
+static struct { int64_t moe, altro, attesa, avvio, affinita, fine, ciclo, nodi; int node; char pad[60]; } z6_t[128];
+static int64_t z6_graph_us = 0, z6_graph_n = 0, z6_inizio_corrente = 0, z6_uscita = 0;
+
+static bool z6_tempi(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char * e = getenv("GGML_Z6_TEMPI");
+        v = e && atoi(e) > 0;
+    }
+    return v;
+}
+
+static void z6_tempi_riepilogo(int n_threads) {
+    if (z6_graph_n < 2000) return;
+    double mn[3] = {1e30, 1e30, 1e30}, mx[3] = {0, 0, 0}, md[3] = {0, 0, 0};
+    for (int i = 0; i < n_threads && i < 128; ++i) {
+        const double v[3] = {(double) z6_t[i].moe, (double) z6_t[i].altro, (double) z6_t[i].attesa};
+        for (int k = 0; k < 3; ++k) { mn[k] = MIN(mn[k], v[k]); mx[k] = MAX(mx[k], v[k]); md[k] += v[k]; }
+    }
+    const double n = (double) z6_graph_n;
+    fprintf(stderr, "z6 tempi: %lld chiamate, %d thread, durata media %.1f us; per chiamata (min/medio/max sui thread) "
+            "esperti %.1f/%.1f/%.1f us, altro %.1f/%.1f/%.1f us, attese %.1f/%.1f/%.1f us\n",
+            (long long) z6_graph_n, n_threads, z6_graph_us / n,
+            mn[0] / n, md[0] / n_threads / n, mx[0] / n, mn[1] / n, md[1] / n_threads / n, mx[1] / n,
+            mn[2] / n, md[2] / n_threads / n, mx[2] / n);
+    {
+        double av[2] = {0, 0}, af[2] = {0, 0}, avmax = 0; int cnt[2] = {0, 0};
+        for (int i = 0; i < n_threads && i < 128; ++i) {
+            const int s = z6_t[i].node & 1;
+            av[s] += z6_t[i].avvio / n; af[s] += z6_t[i].affinita / n; ++cnt[s];
+            avmax = MAX(avmax, z6_t[i].avvio / n);
+        }
+        double ciclo = 0, nodi = 0;
+        for (int i = 0; i < n_threads && i < 128; ++i) { ciclo += z6_t[i].ciclo / n; nodi += z6_t[i].nodi / n; }
+        fprintf(stderr, "z6 ciclo: medio %.1f us, nodi eseguiti per chiamata %.1f\n", ciclo / n_threads, nodi / n_threads);
+        fprintf(stderr, "z6 fork/join: avvio thread medio socket0 %.1f socket1 %.1f max %.1f us; affinita %.1f/%.1f us; "
+                "uscita (fine ultimo thread -> fine chiamata) %.1f us\n",
+                cnt[0] ? av[0] / cnt[0] : 0, cnt[1] ? av[1] / cnt[1] : 0, avmax,
+                cnt[0] ? af[0] / cnt[0] : 0, cnt[1] ? af[1] / cnt[1] : 0, z6_uscita / n);
+        z6_uscita = 0;
+    }
+    for (int socket = 0; socket < 2; ++socket) {
+        int count = 0;
+        double sum = 0, lo = 1e30, hi = 0;
+        for (int i = 0; i < n_threads && i < 128; ++i) {
+            if (z6_t[i].node != socket) continue;
+            const double us = z6_t[i].moe / n;
+            sum += us; lo = MIN(lo, us); hi = MAX(hi, us); ++count;
+        }
+        if (count) fprintf(stderr, "z6 socket: node=%d threads=%d esperti min/medio/max=%.1f/%.1f/%.1f us\n",
+                socket, count, lo, sum / count, hi);
+    }
+    memset(z6_t, 0, sizeof(z6_t));
+    z6_graph_us = 0;
+    z6_graph_n = 0;
+}
+
 static thread_ret_t ggml_graph_compute_thread(void * data) {
     struct ggml_compute_state * state = (struct ggml_compute_state *) data;
 
     const struct ggml_cgraph * cgraph = state->shared->cgraph;
     const struct ggml_cplan  * cplan  = state->shared->cplan;
+    const bool z6_conta = z6_tempi() && state->shared->n_batch <= 32 && state->ith < 128 && z6_inizio_corrente;
+    const int64_t z6_partito = z6_conta ? ggml_time_us() : 0;
 
-    set_numa_thread_affinity(state->ith);
-    set_cpu_thread_affinity(cplan, state->ith); // explicit affinity takes precedence over NUMA
+    // Explicit CPU binding subsumes the wider NUMA binding. Avoid two affinity
+    // syscalls per worker per graph, without assuming OpenMP preserves masks.
+    if (!(z6_options.affinity && cplan->n_cpu_affinity > 0)) {
+        set_numa_thread_affinity(state->ith);
+    }
+    set_cpu_thread_affinity(cplan, state->ith);
+    if (z6_tempi() && state->ith < 128) z6_t[state->ith].node = z6_thread_node(); // explicit affinity takes precedence over NUMA
+    if (z6_conta) {
+        z6_t[state->ith].avvio += z6_partito - z6_inizio_corrente;
+        z6_t[state->ith].affinita += ggml_time_us() - z6_partito;
+    }
 
     struct ggml_compute_params params = {
         /*.ith   =*/ state->ith,
@@ -29989,25 +31098,43 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     int64_t t_eval  = 0;
 #endif
 
+    const int64_t z6_ciclo0 = z6_conta ? ggml_time_us() : 0;
     for (int node_n = 0; node_n < cgraph->n_nodes; node_n++) {
         struct ggml_tensor * node = cgraph->nodes[node_n];
 
         if (ggml_is_noop(node)) continue;
+        if (z6_conta) z6_t[state->ith].nodi += 1;
 
 #if IK_PRINT_TIMING
         int64_t tim1 = ggml_time_us();
 #endif
+        const bool z6_misura = z6_tempi() && state->shared->n_batch <= 32 && state->ith < 128;
+        const bool z6_moe = node->op == GGML_OP_MUL_MAT_ID || node->op == GGML_OP_MOE_FUSED_UP_GATE;
+        const int64_t z6_a = z6_misura ? ggml_time_us() : 0;
         node_n = ggml_compute_forward(&params, node, cgraph, node_n);
 #if IK_PRINT_TIMING
         int64_t tim2 = ggml_time_us();
         t_eval += tim2 - tim1;
 #endif
+        const int64_t z6_b = z6_misura ? ggml_time_us() : 0;
 
         if (state->ith == 0 && cplan->abort_callback && cplan->abort_callback(cplan->abort_callback_data)) {
             state->shared->ec = GGML_STATUS_ABORTED;
         }
 
-        ggml_barrier(state->shared);
+        // OpenMP joins all workers immediately after the last node. This final
+        // explicit barrier is redundant when no abort callback publishes ec.
+        bool z6_skip_final = false;
+#ifdef GGML_USE_OPENMP
+        z6_skip_final = z6_options.barrier &&
+            node_n == cgraph->n_nodes - 1 && !cplan->abort_callback;
+#endif
+        if (!z6_skip_final) ggml_barrier(state->shared);
+        if (z6_misura) {
+            const int64_t z6_c = ggml_time_us();
+            if (z6_moe) z6_t[state->ith].moe += z6_b - z6_a; else z6_t[state->ith].altro += z6_b - z6_a;
+            z6_t[state->ith].attesa += z6_c - z6_b;
+        }
 
         if (state->shared->ec != GGML_STATUS_SUCCESS) {
             break;
@@ -30017,11 +31144,16 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     int64_t t_end = ggml_time_us();
     if (state->ith == 0) printf("ggml_barrier(...): %d us\n", (int)(t_end - t_start - t_eval));
 #endif
+    if (z6_conta) {
+        z6_t[state->ith].fine = ggml_time_us();
+        z6_t[state->ith].ciclo += z6_t[state->ith].fine - z6_ciclo0;
+    }
 
     return 0;
 }
 
 enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cplan * cplan) {
+    z6_options_init();
     GGML_ASSERT(cplan);
     GGML_ASSERT(cplan->n_threads > 0);
     GGML_ASSERT(cplan->work_size == 0 || cplan->work_data != NULL);
@@ -30029,12 +31161,17 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
     int n_threads = cplan->n_threads;
 
 #if defined(__gnu_linux__)
-    // the calling thread is worker 0 and gets pinned below; remember its affinity
+    // Worker 0 is the caller. Preserve the launcher's mask for NUMA as well as
+    // explicit worker affinity; clearing NUMA affinity must not widen a Z6
+    // node-0 process to both sockets between graph executions.
     cpu_set_t saved_affinity;
     const bool restore_affinity =
-        cplan->cpu_affinity != NULL && cplan->n_cpu_affinity > 0 &&
+        (ggml_is_numa() || (cplan->cpu_affinity != NULL && cplan->n_cpu_affinity > 0)) &&
         pthread_getaffinity_np(pthread_self(), sizeof(saved_affinity), &saved_affinity) == 0;
 #endif
+
+    const int64_t z6_inizio = (z6_tempi() && cgraph->n_batch <= 32) ? ggml_time_us() : 0;
+    z6_inizio_corrente = z6_inizio;
 
     struct ggml_compute_state_shared state_shared = {
         /*.cgraph                  =*/ cgraph,
@@ -30048,19 +31185,27 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
         /*.current_chunk           =*/ 0,
         /*.ec                      =*/ GGML_STATUS_SUCCESS,
     };
+    state_shared.z6_locale = z6_locale_valido(cplan, n_threads);
 
 #ifdef GGML_USE_OPENMP
     if (n_threads > 1) {
 //#if IK_PRINT_TIMING
 //        int64_t tim1 = ggml_time_us();
 //#endif
+        // Z6 (GGML_Z6_NUMA_BARRIER): senza "omp single" e la sua barriera implicita a ogni chiamata.
+        // Senza thread dinamici OpenMP dà sempre i thread chiesti; se non fosse così, si torna al percorso originale.
+        const bool z6_senza_single = z6_options.barrier && !omp_get_dynamic() && n_threads <= omp_get_thread_limit();
         #pragma omp parallel num_threads(n_threads)
         {
+            if (!z6_senza_single) {
             #pragma omp single
             {
                 // update the number of threads from the actual number of threads that we got from OpenMP
                 n_threads = omp_get_num_threads();
                 state_shared.n_threads = n_threads;
+            }
+            } else if (omp_get_num_threads() != n_threads) {
+                GGML_ABORT("z6: OpenMP ha dato %d thread invece di %d", omp_get_num_threads(), n_threads);
             }
 
             struct ggml_compute_state worker = {
@@ -30113,14 +31258,27 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
     }
 #endif
 
-    // don't leave affinity set on the main thread
-    clear_numa_thread_affinity();
-
 #if defined(__gnu_linux__)
     if (restore_affinity) {
-        pthread_setaffinity_np(pthread_self(), sizeof(saved_affinity), &saved_affinity);
+        const int rv = pthread_setaffinity_np(pthread_self(), sizeof(saved_affinity), &saved_affinity);
+        if (rv != 0) {
+            fprintf(stderr, "warning: restoring CPU affinity failed: %s\n", strerror(rv));
+        }
+    } else {
+        clear_numa_thread_affinity();
     }
+#else
+    clear_numa_thread_affinity();
 #endif
+
+    if (z6_inizio) {
+        int64_t ultimo = 0;
+        for (int i = 0; i < n_threads && i < 128; ++i) ultimo = MAX(ultimo, z6_t[i].fine);
+        if (ultimo) z6_uscita += ggml_time_us() - ultimo;
+        z6_graph_us += ggml_time_us() - z6_inizio;
+        z6_graph_n += 1;
+        z6_tempi_riepilogo(n_threads);
+    }
 
     return state_shared.ec;
 }

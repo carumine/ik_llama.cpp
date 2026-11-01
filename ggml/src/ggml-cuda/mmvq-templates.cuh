@@ -321,6 +321,11 @@ static __global__ void mul_mat_vec_q(
     char * cdst = (char *)dst + i2*nb2;
     int i02 = ids_data ? *(const int *)(ids_data + i2*ids_nb0) : i2;
     if (i02 < 0) {
+        // An excluded expert must also be safe for a following quantization/fused down.
+        for (int row = blockIdx.x*blockDim.x*blockDim.y + threadIdx.y*blockDim.x + threadIdx.x;
+                row < nrows_dst*ncols_y; row += gridDim.x*blockDim.x*blockDim.y) {
+            ((float *)cdst)[row] = 0.0f;
+        }
         return;
     }
     const char * cx = (const char *)vx + i02*nb02;
@@ -345,6 +350,10 @@ static __global__ void fused_mul_mat_vec_q(
     char * cdst = (char *)dst + i2*nb2;
     int i02 = ids_data ? *(const int *)(ids_data + i2*ids_nb0) : i2;
     if (i02 < 0) {
+        for (int row = blockIdx.x*blockDim.x*blockDim.y + threadIdx.y*blockDim.x + threadIdx.x;
+                row < nrows_dst*ncols_y; row += gridDim.x*blockDim.x*blockDim.y) {
+            ((float *)cdst)[row] = 0.0f;
+        }
         return;
     }
     const char * cx_u = (const char *)vup   + i02*nb02;
@@ -496,8 +505,89 @@ static void mul_mat_vec_q_cuda_T(const mmvq_args & args, cudaStream_t stream) {
     }
 }
 
+// Z6: matrici corte (al più 4 giri di warp per riga, per Q8_0 K <= 1024), una colonna, senza ids.
+// Il kernel generico usa un blocco da 128 thread per riga: con K=320 (hyper-connection di Flash-Next)
+// lavorano 40 thread su 128 e i blocchi sono 10240 per matrice, a circa 74 GB/s. Qui ogni warp calcola
+// rows_per_warp righe intere, senza memoria condivisa né __syncthreads.
+template <ggml_type type, int rows_per_warp>
+__launch_bounds__(4*WARP_SIZE)
+static __global__ void z6_mul_mat_vec_q_corto(const void * __restrict__ vx, const void * __restrict__ vy,
+        const float * __restrict__ bias, float * __restrict__ dst, const int ncols_x, const int nrows_x) {
+    constexpr int qk  = ggml_cuda_type_traits<type>::qk;
+    constexpr int qi  = ggml_cuda_type_traits<type>::qi;
+    constexpr int vdr = get_vdr_mmvq(type);
+    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
+    constexpr int per_giro = vdr*WARP_SIZE/qi;
+
+    const int row0 = (blockIdx.x*blockDim.y + threadIdx.y)*rows_per_warp;
+    if (row0 >= nrows_x) {
+        return;
+    }
+    const int blocks_per_row_x = ncols_x/qk;
+    const int kqs = vdr*(threadIdx.x % (qi/vdr));
+    const block_q8_1 * y = (const block_q8_1 *) vy;
+
+    float tmp[rows_per_warp] = {0.0f};
+    for (int kbx = threadIdx.x/(qi/vdr); kbx < blocks_per_row_x; kbx += per_giro) {
+        const int kby = kbx*(qk/QK8_1);
+#pragma unroll
+        for (int i = 0; i < rows_per_warp; ++i) {
+            if (row0 + i < nrows_x) {
+                tmp[i] += vec_dot_q_cuda(vx, &y[kby], (row0 + i)*blocks_per_row_x + kbx, kqs);
+            }
+        }
+    }
+    float r = 0.0f;
+#pragma unroll
+    for (int i = 0; i < rows_per_warp; ++i) {
+        const float v = warp_reduce_sum(tmp[i]);
+        if (threadIdx.x == i) {
+            r = v;
+        }
+    }
+    if (threadIdx.x < rows_per_warp && row0 + threadIdx.x < nrows_x) {
+        dst[row0 + threadIdx.x] = r + (bias ? bias[row0 + threadIdx.x] : 0.0f);
+    }
+}
+
+// GGML_Z6_MMVQ_CORTO=1|2|4: righe per warp del kernel per matrici corte; 0 o assente = kernel generico
+static int z6_mmvq_corto() {
+    static const int v = [] {
+        const char * e = getenv("GGML_Z6_MMVQ_CORTO");
+        const int n = e ? atoi(e) : 0;
+        return n == 1 || n == 2 || n == 4 ? n : 0;
+    }();
+    return v;
+}
+
+template <ggml_type type>
+static bool z6_mul_mat_vec_q_corto_cuda(const mmvq_args & args, cudaStream_t stream) {
+    constexpr int qk  = ggml_cuda_type_traits<type>::qk;
+    constexpr int qi  = ggml_cuda_type_traits<type>::qi;
+    constexpr int vdr = get_vdr_mmvq(type);
+    const int rpw = z6_mmvq_corto();
+    if (!rpw || args.ncols_y != 1 || args.ne2 != 1 || args.ids_data || args.vx_g ||
+        args.nrows_dst < args.nrows_x || (args.ncols_x/qk) > 4*(vdr*WARP_SIZE/qi)) {
+        return false;
+    }
+    const dim3 block_dims(WARP_SIZE, 4, 1);
+    const dim3 block_nums((args.nrows_x + 4*rpw - 1)/(4*rpw), 1, 1);
+    const float * bias = (const float *) args.bias_u;
+    switch (rpw) {
+        case 1: z6_mul_mat_vec_q_corto<type, 1><<<block_nums, block_dims, 0, stream>>>(args.vx_u, args.vy, bias, args.dst, args.ncols_x, args.nrows_x); break;
+        case 2: z6_mul_mat_vec_q_corto<type, 2><<<block_nums, block_dims, 0, stream>>>(args.vx_u, args.vy, bias, args.dst, args.ncols_x, args.nrows_x); break;
+        default: z6_mul_mat_vec_q_corto<type, 4><<<block_nums, block_dims, 0, stream>>>(args.vx_u, args.vy, bias, args.dst, args.ncols_x, args.nrows_x); break;
+    }
+    return true;
+}
+
 template <ggml_type type>
 static void mul_mat_vec_q_cuda(const mmvq_args & args, cudaStream_t stream) {
+    if constexpr (type == GGML_TYPE_Q8_0) {
+        if (z6_mul_mat_vec_q_corto_cuda<type>(args, stream)) {
+            return;
+        }
+    }
     int nwarps = 1;
     int id = ggml_cuda_get_device();
     const int cc = ggml_cuda_info().devices[id].cc;

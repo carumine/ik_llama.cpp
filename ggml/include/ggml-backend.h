@@ -204,6 +204,22 @@ extern "C" {
     GGML_API int                  ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched);
     GGML_API int                  ggml_backend_sched_get_n_copies(ggml_backend_sched_t sched);
 
+    // Z6: explicit dependencies for one immutable hot/cold MoE group. Host
+    // tensors use a context-owned pinned packet, never the model weight buffer.
+    struct ggml_z6_caldi_group {
+        struct ggml_tensor * hot_begin;
+        struct ggml_tensor * hot_end;
+        struct ggml_tensor * cold_begin;
+        struct ggml_tensor * cold_end;
+        struct ggml_tensor * device_inputs[3]; // activation, cold IDs, router weights
+        struct ggml_tensor * host_inputs[3];
+        int layer;
+    };
+    GGML_API void ggml_backend_sched_z6_begin_graph(ggml_backend_sched_t sched);
+    GGML_API void ggml_backend_sched_z6_add_group(ggml_backend_sched_t sched, const struct ggml_z6_caldi_group * group);
+    // Counts are collected with GGML_Z6_TEMPI=1.
+    GGML_API void ggml_backend_sched_z6_stats(ggml_backend_sched_t sched, int64_t * groups, int64_t * overlapping);
+
     GGML_API size_t               ggml_backend_sched_get_buffer_size(ggml_backend_sched_t sched, ggml_backend_t backend);
 
     GGML_API void                 ggml_backend_sched_set_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node, ggml_backend_t backend);

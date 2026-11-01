@@ -8,12 +8,15 @@
 
 struct llama_model;
 class llama_moe_cache;
+class llama_z6_caldi;
+class llama_z6_testa;
 
 #include <vector>
 #include <map>
 #include <tuple>
 #include <set>
 #include <memory>
+#include <functional>
 
 struct llama_swa_window_view {
     int64_t w_view  = 0;
@@ -123,6 +126,7 @@ struct llama_kv_cache {
 
     // computed before each graph build
     uint32_t n = 0;
+    uint64_t z6_inputs_epoch = 0; // invalidates append-only host inputs on any cache edit
 
     ggml_type type_k = GGML_TYPE_F16;
     ggml_type type_v = GGML_TYPE_F16;
@@ -380,6 +384,12 @@ struct llama_context {
 
     std::vector<ggml_backend_t> backends;
     std::unique_ptr<llama_moe_cache> moe_cache;
+    std::unique_ptr<llama_z6_caldi> z6_caldi;
+    std::unique_ptr<llama_z6_testa> z6_testa;
+    // Z6 (GGML_Z6_SHEXP_PARALLELO=1): costruttore dello shared expert, chiamato dal gruppo parallelo
+    // dei caldi perché giri sulla GPU mentre la CPU calcola gli esperti freddi
+    std::function<ggml_tensor * (ggml_tensor *)> z6_shexp;
+    bool z6_shexp_fatto = false;
 #ifdef GGML_USE_METAL
     ggml_backend_t backend_metal = nullptr;
 #endif
@@ -705,7 +715,17 @@ struct llama_context {
 
     // Qwen sparse attention: everything that depends on cache layout is computed on the host,
     // so the graph only gathers, pools and scores. One entry per distinct compress ratio.
+    struct z6_append_input {
+        bool valid = false;
+        uint64_t epoch = 0;
+        uint32_t head = 0;
+        llama_pos pos = -1;
+        llama_seq_id seq = -1;
+    };
+    z6_append_input z6_mask_append;
     struct qsa_input {
+        z6_append_input z6_append;
+
         int32_t ratio    = 0;
         struct ggml_tensor * cell_blk  = nullptr; // I32 [n_kv]           block each cell belongs to
         struct ggml_tensor * bias      = nullptr; // F32 [n_kv, n_tokens] causal mask plus the tail boost

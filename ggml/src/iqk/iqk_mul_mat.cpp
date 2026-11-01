@@ -12,6 +12,7 @@
 #if defined IQK_IMPLEMENT
 
 #include <cstring>
+#include <cstdlib>
 #include <type_traits>
 #include <vector>
 #include <new>
@@ -55,15 +56,35 @@
 
 namespace {
 
+// Z6 experiment: change output-row tiling, retaining the same dot-product
+// kernels and accumulation order within each output. Default stays 64.
+static int z6_matmul_tile() {
+    static const int tile = []() {
+        const char * value = std::getenv("IK_Z6_MATMUL_TILE");
+        if (value && std::strcmp(value, "32") == 0) return 32;
+        if (value && std::strcmp(value, "128") == 0) return 128;
+        return 64;
+    }();
+    return tile;
+}
+
+// Size of the row panel passed to the existing temporary conversion. This
+// does not alter the conversion type or quantizer; exact fixtures gate use.
+static int z6_repack_tile() {
+    static const int tile = []() {
+        const char * value = std::getenv("IK_Z6_REPACK_TILE");
+        if (value && std::strcmp(value, "16") == 0) return 16;
+        if (value && std::strcmp(value, "64") == 0) return 64;
+        return 32;
+    }();
+    return tile;
+}
+
 struct MulMat {
     std::array<mul_mat_t, IQK_MAX_NY> funcs = {};
     mul_mat_t func16 = nullptr;
-    inline void mul_mat_NxM(int n, const void * vx, size_t bx, DataInfo& info, int nrc_x, int nrc_y) {
-#ifdef __aarch64__
-        constexpr int k_x_step = 64; //8192; // Tiling does not seem to help on my M2 Max (but difference to tiling is small)
-#else
-        constexpr int k_x_step = 64; // This works best on my Ryzen-7950X (but differences to other tile size are small)
-#endif
+    template<int k_x_step>
+    inline void mul_mat_NxM_tiled(int n, const void * vx, size_t bx, DataInfo& info, int nrc_x, int nrc_y) {
         if (func16 && nrc_y >= 16) {
             int n_step = (nrc_y - info.cur_y)/16;
             for (int ix = 0; ix < nrc_x; ix += k_x_step) {
@@ -121,6 +142,15 @@ struct MulMat {
         if (n_left > 0) {
             funcs[n_left-1](n, vx, bx, info, nrc_x);
         }
+    }
+    inline void mul_mat_NxM(int n, const void * vx, size_t bx, DataInfo& info, int nrc_x, int nrc_y) {
+#if defined(__AVX512VNNI__) && defined(__AVX512VL__)
+        switch (z6_matmul_tile()) {
+            case 32:  return mul_mat_NxM_tiled<32>(n, vx, bx, info, nrc_x, nrc_y);
+            case 128: return mul_mat_NxM_tiled<128>(n, vx, bx, info, nrc_x, nrc_y);
+        }
+#endif
+        mul_mat_NxM_tiled<64>(n, vx, bx, info, nrc_x, nrc_y);
     }
     inline static void gelu(int n, const float * src, float * dst);
     inline static void relu(int n, const float * src, float * dst);
@@ -661,7 +691,7 @@ extern "C" IQK_API bool iqk_mul_mat(long Nx, long Ny, long ne00,
              dequant_type != etypeA && MulMat::prepare(dequant_type, typeB, ne00, mm, Ny) &&
              Nx%MulMat::num_rows(ggml_type(dequant_type)) == 0) {
 
-        constexpr int k_x_step = 32;
+        const int k_x_step = z6_repack_tile();
 
         auto num_rows = MulMat::num_rows(ggml_type(dequant_type));
         GGML_ASSERT(Nx%num_rows == 0);
@@ -851,7 +881,7 @@ extern "C" IQK_API bool iqk_mul_mat_moe(long Nx, long Ny, long ne00, int ne11,
     if (dequant_type != etypeA && Nx%MulMat::num_rows(dequant_type) == 0 &&
         MulMat::prepare(dequant_type, typeB, ne00, mm, Ny)) {
 
-        constexpr int k_x_step = 32;
+        const int k_x_step = z6_repack_tile();
 
         auto num_rows = MulMat::num_rows(ggml_type(dequant_type));
         GGML_ASSERT(Nx%num_rows == 0);

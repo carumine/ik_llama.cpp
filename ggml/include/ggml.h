@@ -729,6 +729,7 @@ extern "C" {
         GGML_OP_MASK_TO_IDX,
         GGML_OP_LATENT_ATTN,
         GGML_OP_DS4_COMP,
+        GGML_OP_Z6_HC,
 
         GGML_OP_FMA,
 
@@ -948,6 +949,8 @@ extern "C" {
     GGML_API FILE *  ggml_fopen(const char * fname, const char * mode);
 
     GGML_API void    ggml_numa_init(enum ggml_numa_strategy numa); // call once for better performance on NUMA systems
+    // Z6: establish expert page policy before loading/pinning owned host weights.
+    GGML_API bool ggml_z6_numa_place_tensor(const struct ggml_tensor * tensor);
     GGML_API bool    ggml_is_numa(void); // true if init detected that system has >1 NUMA node
 
     GGML_API void    ggml_print_object (const struct ggml_object * obj);
@@ -1159,6 +1162,14 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
             struct ggml_tensor  * b);
+
+    // As mul_multi_add, but never reads a contribution whose ids entry is negative.
+    // src[2]/src[3] remain available for expert scales/original expert IDs.
+    GGML_API struct ggml_tensor * ggml_mul_multi_add_id(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b,
+        struct ggml_tensor  * ids);
 
     // Source may be F32, F16, or a supported quantized type; output is always F32.
     GGML_API struct ggml_tensor * ggml_hadamard(
@@ -2752,6 +2763,59 @@ extern "C" {
             int                   n_iters,
             float                 eps);
 
+    // Z6: operazioni fuse delle hyper-connection di qwen4exp (un kernel invece di 2-5)
+    // combine:  dst[e,h,t] = res[e,h,t] + b[e,t] * s_out*sigmoid(s_in*inj[h,t])     res [E,H,T], b [E,(1),T], inj [H,T]
+    GGML_API struct ggml_tensor * ggml_z6_hc_combine(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * res,
+            struct ggml_tensor  * b,
+            struct ggml_tensor  * inj,
+            float                 s_in,
+            float                 s_out);
+    // gate_sum: dst[e,t] = scale * sum_h sigmoid(up[e+h*E,t]) * xn[e+h*E,t]           up, xn [E*H,T] -> [E,T]
+    GGML_API struct ggml_tensor * ggml_z6_hc_gate_sum(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * up,
+            struct ggml_tensor  * xn,
+            int                   H,
+            float                 scale);
+    // norm:     dst[e+h*E,t] = x[e,h,t] / sqrt(mean_e x[.,h,t]^2 + eps) * w[e+h*E]     x [E,H,T], w [E*H] -> [E*H,T]
+    GGML_API struct ggml_tensor * ggml_z6_hc_norm(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * w,
+            float                 eps);
+
+    // Packed [normalized streams, injection weights], decode only (four streams).
+    GGML_API struct ggml_tensor * ggml_z6_hc_norm_inject(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * w,
+            struct ggml_tensor  * w_inject,
+            float                 eps);
+
+    GGML_API struct ggml_tensor * ggml_z6_ssm_silu_norm(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            int                   key_dim,
+            int                   head_dim,
+            float                 eps);
+
+    GGML_API struct ggml_tensor * ggml_z6_moe_down_sum(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * experts,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * ids,
+            struct ggml_tensor  * weights);
+
+    // gather_f16: celle idx di una cache K o V quantizzata [ne0*ne1 per cella], convertite in f16 -> [ne0, ne1, n_idx]
+    GGML_API struct ggml_tensor * ggml_z6_gather_f16(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * cache,
+            struct ggml_tensor  * idx,
+            int64_t               ne0,
+            int64_t               ne1);
+
     GGML_API struct ggml_tensor * ggml_hc_post(
             struct ggml_context * ctx,
             struct ggml_tensor  * x,
@@ -3429,6 +3493,9 @@ extern "C" {
 
     GGML_API void  ggml_set_quantize_fudge_factor(enum ggml_type type, float fudge);
     GGML_API float ggml_get_quantize_fudge_factor(enum ggml_type type);
+
+    // Z6: esperti freddi scelti dall'ultimo token per un livello (GGML_Z6_CALDI_DINAMICI)
+    GGML_API int ggml_z6_freddi_scelti(int il, int * out, int max);
 
 #ifdef  __cplusplus
 }

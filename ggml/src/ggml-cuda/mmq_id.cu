@@ -128,6 +128,9 @@ static void launch_mmq_ids_helper(
         const int n_experts, const int n_tokens, const int n_expert_used_var, const int nchannels_y, const int si1, const int sis1, cudaStream_t stream) {
     GGML_ASSERT(n_tokens          < (1 << 22) && "too few bits in mmq_ids_helper_store");
     GGML_ASSERT(n_expert_used_var < (1 << 10) && "too few bits in mmq_ids_helper_store");
+    // Z6 (GGML_Z6_CALDI_BATCH): gli id negativi lasciano buchi all'inizio della lista compatta, che la conversione legge
+    static const bool z6_id_negativi = getenv("GGML_Z6_CALDI_BATCH") != nullptr;
+    if (z6_id_negativi) CUDA_CHECK(cudaMemsetAsync(ids_src1, 0, (size_t) n_tokens*n_expert_used_var*sizeof(int32_t), stream));
 
     const int id = ggml_cuda_get_device();
     const int warp_size = ggml_cuda_get_physical_warp_size_host(); //ggml_cuda_info().devices[id].warp_size;

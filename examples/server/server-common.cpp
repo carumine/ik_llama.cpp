@@ -837,6 +837,21 @@ json oaicompat_chat_params_parse(
         throw std::runtime_error("invalid type for \"enable_thinking\" (expected boolean, got string)");
     }
 
+    // Honor the OAI field used by clients such as LocalHarness. Forward it to
+    // templates supporting effort levels; "none" explicitly disables thinking.
+    if (body.contains("reasoning_effort")) {
+        const auto effort = json_value(body, "reasoning_effort", std::string(""));
+        if (effort == "none") {
+            inputs.enable_thinking = false;
+            // The older differential autoparser also consumes template kwargs.
+            // Keep its explicit template flag consistent with the parser flag.
+            inputs.chat_template_kwargs["enable_thinking"] = "false";
+            inputs.chat_template_kwargs.erase("reasoning_effort");
+        } else if (!effort.empty()) {
+            inputs.chat_template_kwargs["reasoning_effort"] = json(effort).dump();
+        }
+    }
+
     /*"whether to prefill the assistant's response if the last message is an assistant message (default: prefill enabled)\n"
         "when this flag is set, if the last message is an assistant message then it will be treated as a full message and not prefilled\n"*/
     bool prefill_assistant_message = !inputs.messages.empty() && inputs.messages.back().role == "assistant" && opt.prefill_assistant;

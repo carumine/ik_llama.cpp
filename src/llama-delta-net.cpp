@@ -7,6 +7,7 @@
 #include "ggml.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <unordered_set>
 
 #define QWEN3NEXT_CHUNK_SIZE 64
@@ -337,7 +338,12 @@ ggml_tensor * delta_net::build_qkv(ggml_context * ctx0, ggml_tensor * state_stor
     cb(conv_output_raw, "conv_output_raw", il);
 
     ggml_tensor * conv_output = ggml_view_2d(ctx0, conv_output_raw, conv_dim, n_tok, conv_dim * ggml_element_size(conv_output_raw), 0);
-    ggml_tensor * conv_output_silu = ggml_silu(ctx0, conv_output);
+    static const bool z6_fuse_ssm = [] { const char * e = std::getenv("GGML_Z6_SSM_FUSO"); return e && std::atoi(e) > 0; }();
+    const bool fused_silu_norm = z6_fuse_ssm && n_seq_tokens == 1 && n_seqs == 1 &&
+            head_k_dim > 0 && head_k_dim <= 256 && head_k_dim % 32 == 0 && conv_dim % head_k_dim == 0;
+    ggml_tensor * conv_output_silu = fused_silu_norm
+            ? ggml_z6_ssm_silu_norm(ctx0, conv_output, key_dim, head_k_dim, eps_norm)
+            : ggml_silu(ctx0, conv_output);
     cb(conv_output_silu, "conv_output_silu", il);
     ggml_build_forward_expand(gf, conv_output_silu);
 
@@ -367,8 +373,10 @@ ggml_tensor * delta_net::build_qkv(ggml_context * ctx0, ggml_tensor * state_stor
         q_conv = ggml_l2_norm(ctx0, q_conv, eps_norm);
         k_conv = ggml_l2_norm(ctx0, k_conv, eps_norm);
     } else {
-        q_conv = ggml_l2_norm(ctx0, q_conv, eps_norm);
-        k_conv = ggml_l2_norm(ctx0, k_conv, eps_norm);
+        if (!fused_silu_norm) {
+            q_conv = ggml_l2_norm(ctx0, q_conv, eps_norm);
+            k_conv = ggml_l2_norm(ctx0, k_conv, eps_norm);
+        }
         q_conv = ggml_permute(ctx0, q_conv, 0, 2, 1, 3);
         k_conv = ggml_permute(ctx0, k_conv, 0, 2, 1, 3);
     }

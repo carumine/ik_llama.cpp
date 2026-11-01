@@ -1262,6 +1262,16 @@ bool llama_model_loader::load_all_data(
     // and this is the mutex we use.
     std::mutex load_mutex;
 
+#ifdef GGML_USE_CUDA
+    auto z6_bind_owned = [](ggml_tensor * tensor) {
+        const char * pin = getenv("GGML_Z6_NUMA_PINNED");
+        if (pin && atoi(pin) > 0 && strstr(ggml_get_name(tensor), "_exps.weight") &&
+                !ggml_z6_numa_place_tensor(tensor)) {
+            throw std::runtime_error("NUMA expert policy failed before the first write");
+        }
+    };
+#endif
+
     // Load model weights into a backing buffer:
     // * mmap:               host page cache        Serial
     // * host:               system ram             Parallel
@@ -1310,14 +1320,17 @@ bool llama_model_loader::load_all_data(
                         throw std::runtime_error(format("unable to allocate repack buffer for tensor '%s'", ggml_get_name(cur)));
                     }
                     uint8_t * base = (uint8_t *) ggml_backend_buffer_get_base(owned);
+                    ggml_backend_tensor_alloc(owned, cur, base);
+                    ggml_backend_buffer_set_usage(owned, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+                    model->bufs.push_back(owned); // own it before any read/placement can throw
+#ifdef GGML_USE_CUDA
+                    z6_bind_owned(cur);
+#endif
                     file->seek(weight->offs, SEEK_SET);
                     file->read_raw(base, n_size);
                     if (check_tensors && !ggml_validate_row_data(cur->type, base, n_size)) {
                         throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));
                     }
-                    ggml_backend_tensor_alloc(owned, cur, base);
-                    ggml_backend_buffer_set_usage(owned, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-                    model->bufs.push_back(owned);
                     return n_size;
                 }
             }
@@ -1358,6 +1371,9 @@ bool llama_model_loader::load_all_data(
                     ggml_backend_tensor_alloc(bbuf, base, ggml_backend_buffer_get_base(bbuf));
                     ggml_backend_buffer_set_usage(bbuf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
                     model->bufs.push_back(bbuf);
+#ifdef GGML_USE_CUDA
+                    z6_bind_owned(base);
+#endif
                     if (lmlocks) {
                         model->mlock_bufs.emplace_back(new llama_mlock);
                         auto & mlock_buf = model->mlock_bufs.back();

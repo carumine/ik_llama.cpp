@@ -54,6 +54,10 @@ add_library(llama
             llama-build-context.cpp
             llama-moe-cache.h
             llama-moe-cache.cpp
+            llama-z6-caldi.h
+            llama-z6-caldi.cpp
+            llama-z6-testa.h
+            llama-z6-testa.cpp
             llama-model.h
             llama-model.cpp
             llama-reload-info.h
@@ -152,6 +156,11 @@ target_include_directories(llama PRIVATE ../ggml/src)
 target_compile_features   (llama PUBLIC cxx_std_17)
 
 target_link_libraries(llama PUBLIC ggml)
+# Z6: preparazione degli ingressi a contesto lungo divisa fra i thread OpenMP di ggml (GGML_Z6_INGRESSI_PAR)
+find_package(OpenMP)
+if (OpenMP_CXX_FOUND)
+    target_link_libraries(llama PRIVATE OpenMP::OpenMP_CXX)
+endif()
 
 if (BUILD_SHARED_LIBS)
     set_target_properties(llama PROPERTIES POSITION_INDEPENDENT_CODE ON)

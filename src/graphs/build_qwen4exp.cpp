@@ -1,10 +1,22 @@
 #include "../llama-build-context.h"
 #include "../llama-model.h"
 #include "../llama-context.h"
+#include "../llama-z6-testa.h"
 #include "../llama-delta-net.h"
 #include "../llama-spec-features-dflash.h"
 
 #include <optional>
+
+// Z6 (GGML_Z6_HC_FUSO=1): norma, coda del mix e combine delle hyper-connection in un kernel ciascuno
+static bool qwen4exp_z6_hc_fuso() {
+    static const bool v = [] { const char * e = getenv("GGML_Z6_HC_FUSO"); return e && atoi(e) > 0; }();
+    return v;
+}
+
+static bool qwen4exp_z6_hc_inject_fuso() {
+    static const bool v = [] { const char * e = getenv("GGML_Z6_HC_INJECT_FUSO"); return e && atoi(e) > 0; }();
+    return v;
+}
 
 static ggml_tensor * qwen4exp_grouped_rms(
         ggml_context        * ctx0,
@@ -37,13 +49,26 @@ static ggml_tensor * qwen4exp_hc_mix(
     const int32_t hc_dim = hc * n_embd;
     const int64_t nt     = x->ne[2];
 
-    ggml_tensor * xn = qwen4exp_grouped_rms(ctx0, hparams, x, w_norm, hc_dim, nt);
+    const bool fuso = qwen4exp_z6_hc_fuso() && ggml_is_contiguous(x) && x->type == GGML_TYPE_F32 &&
+            w_norm->type == GGML_TYPE_F32;
+    const bool inject_fuso = fuso && qwen4exp_z6_hc_inject_fuso() && inject && hc == 4 && nt == 1 &&
+            n_embd % 256 == 0 && w_inject && w_inject->type == GGML_TYPE_F32 &&
+            ggml_is_contiguous(w_inject) && lctx.lora_adapters.empty();
+    ggml_tensor * xn;
+    if (inject_fuso) {
+        auto packed = ggml_z6_hc_norm_inject(ctx0, x, w_norm, w_inject, hparams.f_norm_rms_eps);
+        xn = ggml_view_2d(ctx0, packed, hc_dim, 1, hc_dim*sizeof(float), 0);
+        *inject = ggml_view_2d(ctx0, packed, hc, 1, hc*sizeof(float), hc_dim*sizeof(float));
+    } else {
+        xn = fuso ? ggml_z6_hc_norm(ctx0, x, w_norm, hparams.f_norm_rms_eps)
+                  : qwen4exp_grouped_rms(ctx0, hparams, x, w_norm, hc_dim, nt);
+    }
     cb(xn, "hc_norm", il);
 
     ggml_tensor * lo = llm_build_context::llm_build_lora_mm(lctx, ctx0, w_down, xn);
     cb(lo, "mix_down", il);
     if (inject) {
-        *inject = llm_build_context::llm_build_lora_mm(lctx, ctx0, w_inject, xn);
+        if (!inject_fuso) *inject = llm_build_context::llm_build_lora_mm(lctx, ctx0, w_inject, xn);
         cb(*inject, "hc_inject", il);
         ggml_build_forward_expand(gf, lo);
         ggml_build_forward_expand(gf, *inject);
@@ -54,6 +79,12 @@ static ggml_tensor * qwen4exp_hc_mix(
     cb(lo, "mix_down_silu", il);
     auto up = llm_build_context::llm_build_lora_mm(lctx, ctx0, w_up, lo);
     cb(up, "mix_up", il);
+    if (fuso && ggml_is_contiguous(up) && ggml_are_same_shape(up, xn)) {
+        ggml_tensor * mixed = ggml_z6_hc_gate_sum(ctx0, up, xn, hc, 1.0f / (float) hc);
+        cb(mixed, "hc_mixed", il);
+        GGML_UNUSED(bctx);
+        return mixed;
+    }
     auto gated = ggml_fused_mul_unary(ctx0, up, xn, GGML_UNARY_OP_SIGMOID);
     cb(gated, "mix_gated", il);
     //auto gate = ggml_sigmoid(ctx0, up);
@@ -85,6 +116,13 @@ static ggml_tensor * qwen4exp_hc_combine(
         const llm_build_cb  & cb) {
     const int32_t hc = hparams.dsv4_hc_mult;
     const int64_t nt = residual->ne[2];
+
+    if (qwen4exp_z6_hc_fuso() && ggml_is_contiguous(residual) && ggml_is_contiguous(block_out) &&
+            ggml_is_contiguous(inject) && ggml_nelements(inject) == hc*nt) {
+        ggml_tensor * cur = ggml_z6_hc_combine(ctx0, residual, block_out, inject, 1.0f / (float) hc, 2.0f);
+        cb(cur, "hc_combine", il);
+        return cur;
+    }
 
     auto inject_scaled = ggml_scale(ctx0, inject, 1.0f / (float) hc);
     cb(inject_scaled, "inject_s", il);
@@ -349,6 +387,11 @@ static ggml_tensor * qwen4exp_qsa_mask(
         cb(inp->head_w,     "qsa_head_w",     -1);
         for (ggml_tensor * t : {inp->cell_blk, inp->bias, inp->win_blocks, inp->win_cells, inp->win_pos, inp->head_w}) {
             ggml_set_input(t);
+            const char * incr = getenv("GGML_Z6_INGRESSI_INCR");
+            if (n_tokens == 1 && incr && atoi(incr) > 0) {
+                // These host buffers must survive graph execution for an append update.
+                ggml_set_output(t);
+            }
             ggml_build_forward_expand(gf, t);
         }
         auto causal = ggml_view_2d(ctx0, KQ_mask, n_kv, n_tokens, KQ_mask->nb[1], 0);
@@ -505,6 +548,17 @@ static bool qwen4exp_qsa_gather(
         idx = ggml_reshape_1d(ctx0, ggml_reshape_4d_ext(ctx0, idx, GGML_TYPE_I32, n_pad, 1, 1, 1), n_pad);
     }
 
+    // Z6 (GGML_Z6_GATHER_F16=1): celle scelte raccolte già in f16, senza la conversione dentro flash attention
+    static const bool z6_gather_f16 = [] { const char * e = getenv("GGML_Z6_GATHER_F16"); return e && atoi(e) > 0; }();
+    if (z6_gather_f16 && k_cache->type == GGML_TYPE_Q8_0 && v_cache->type == GGML_TYPE_Q8_0 &&
+            k_cell == ggml_row_size(k_cache->type, (int64_t) n_embd_head_k*n_head_kv)) {
+        ggml_tensor * k = ggml_z6_gather_f16(ctx0, k_cache, idx, n_embd_head_k, n_head_kv);
+        *k_out = ggml_view_3d(ctx0, k, n_embd_head_k, n_pad, n_head_kv, k->nb[2], k->nb[1], 0);
+        cb(*k_out, "qsa_k_sel", il);
+        ggml_tensor * v = ggml_z6_gather_f16(ctx0, v_cache, idx, n_embd_head_v, n_head_kv);
+        *v_out = ggml_view_3d(ctx0, v, n_embd_head_v, n_pad, n_head_kv, v->nb[2], v->nb[1], 0);
+        cb(*v_out, "qsa_v_sel", il);
+    } else {
     ggml_tensor * k = ggml_reshape_4d_ext(ctx0, k_cache, GGML_TYPE_F32, k_cell/sizeof(float), n_cells, 1, 1);
     k = ggml_get_rows(ctx0, k, idx);
     cb(k, "gather_k", il);
@@ -518,6 +572,7 @@ static bool qwen4exp_qsa_gather(
     v = ggml_reshape_4d_ext(ctx0, v, v_cache->type, n_embd_head_v, n_head_kv, n_pad, 1);
     *v_out = ggml_view_3d(ctx0, v, n_embd_head_v, n_pad, n_head_kv, v->nb[2], v->nb[1], 0);
     cb(*v_out, "qsa_v_sel", il);
+    }
 
     // gather the mask too: a selected cell can belong to another sequence or lie past its end
     ggml_tensor * m = ggml_view_2d(ctx0, KQ_mask, 1, bctx.n_kv, ggml_element_size(KQ_mask), 0);
@@ -769,7 +824,12 @@ ggml_cgraph * llm_build_context::build_qwen4exp() {
     // name the mixed stream for append_pooling (the nextn tail needs a named embd)
     cb(cur, "result_embd", -1);
 
-    cur = llm_build_lora_mm(lctx, ctx0, model.output, cur);
+    if (lctx.z6_testa) {
+        GGML_ASSERT(lctx.lora_adapters.empty() && "GGML_Z6_TESTA_DIVISA non supporta LoRA");
+        cur = lctx.z6_testa->build(ctx0, gf, lctx.sched, lctx.backend_cpu, cur);
+    } else {
+        cur = llm_build_lora_mm(lctx, ctx0, model.output, cur);
+    }
     cb(cur, "result_output", -1);
 
     ggml_build_forward_expand(gf, cur);

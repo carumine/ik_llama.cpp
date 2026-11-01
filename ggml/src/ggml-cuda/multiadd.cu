@@ -102,6 +102,24 @@ static void mul_multi_add_f32_cuda(int nused, int64_t ne0, int64_t ne1, int64_t 
     mul_multi_add_f32<<<num_blocks, CUDA_MULTI_ADD_BLOCK_SIZE, 0, stream>>>(nused, ne0, ne1, nb1, nb01, nb02, nb11, nb12, nb31, src0, src1, dst, scales, ids);
 }
 
+static __global__ void mul_multi_add_id_f32(
+        int ne0, int nt, int nk, const char * x, size_t xb1, size_t xb2,
+        const char * w, size_t wb1, size_t wb2, const char * valid, size_t vb1,
+        const float * scales, const char * original, size_t ob1, char * out, size_t outb1) {
+    int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= ne0*nt) return;
+    int t = i/ne0, k = i%ne0;
+    const auto ids = (const int32_t *)(valid + t*vb1);
+    float sum = 0.0f;
+    for (int j = 0; j < nk; ++j) {
+        if (ids[j] < 0) continue; // no reads of x, w or scales for an excluded expert
+        float weight = *(const float *)(w + t*wb2 + j*wb1);
+        if (scales) weight *= scales[((const int32_t *)(original + t*ob1))[j]];
+        sum += ((const float *)(x + t*xb2 + j*xb1))[k]*weight;
+    }
+    ((float *)(out + t*outb1))[k] = sum;
+}
+
 void ggml_cuda_op_mul_multi_add(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     auto src0 = dst->src[0];
     auto src1 = dst->src[1];
@@ -118,6 +136,21 @@ void ggml_cuda_op_mul_multi_add(ggml_backend_cuda_context & ctx, ggml_tensor * d
 
     auto src2 = dst->src[2];
     auto src3 = dst->src[3];
+    if (dst->src[4]) {
+        auto valid = dst->src[4];
+        GGML_ASSERT(valid->type == GGML_TYPE_I32 && valid->nb[0] == sizeof(int32_t));
+        const int n = dst->ne[0]*dst->ne[1];
+        mul_multi_add_id_f32<<<(n + CUDA_MULTI_ADD_BLOCK_SIZE - 1)/CUDA_MULTI_ADD_BLOCK_SIZE,
+                CUDA_MULTI_ADD_BLOCK_SIZE, 0, ctx.stream()>>>(
+                dst->ne[0], dst->ne[1], src0->ne[1],
+                (const char *)src0->data, src0->nb[1], src0->nb[2],
+                (const char *)src1->data, src1->nb[1], src1->nb[2],
+                (const char *)valid->data, valid->nb[1],
+                src2 && src3 ? (const float *)src2->data : nullptr,
+                src3 ? (const char *)src3->data : nullptr, src3 ? src3->nb[1] : 0,
+                (char *)dst->data, dst->nb[1]);
+        return;
+    }
     if (src2 && src3) {
         GGML_ASSERT(src3->ne[0] == src0->ne[1]);
         GGML_ASSERT(src3->type == GGML_TYPE_I32);

@@ -25,6 +25,8 @@
 #include "llama-hparams.h"
 #include "llama-context.h"
 #include "llama-moe-cache.h"
+#include "llama-z6-caldi.h"
+#include "llama-z6-testa.h"
 #include "llama-spec-features.h"
 #include "llama-dflash.h"
 #include "llama-dsv4.h"
@@ -663,6 +665,7 @@ static inline uint64_t model_state_hash(const llama_context & lctx) {
 }
 
 void llama_context::reset_scheduler() {
+    z6_mask_append = {};
     ggml_backend_sched_reset(sched);
     prev.reset();
     prev_mtp.reset();
@@ -911,6 +914,8 @@ llama_context::~llama_context() {
     free_dsv4_cache_tensors();
     ggml_backend_sched_free(sched);
     moe_cache.reset();
+    z6_caldi.reset();
+    z6_testa.reset();
 
     for (ggml_backend_t backend : backends) {
         ggml_backend_free(backend);
@@ -937,6 +942,8 @@ static int llama_openpangu_chunked_graph_nodes(const llama_model & model, const 
 
 int llama_context::max_nodes(int n_tokens, int n_kv) const {
     int max_nodes = model.max_nodes(n_tokens);
+    // The hot branch is token-wise on CUDA even for a small batched decode.
+    if (llama_z6_caldi::requested()) max_nodes += model.hparams.n_layer*32*16;
     max_nodes += llama_openpangu_chunked_graph_nodes(model, cparams, n_tokens, n_kv);
     if (model.arch == LLM_ARCH_DEEPSEEK41 && n_tokens > 0 && n_kv > 0) {
         const llama_hparams & hp = model.hparams;
@@ -2259,6 +2266,7 @@ bool llama_kv_cache::checkpoint_restore(ggml_backend_sched_t sched, llama_ckpt_d
 
     const uint32_t n_layer = (uint32_t)s_l.size();
 
+    ++z6_inputs_epoch;
     cells = ckpt.cells_snapshot;
     head  = ckpt.head_snapshot;
     used  = ckpt.used_snapshot;
@@ -2633,6 +2641,7 @@ bool llama_kv_cache::per_step_restore(ggml_backend_sched_t sched,llama_ckpt_data
 }
 
 static void llama_kv_cache_clear(struct llama_kv_cache & cache) {
+    ++cache.z6_inputs_epoch;
     for (int32_t i = 0; i < (int32_t) cache.size; ++i) {
         cache.cells[i].pos = -1;
         cache.cells[i].tok = -1;
@@ -2655,6 +2664,7 @@ static bool llama_kv_cache_seq_rm(
                  llama_seq_id   seq_id,
                     llama_pos   p0,
                     llama_pos   p1) {
+    ++cache.z6_inputs_epoch;
     uint32_t new_head = cache.size;
 
     if (p0 < 0) p0 = 0;
@@ -2753,6 +2763,7 @@ static void llama_kv_cache_seq_cp(
                  llama_seq_id   seq_id_dst,
                     llama_pos   p0,
                     llama_pos   p1) {
+    ++cache.z6_inputs_epoch;
     if (p0 < 0) p0 = 0;
     if (p1 < 0) p1 = std::numeric_limits<llama_pos>::max();
 
@@ -2806,6 +2817,7 @@ static void llama_kv_cache_seq_cp(
 }
 
 static void llama_kv_cache_seq_keep(struct llama_kv_cache & cache, llama_seq_id seq_id) {
+    ++cache.z6_inputs_epoch;
     uint32_t new_head = cache.size;
     const bool has_qnext_state = llama_kv_has_qnext_state_storage(cache);
 
@@ -2834,6 +2846,7 @@ static void llama_kv_cache_seq_add(
                     llama_pos   p0,
                     llama_pos   p1,
                     llama_pos   delta) {
+    ++cache.z6_inputs_epoch;
     // position-strict caches (openPangu latent rows and indexer keys) cannot be
     // re-positioned: rope is baked into the cached k_pe rows and the side state is keyed
     // by absolute position. Fail loudly instead of corrupting.
@@ -2891,6 +2904,7 @@ static void llama_kv_cache_seq_div(
                     llama_pos   p0,
                     llama_pos   p1,
                           int   d) {
+    ++cache.z6_inputs_epoch;
     // see llama_kv_cache_seq_add: position-strict caches cannot be re-positioned
     GGML_ASSERT(!cache.s_l_position_strict && "self-extend/position division is not supported for this model's position-indexed KV cache");
     GGML_ASSERT(!cache.any_compacted() && "self-extend/position division is not supported for a compacted KV cache (--swa-compress)");
@@ -2950,6 +2964,7 @@ static llama_pos llama_kv_cache_seq_pos_min(const struct llama_kv_cache & cache,
 }
 
 static void llama_kv_cache_defrag(struct llama_kv_cache & cache) {
+    ++cache.z6_inputs_epoch;
     if (cache.s_l_position_strict) {
         // defrag moves cells, which would break the cell-index == position mapping the
         // openPangu indexer cache relies on; skipping is safe (defrag is an optimization)
@@ -5202,6 +5217,23 @@ static bool llm_load_tensors(
 
     model.mappings.reserve(ml.mappings.size());
 
+#ifdef GGML_USE_CUDA
+    const char * z6_pin_env = getenv("GGML_Z6_NUMA_PINNED");
+    const bool z6_pin = z6_pin_env && atoi(z6_pin_env) > 0;
+    const char * z6_numa_env = getenv("GGML_Z6_NUMA_EXPERTS");
+    if (z6_pin && !(z6_numa_env && atoi(z6_numa_env) > 0)) {
+        throw std::runtime_error("GGML_Z6_NUMA_PINNED requires GGML_Z6_NUMA_EXPERTS=1");
+    }
+    if (z6_pin && (!mmap_disabled || use_mlock || getenv("GGML_CUDA_NO_PINNED"))) {
+        throw std::runtime_error("GGML_Z6_NUMA_PINNED requires --no-mmap, no --mlock and CUDA pinning enabled");
+    }
+    // Reset even on exceptions/cancellation. Runtime staging buffers pin immediately.
+    struct z6_defer_guard {
+        explicit z6_defer_guard(bool active) { ggml_backend_cuda_host_defer(active); }
+        ~z6_defer_guard() { ggml_backend_cuda_host_defer(false); }
+    } z6_guard(z6_pin);
+#endif
+
     // create the backend buffers
     std::vector<std::pair<ggml_context *, llama_buf_map>> ctx_bufs;
     ctx_bufs.reserve(ctx_map.size());
@@ -5412,6 +5444,10 @@ static bool llm_load_tensors(
             }
         }
 
+#ifdef GGML_USE_CUDA
+        ggml_backend_cuda_host_defer(false);
+#endif
+
         if (defer_expert_mmap) {
             ml.drop_mmap_expert_pages();
         }
@@ -5617,6 +5653,53 @@ static bool llm_load_tensors(
 
     // Prism ternary Hadamard rotations
     llm_load_hadamard(ml, model);
+
+    // Pin only after every in-place CPU weight transformation has completed.
+    if (!dry_run) {
+        // --defer-ple with --no-mmap allocates owned host copies inside
+        // load_all_data. Only now do all tensors have their final addresses.
+#ifdef GGML_USE_CUDA
+        if (z6_pin) {
+            // La cache del file letto adesso non serve (--no-mmap ha copiato i pesi) e, se riempie il
+            // nodo 1, il kernel non le toglie spazio per spostarvi le pagine degli esperti: la
+            // verifica NUMA fallirebbe. Le righe PLE lasciate sul file tornano in cache all'uso.
+            for (const auto & file : ml.files) {
+                posix_fadvise(file->file_id(), 0, 0, POSIX_FADV_DONTNEED);
+            }
+            int placed = 0;
+            for (const auto & named : model.tensors_by_name) {
+                const auto * t = named.second;
+                if (t->buffer && ggml_backend_buffer_is_host(t->buffer) &&
+                        named.first.find("_exps.weight") != std::string::npos) {
+                    if (!t->data || t->ne[2] < 2 || !ggml_z6_numa_place_tensor(t)) {
+                        throw std::runtime_error("NUMA expert placement failed before CUDA registration");
+                    }
+                    ++placed;
+                }
+            }
+            // Un modello senza esperti in RAM (per esempio la testa MTP) registra solo gli altri buffer
+            if (!placed) LLAMA_LOG_INFO("z6 pinned: no host expert tensors, registering the other host buffers\n");
+            LLAMA_LOG_INFO("z6 pinned: placed %d expert tensors at final addresses; registering host buffers\n", placed);
+            auto z6_maps = [](const char * phase) {
+                const char * prefix = getenv("GGML_Z6_NUMA_MAPS_PREFIX");
+                if (!prefix || !*prefix) return;
+                for (const char * name : {"numa_maps", "maps"}) {
+                    std::ifstream source(std::string("/proc/self/") + name);
+                    std::ofstream target(std::string(prefix) + "-" + phase + "-" + name);
+                    if (!source || !target) throw std::runtime_error("unable to save NUMA pin diagnostic maps");
+                    target << source.rdbuf();
+                    if (!target) throw std::runtime_error("unable to write NUMA pin diagnostic maps");
+                }
+            };
+            z6_maps("before-register");
+            if (!ggml_backend_cuda_host_register_pending()) {
+                throw std::runtime_error("CUDA registration failed after NUMA expert placement");
+            }
+            z6_maps("after-register");
+        }
+#endif
+
+    }
 
     // loading time will be recalculate after the first eval, so
     // we take page faults deferred by mmap() into consideration
@@ -5900,6 +5983,131 @@ static void llama_set_engram_rows(llama_context & lctx, const llama_batch & batc
     ggml_backend_tensor_set(rows, idx.data(), 0, idx.size()*sizeof(int32_t));
 }
 
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
+// Z6 (GGML_Z6_INGRESSI_PAR=1): a contesto lungo i cicli per cella di llama_set_inputs (maschera causale e
+// ingressi dell'attenzione sparsa, con un std::set per cella) costano millisecondi per token su un thread
+// solo, mentre i thread di calcolo aspettano. f(primo, ultimo) su intervalli multipli di passo, in parallelo
+// con la squadra OpenMP di ggml; sotto le 16384 celle o senza la variabile, in un thread come prima.
+template <typename F>
+static void z6_per_celle(int64_t n, int64_t passo, F && f) {
+#ifdef _OPENMP
+    static const bool attivo = [] { const char * e = getenv("GGML_Z6_INGRESSI_PAR"); return e && atoi(e) > 0; }();
+    if (attivo && n >= 16384) {
+        #pragma omp parallel
+        {
+            const int64_t nth = omp_get_num_threads(), ith = omp_get_thread_num();
+            const int64_t per = ((n + nth - 1)/nth + passo - 1)/passo*passo;
+            const int64_t a = ith*per, b = std::min(n, a + per);
+            if (a < b) f(a, b);
+        }
+        return;
+    }
+#endif
+    GGML_UNUSED(passo);
+    f(0, n);
+}
+
+static bool z6_ingressi_incr() {
+    static const bool v = [] { const char * e = getenv("GGML_Z6_INGRESSI_INCR"); return e && atoi(e) > 0; }();
+    return v;
+}
+static bool z6_ingressi_verifica() {
+    static const bool v = [] { const char * e = getenv("GGML_Z6_INGRESSI_VERIFICA"); return e && atoi(e) > 0; }();
+    return v;
+}
+static bool z6_append_eligible(const llama_context & ctx, const llama_batch & batch) {
+    if (!z6_ingressi_incr() || ctx.model.arch != LLM_ARCH_QWEN4EXP || !ctx.cparams.causal_attn ||
+            !ctx.cparams.flash_attn || ctx.is_encoding || ctx.cparams.mtp_op_type != MTP_OP_NONE ||
+            ctx.model.hparams.use_alibi || ctx.model.hparams.n_attn_chunk || ctx.model.hparams.n_swa ||
+            ctx.kv_self.any_compacted() || batch.n_tokens != 1 || !batch.pos || !batch.n_seq_id ||
+            batch.n_seq_id[0] != 1 || ctx.kv_self.head >= ctx.kv_self.n) return false;
+    const auto & cell = ctx.kv_self.cells[ctx.kv_self.head];
+    return cell.pos == batch.pos[0] && cell.seq_id.size() == 1 && cell.has_seq_id(batch.seq_id[0][0]);
+}
+static bool z6_appended(const llama_context & ctx, const llama_batch & batch, const llama_context::z6_append_input & state) {
+    return z6_append_eligible(ctx, batch) && state.valid && state.epoch == ctx.kv_self.z6_inputs_epoch &&
+        state.head + 1 == ctx.kv_self.head && state.pos + 1 == batch.pos[0] && state.seq == batch.seq_id[0][0];
+}
+static void z6_append_stamp(const llama_context & ctx, const llama_batch & batch, llama_context::z6_append_input & state) {
+    const bool appended = z6_appended(ctx, batch, state);
+    state.valid = z6_append_eligible(ctx, batch);
+    // Establish the append-only invariant once after a full fill or cache edit.
+    // Other sequences, holes or pre-existing future cells can change old mask/bias
+    // entries when the query position advances, even if this cell is contiguous.
+    if (state.valid && !appended) {
+        const auto & kv = ctx.kv_self;
+        const auto seq = batch.seq_id[0][0];
+        for (uint32_t i = 0; i < kv.size; ++i) {
+            const auto & c = kv.cells[i];
+            if (i <= kv.head ? c.pos != (llama_pos)i || c.seq_id.size() != 1 || !c.has_seq_id(seq)
+                             : !c.is_empty()) {
+                state.valid = false;
+                break;
+            }
+        }
+    }
+    if (state.valid) {
+        state.epoch = ctx.kv_self.z6_inputs_epoch; state.head = ctx.kv_self.head;
+        state.pos = batch.pos[0]; state.seq = batch.seq_id[0][0];
+    }
+}
+static void z6_verify_bytes(ggml_tensor * t, const std::vector<uint8_t> & expected) {
+    GGML_ASSERT(expected.size() == ggml_nbytes(t));
+    if (memcmp(t->data, expected.data(), expected.size()) != 0) {
+        size_t first = 0;
+        const auto actual = (const uint8_t *)t->data;
+        while (first < expected.size() && actual[first] == expected[first]) ++first;
+        GGML_ABORT("Z6 incremental inputs differ from full fill: %s shape=%lldx%lld first_byte=%zu incremental=%u full=%u",
+                t->name, (long long)t->ne[0], (long long)t->ne[1], first, expected[first], actual[first]);
+    }
+    static uint64_t calls = 0;
+    if ((++calls & (calls - 1)) == 0) LLAMA_LOG_INFO("Z6 ingressi: %llu buffer bit-identici al riempimento completo\n", (unsigned long long)calls);
+}
+// Only an appended decode cell changed. Revisit its compression block and the previous
+// block (whose tail boost may disappear); all other cells retain their previous bytes.
+static void z6_qsa_append(llama_context & ctx, const llama_batch & batch, llama_context::qsa_input & qsa) {
+    const auto & kv = ctx.kv_self;
+    const int r = qsa.ratio, n = qsa.cell_blk->ne[0], nw = qsa.win_blocks->ne[0];
+    auto ids = (int32_t *)qsa.cell_blk->data;
+    auto bias = (float *)qsa.bias->data;
+    const auto pos = batch.pos[0]; const auto tail = (pos+1)/r*r;
+    for (int b = (kv.head-1)/r; b <= int(kv.head)/r; ++b) {
+        int filled = 0; llama_seq_id sid = -1; bool mixed = false;
+        for (int j = b*r; j < std::min(n, (b+1)*r); ++j) {
+            const auto & c = kv.cells[j]; if (c.is_empty()) continue;
+            const auto s = *c.seq_id.begin();
+            if (sid < 0) sid = s; else if (sid != s) mixed = true;
+            ++filled;
+        }
+        const bool valid = filled == r && !mixed;
+        for (int j = b*r; j < std::min(n, (b+1)*r); ++j) {
+            const auto & c = kv.cells[j];
+            const bool present = !c.is_empty();
+            ids[j] = present && valid ? b : 0;
+            const auto p = present ? c.pos : -1;
+            bias[j] = p >= tail && p <= pos ? 65504.f : present && valid ? 0.f : -INFINITY;
+        }
+    }
+    const int b = kv.head/r;
+    int32_t bp = -1;
+    auto blocks = (int32_t *)qsa.win_blocks->data;
+    auto cells = (int32_t *)qsa.win_cells->data;
+    auto positions = (int32_t *)qsa.win_pos->data;
+    for (int t = 0; t < r; ++t) {
+        const int j = b*r+t;
+        const bool present = j < n && !kv.cells[j].is_empty();
+        if (present && (bp < 0 || kv.cells[j].pos < bp)) bp = kv.cells[j].pos;
+        for (int w = 0; w < nw; ++w) cells[w*r+t] = present ? j : 0;
+    }
+    for (int w = 0; w < nw; ++w) {
+        blocks[w] = b;
+        for (int sec = 0; sec < GGML_MROPE_SECTIONS; ++sec) positions[sec*nw+w] = std::max(0, bp);
+    }
+}
+
 static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
     //
     // set input data
@@ -6072,17 +6280,33 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
             std::fill(dst_w, dst_w + ggml_nelements(qsa.head_w), 1.0f);
         }
 
+        std::vector<std::vector<uint8_t>> z6_expected;
+        const std::vector<ggml_tensor *> z6_checked = z6_ingressi_verifica()
+            ? std::vector<ggml_tensor *>{qsa.cell_blk, qsa.bias, qsa.win_blocks, qsa.win_cells, qsa.win_pos, qsa.head_w}
+            : std::vector<ggml_tensor *>{};
+        if (!lctx.qsa_pooled_stale && z6_appended(lctx, batch, qsa.z6_append)) {
+            z6_qsa_append(lctx, batch, qsa);
+            z6_append_stamp(lctx, batch, qsa.z6_append);
+            if (!z6_ingressi_verifica()) continue;
+            for (auto t : z6_checked) {
+                const auto p = (const uint8_t *)t->data;
+                z6_expected.emplace_back(p, p + ggml_nbytes(t));
+            }
+        }
+
         // -1 where the block cannot be pooled. Block 0 stands in so the gather stays in range;
         // the bias below is what keeps those out of the ranking
         std::vector<int32_t> blk_of(n_kv, -1);
         std::vector<llama_pos> cell_pos(n_kv, -1);
         std::vector<int32_t> filled(n_blocks, 0);
         std::vector<llama_seq_id> blk_seq(n_blocks, -1);
-        std::vector<bool> blk_mixed(n_blocks, false);
+        std::vector<uint8_t> blk_mixed(n_blocks, 0);  // non vector<bool>: i blocchi sono scritti da thread diversi
         std::vector<int32_t> blk_cells(r*n_blocks, 0);
         std::vector<llama_pos> blk_pos(n_blocks, -1);
 
-        for (int32_t j = 0; j < n_kv; ++j) {
+        // ogni thread tiene blocchi interi di r celle: nessun blocco è scritto da due thread
+        z6_per_celle(n_kv, r, [&](int64_t j0, int64_t j1) {
+        for (int32_t j = (int32_t) j0; j < (int32_t) j1; ++j) {
             const auto & cell = kv_self.cells[j];
             if (cell.is_empty()) {
                 continue;
@@ -6106,6 +6330,7 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
             }
             filled[b]++;
         }
+        });
 
         // only these blocks can have changed. A short window repeats its last entry, so the
         // scatter writes the same correct value twice rather than an unrelated block
@@ -6141,30 +6366,33 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
             }
         }
 
-        for (int32_t j = 0; j < n_kv; ++j) {
+        z6_per_celle(n_kv, 1, [&](int64_t j0, int64_t j1) {
+        for (int32_t j = (int32_t) j0; j < (int32_t) j1; ++j) {
             const int32_t b = blk_of[j];
             if (b >= 0 && (filled[b] < r || blk_mixed[b])) {
                 blk_of[j] = -1;
             }
             dst_cell_blk[j] = blk_of[j] < 0 ? 0 : blk_of[j];
         }
+        });
 
         // KQ_mask already carries causality, so this holds only the per-block part: -inf for an
         // unpoolable block, a boost for the incomplete block the query sits in
-        auto fill_bias = [&](int32_t i0, int32_t i1) {
+        auto fill_bias = [&](int32_t i0, int32_t i1, int32_t j0 = 0, int32_t j1 = -1) {
+            if (j1 < 0) j1 = n_kv;
             for (int32_t i = i0; i < i1; ++i) {
                 // n_kv times n_tokens reaches 2^31 at the model's full context, so index wide
                 float * cur_bias = dst_bias + (size_t) i*n_kv;
 
                 if (i >= batch.n_tokens) {
-                    std::fill(cur_bias, cur_bias + n_kv, 0.0f);
+                    std::fill(cur_bias + j0, cur_bias + j1, 0.0f);
                     continue;
                 }
 
                 const llama_pos q          = batch.pos[i];
                 const llama_pos tail_start = (q + 1)/r*r;
 
-                for (int32_t j = 0; j < n_kv; ++j) {
+                for (int32_t j = j0; j < j1; ++j) {
                     const llama_pos p = cell_pos[j];
 
                     // finite, so it can never meet a -inf and produce a nan
@@ -6184,12 +6412,15 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
             fill_bias(0, std::min(n_tokens, npt));
             for (auto & w : workers) w.join();
         } else {
-            fill_bias(0, n_tokens);
+            z6_per_celle(n_kv, 1, [&](int64_t j0, int64_t j1) { fill_bias(0, n_tokens, (int32_t) j0, (int32_t) j1); });
         }
 
         // a reused graph was built with the narrow window, so clearing on `touched` alone would
         // leave the blocks it could not reach at zero
         lctx.qsa_pooled_stale = (int32_t) touched.size() > n_win;
+        if (z6_ingressi_incr()) z6_append_stamp(lctx, batch, qsa.z6_append);
+        for (size_t z = 0; z < z6_expected.size(); ++z) z6_verify_bytes(z6_checked[z], z6_expected[z]);
+
     }
 
     if (batch.token && lctx.inp_tokens) {
@@ -6513,6 +6744,17 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
                 }
             };
 
+            std::vector<uint8_t> z6_expected_mask;
+            const bool z6_mask_fast = !data_swa && !data_swa_f16 && !data_swa_win && !data_swa_win_f16 &&
+                data_f16 && &mask_kv_self == &kv_self && z6_appended(lctx, batch, lctx.z6_mask_append);
+            if (z6_mask_fast) {
+                data_f16[kv_self.head] = ggml_fp32_to_fp16(0.f);
+                if (z6_ingressi_verifica()) {
+                    auto ptr = (const uint8_t *)lctx.inp_KQ_mask->data;
+                    z6_expected_mask.assign(ptr, ptr + ggml_nbytes(lctx.inp_KQ_mask));
+                }
+            }
+            if (!z6_mask_fast || z6_ingressi_verifica()) {
             if (n_kv >= 1024 && n_tokens >= 32) {
                 int n_thread = std::max(1, int(std::thread::hardware_concurrency()/2));
                 int npt = (n_kv + n_thread - 1)/n_thread;
@@ -6606,7 +6848,7 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
                     const llama_seq_id seq_id = batch.seq_id[j][0];
 
                     if (!hparams.use_alibi && cparams.flash_attn) {
-                        noalibi_f16(j, pos, seq_id, 0, n_kv);
+                        z6_per_celle(n_kv, 1, [&](int64_t i0, int64_t i1) { noalibi_f16(j, pos, seq_id, (int) i0, (int) i1); });
                         continue;
                     }
 
@@ -6670,6 +6912,9 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
                 }
             }
             }
+            }
+            if (z6_ingressi_incr()) z6_append_stamp(lctx, batch, lctx.z6_mask_append);
+            if (!z6_expected_mask.empty()) z6_verify_bytes(lctx.inp_KQ_mask, z6_expected_mask);
 #if IK_PRINT_TIMING == 2
             auto tim2 = ggml_time_us();
             printf("set_inputs(mask1): %d us\n", int(tim2-tim1));
@@ -8295,6 +8540,7 @@ static int llama_encode_internal(
 
 // find holes from the beginning of the KV cache and fill them by moving data from the end of the cache
 static void llama_kv_cache_defrag_internal(struct llama_context & lctx) {
+    ++lctx.kv_self.z6_inputs_epoch;
     auto & kv_self = lctx.kv_self;
 
     const auto & hparams = lctx.model.hparams;
@@ -9329,6 +9575,18 @@ struct llama_context * llama_init_from_model(
         return nullptr;
     }
 
+    if (llama_z6_caldi::requested() && (params.moe_cache_size || model->fit || !params.fused_moe_up_gate)) {
+        LLAMA_LOG_ERROR("z6 caldi: incompatibili con moe-cache, fit o -no-fmoe\n");
+        return nullptr;
+    }
+    if (llama_z6_caldi::requested()) {
+        try { (void) llama_z6_caldi::device(); }
+        catch (const std::exception & e) {
+            LLAMA_LOG_ERROR("z6 caldi: %s\n", e.what());
+            return nullptr;
+        }
+    }
+
     if (params.moe_cache_size > 0) {
         if (model->fit) {
             LLAMA_LOG_ERROR("%s: MoE cache cannot be combined with --fit because fit does not reserve context-time cache memory\n", __func__);
@@ -9769,6 +10027,25 @@ struct llama_context * llama_init_from_model(
             }
             ggml_backend_add_from_device(ctx, backend);
 
+            if (llama_z6_caldi::requested()) {
+                try {
+                    const int device = llama_z6_caldi::device();
+                    if (device < 0 || device >= ggml_backend_cuda_get_device_count())
+                        throw std::runtime_error("dispositivo CUDA non disponibile");
+                    if (device != main_gpu_id) {
+                        auto extra = ggml_backend_cuda_init(device, cparams.cuda_params, ctx);
+                        if (!extra) throw std::runtime_error("inizializzazione GPU dedicata fallita");
+                        // Explicit CALDI_DEVICE may be dedicated to experts and absent
+                        // from the dense model's --devices list.
+                        ctx->backends.push_back(extra);
+                    }
+                } catch (const std::exception & e) {
+                    LLAMA_LOG_ERROR("z6 caldi: %s\n", e.what());
+                    llama_free(ctx);
+                    return nullptr;
+                }
+            }
+
         } else {
             // LLAMA_SPLIT_MODE_LAYER and LLAMA_SPLIT_MODE_GRAPH require a backend for each GPU
             auto params = cparams.cuda_params;
@@ -9786,7 +10063,11 @@ struct llama_context * llama_init_from_model(
                     llama_free(ctx);
                     return nullptr;
                 }
-                ggml_backend_add_from_device(ctx, backend);
+                if (llama_z6_caldi::requested() && device == llama_z6_caldi::device()) {
+                    ctx->backends.push_back(backend);
+                } else {
+                    ggml_backend_add_from_device(ctx, backend);
+                }
             }
         }
 #elif defined(GGML_USE_VULKAN)
@@ -10046,6 +10327,8 @@ struct llama_context * llama_init_from_model(
                 model->split_mode == LLAMA_SPLIT_MODE_LAYER &&
                 params.offload_kqv && !model->has_tensor_overrides();
             pipeline_parallel = pipeline_parallel && params.moe_cache_size == 0;
+            pipeline_parallel = pipeline_parallel && !llama_z6_caldi::requested();
+            pipeline_parallel = pipeline_parallel && !llama_z6_testa::requested();
 #ifndef GGML_USE_CUDA
             // pipeline parallelism requires support for async compute and events
             // currently this is only implemented in the CUDA backend
@@ -10058,6 +10341,26 @@ struct llama_context * llama_init_from_model(
             }
 
             llama_repack_up_gate_exps(*ctx);
+
+            if (llama_z6_testa::requested()) {
+                try {
+                    ctx->z6_testa = std::make_unique<llama_z6_testa>(*model, ctx->backends);
+                } catch (const std::exception & e) {
+                    LLAMA_LOG_ERROR("z6 testa: %s\n", e.what());
+                    llama_free(ctx);
+                    return nullptr;
+                }
+            }
+
+            if (llama_z6_caldi::requested() && cparams.mtp_op_type == MTP_OP_NONE) {
+                try {
+                    ctx->z6_caldi = std::make_unique<llama_z6_caldi>(*model, ctx->backends);
+                } catch (const std::exception & e) {
+                    LLAMA_LOG_ERROR("z6 caldi: %s\n", e.what());
+                    llama_free(ctx);
+                    return nullptr;
+                }
+            }
 
             if (cparams.moe_cache_size > 0) {
                 try {
@@ -12871,6 +13174,7 @@ struct llama_data_read {
     }
 
     void read_kv_cache(struct llama_context * ctx, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) {
+        ++ctx->kv_self.z6_inputs_epoch;
         uint32_t cell_count;
         read_to(&cell_count, sizeof(cell_count));
 
@@ -12955,6 +13259,45 @@ struct llama_data_write_dummy : llama_data_write {
     }
 };
 
+// Z6 (IK_Z6_CKPT_VELOCE=1): un checkpoint di qwen4exp sono circa 112 MB di stati SSM in VRAM, copiati livello per
+// livello in memoria non bloccata a circa 4 GB/s. Qui passano da un buffer bloccato (circa 12 GB/s) e da lì alla
+// destinazione con una memcpy divisa fra 8 thread: misurato 27 -> circa 12 ms sul microbenchmark.
+static bool z6_ckpt_veloce() {
+    static const bool attivo = [] { const char * e = getenv("IK_Z6_CKPT_VELOCE"); return e && atoi(e) > 0; }();
+    return attivo;
+}
+
+static void z6_tensor_get_pinned(const ggml_tensor * tensor, uint8_t * dst, size_t offset, size_t size) {
+    constexpr size_t kPezzo = 16u << 20;
+    static std::mutex mtx;
+    // mai liberato: il contesto CUDA può chiudersi prima dei distruttori statici
+    static ggml_backend_buffer_t staging = nullptr;
+    std::lock_guard<std::mutex> lock(mtx);
+    if (!staging) {
+        staging = ggml_backend_buft_alloc_buffer(llama_default_buffer_type_cpu(true), kPezzo);
+    }
+    if (!staging || !ggml_backend_buffer_is_host(staging)) {
+        ggml_backend_tensor_get(tensor, dst, offset, size);
+        return;
+    }
+    uint8_t * buf = (uint8_t *) ggml_backend_buffer_get_base(staging);
+    for (size_t fatto = 0; fatto < size; fatto += kPezzo) {
+        const size_t n = std::min(kPezzo, size - fatto);
+        ggml_backend_tensor_get(tensor, buf, offset + fatto, n);
+#ifdef _OPENMP
+        #pragma omp parallel num_threads(8)
+        {
+            const size_t nth = omp_get_num_threads(), ith = omp_get_thread_num();
+            const size_t per = (n + nth - 1)/nth;
+            const size_t a = std::min(n, ith*per), b = std::min(n, a + per);
+            memcpy(dst + fatto + a, buf + a, b - a);
+        }
+#else
+        memcpy(dst + fatto, buf, n);
+#endif
+    }
+}
+
 struct llama_data_write_buffer : llama_data_write {
     uint8_t * ptr;
     size_t buf_size = 0;
@@ -12982,6 +13325,8 @@ struct llama_data_write_buffer : llama_data_write {
         }
         if (tensor->extra) {
             get_tensor_data_split(tensor, offset, size, il);
+        } else if (tensor->buffer && !ggml_backend_buffer_is_host(tensor->buffer) && z6_ckpt_veloce()) {
+            z6_tensor_get_pinned(tensor, ptr, offset, size);
         } else {
             ggml_backend_tensor_get(tensor, ptr, offset, size);
         }
@@ -13630,6 +13975,7 @@ int32_t llama_decode(
     if (ret < 0) {
         LLAMA_LOG_ERROR("%s: failed to decode, ret = %d\n", __func__, ret);
     }
+    if (ret == 0 && batch.n_tokens == 1 && ctx->z6_caldi) ctx->z6_caldi->dopo_token();
 
     return ret;
 }

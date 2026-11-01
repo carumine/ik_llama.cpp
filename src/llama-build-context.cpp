@@ -4,6 +4,7 @@
 #include "llama-model.h"
 #include "llama-context.h"
 #include "llama-moe-cache.h"
+#include "llama-z6-caldi.h"
 #include "llama-delta-net.h"
 
 #include "ggml.h"
@@ -134,6 +135,7 @@ void llm_build_context::init() {
         lctx.inp_kpool_ape_slots = nullptr;
         lctx.inp_mtp_carry     = nullptr;
         lctx.inp_qsa.clear();
+        lctx.z6_mask_append = {};
         lctx.dflash.inputs.target_features = nullptr;
         lctx.dflash.inputs.pos_ctx = nullptr;
         lctx.dflash.inputs.kq_mask = nullptr;
@@ -591,6 +593,12 @@ ggml_tensor * llm_build_context::build_inp_KQ_mask(bool causal) {
         lctx.inp_KQ_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, n_kv, GGML_PAD(n_tokens, GGML_KQ_MASK_PAD));
         cb(lctx.inp_KQ_mask, "KQ_mask", -1);
         ggml_set_input(lctx.inp_KQ_mask);
+        const char * incr = getenv("GGML_Z6_INGRESSI_INCR");
+        if (model.arch == LLM_ARCH_QWEN4EXP && n_tokens == 1 && incr && atoi(incr) > 0) {
+            // INPUT is freed after its last graph consumer. OUTPUT also prevents
+            // the allocator from overwriting the host mask between decode calls.
+            ggml_set_output(lctx.inp_KQ_mask);
+        }
         return lctx.inp_KQ_mask;
     }
     lctx.inp_KQ_mask = causal
@@ -1819,6 +1827,112 @@ llm_expert_gating_func_type   gating_op,
         ggml_build_forward_expand(graph, weights);
     }
 
+    // GGML_Z6_CALDI_BATCH=<token minimi>: i caldi lavorano anche nei microbatch grandi, in GPU e prima dei freddi
+    static const int z6_caldi_batch = [] { const char * e = getenv("GGML_Z6_CALDI_BATCH"); return e ? atoi(e) : 0; }();
+    const bool z6_batch = z6_caldi_batch > 0 && n_tokens >= z6_caldi_batch && graph;
+    if (lctx.z6_caldi && (n_tokens <= 32 || z6_batch) && lctx.z6_caldi->has_layer(il)) {
+        GGML_ASSERT(n_tokens > 0 && !weight_before_ffn && lctx.lora_adapters.empty());
+        GGML_ASSERT(!up_exps_b && !gate_exps_b && !up_gate_exps_b && !down_exps_b && !down_exps_s);
+        GGML_ASSERT(type_op == LLM_FFN_SILU || type_op == LLM_FFN_GELU);
+        auto & hot = *lctx.z6_caldi;
+        const auto gpu = hot.backend(il);
+        auto place = [&](ggml_tensor * t, ggml_backend_t b, const char * name) {
+            cb(t, name, il);
+            ggml_backend_sched_set_tensor_backend(lctx.sched, t, b);
+            return t;
+        };
+        auto ids = ggml_is_contiguous(selected_experts) ? selected_experts : ggml_cont(ctx, selected_experts);
+        ids = ggml_reshape_1d(ctx, ids, n_expert_used*n_tokens);
+        auto map_ids = [&](bool on_gpu) {
+            auto lookup = place(ggml_get_rows(ctx, hot.map(il, on_gpu), ids), gpu,
+                    on_gpu ? "z6_caldi_ids" : "z6_freddi_ids");
+            return ggml_reshape_2d(ctx, lookup, n_expert_used, n_tokens);
+        };
+        auto hot_ids = map_ids(true);
+        auto cold_ids = map_ids(false);
+        auto x = ggml_reshape_3d(ctx, cur, n_embd, 1, n_tokens);
+        // GGML_Z6_CALDI_BATCH_PAR: anche nei batch i caldi corrono mentre la CPU fa i freddi, che ne consegna la somma
+        const bool parallel = hot.parallel() && n_tokens <= (n_tokens > 32 && z6_batch ? hot.staging_tokens() : 32) &&
+                ggml_backend_sched_get_n_copies(lctx.sched) == 1 &&
+                graph && n_expert_used == lctx.model.hparams.n_expert_used && !lctx.cparams.split_mode_graph_scheduling &&
+                lctx.model.split_mode != LLAMA_SPLIT_MODE_GRAPH;
+        ggml_tensor * cpu_x = x, * cpu_ids = cold_ids, * cpu_weights = nullptr;
+        ggml_tensor * hot_begin = nullptr;
+        if (parallel) {
+            // These producer nodes must finish before the separate hot split.
+            auto plan_graph = graph;
+            ggml_build_forward_expand(plan_graph, x);
+            ggml_build_forward_expand(plan_graph, hot_ids);
+            ggml_build_forward_expand(plan_graph, cold_ids);
+            ggml_build_forward_expand(plan_graph, weights);
+            hot.staging(ctx, il, n_tokens, &cpu_x, &cpu_ids, &cpu_weights);
+        }
+        const auto unary = type_op == LLM_FFN_SILU ? GGML_UNARY_OP_SILU : GGML_UNARY_OP_GELU;
+        ggml_tensor * hot_sum = nullptr;
+        // CUDA's down with multiple tokens can select MMQ even for <=32 tokens.
+        // Keep up/gate one-token and down immediately adjacent: CUDA's fused
+        // up/gate+down path uses MMVQ also for ten experts (standalone down's
+        // fast path would only accept <=8). No MMQ or large-prompt changes.
+        if (n_tokens > 32) {
+            auto par = place(ggml_moe_up_gate(ctx,
+                    hot.experts(up_gate_exps ? up_gate_exps : up_exps),
+                    up_gate_exps ? nullptr : hot.experts(gate_exps), x, hot_ids, unary), gpu, "z6_caldi_up_gate");
+            hot_begin = par;
+            *(float *)(par->op_params + 1) = lctx.model.swiglu_limit(il, false);
+            auto down = place(ggml_mul_mat_id(ctx, hot.experts(down_exps), par, hot_ids), gpu, "z6_caldi_down");
+            hot_sum = place(ggml_mul_multi_add_id(ctx, down, weights, hot_ids), gpu, "z6_caldi_somma");
+        }
+        for (int64_t it = 0; n_tokens <= 32 && it < n_tokens; ++it) {
+            auto xi = ggml_view_3d(ctx, x, n_embd, 1, 1, x->nb[1], x->nb[2], it*x->nb[2]);
+            auto hi = ggml_view_2d(ctx, hot_ids, n_expert_used, 1, hot_ids->nb[1], it*hot_ids->nb[1]);
+            auto wi = ggml_view_3d(ctx, weights, 1, n_expert_used, 1, weights->nb[1], weights->nb[2], it*weights->nb[2]);
+            auto par = place(ggml_moe_up_gate(ctx,
+                    hot.experts(up_gate_exps ? up_gate_exps : up_exps),
+                    up_gate_exps ? nullptr : hot.experts(gate_exps), xi, hi, unary), gpu, "z6_caldi_up_gate");
+            if (!hot_begin) hot_begin = par;
+            *(float *)(par->op_params + 1) = lctx.model.swiglu_limit(il, false);
+            auto down = place(ggml_mul_mat_id(ctx, hot.experts(down_exps), par, hi), gpu, "z6_caldi_down");
+            auto sum = place(ggml_mul_multi_add_id(ctx, down, wi, hi), gpu, "z6_caldi_somma");
+            hot_sum = hot_sum ? place(ggml_concat(ctx, hot_sum, sum, 1), gpu, "z6_caldi_batch") : sum;
+        }
+        if (graph) ggml_build_forward_expand(graph, hot_sum);
+        ggml_tensor * z6_shared = nullptr;
+        if (parallel && lctx.z6_shexp) {
+            // Dipende solo dall'ingresso: nello stesso pezzo GPU dei caldi, prima dei nodi CPU,
+            // quindi in parallelo agli esperti freddi invece che dopo
+            z6_shared = lctx.z6_shexp(cur);
+            ggml_build_forward_expand(graph, z6_shared);
+            lctx.z6_shexp_fatto = true;
+        }
+        auto cold_par = place(ggml_moe_up_gate(ctx, up_gate_exps ? up_gate_exps : up_exps,
+                up_gate_exps ? nullptr : gate_exps, cpu_x, cpu_ids, unary), lctx.backend_cpu, "z6_freddi_up_gate");
+        *(float *)(cold_par->op_params + 1) = lctx.model.swiglu_limit(il, false);
+        static const bool z6_sum_cpu = [] { const char * e = getenv("GGML_Z6_FREDDI_SOMMA"); return e && atoi(e) > 0; }();
+        const bool sum_cpu = z6_sum_cpu && parallel && n_tokens == 1 && down_exps->ne[1] % 32 == 0;
+        auto cold_down = place(sum_cpu ? ggml_z6_moe_down_sum(ctx, down_exps, cold_par, cpu_ids, cpu_weights)
+                                      : ggml_mul_mat_id(ctx, down_exps, cold_par, cpu_ids), lctx.backend_cpu, "z6_freddi_down");
+        const bool sum_batch = parallel && n_tokens > 32;
+        auto cold_end = sum_batch ? place(ggml_mul_multi_add_id(ctx, cold_down, cpu_weights, cpu_ids), lctx.backend_cpu,
+                "z6_freddi_somma_cpu") : cold_down;
+        if (parallel) {
+            hot.stage_output(cold_end);
+            const ggml_z6_caldi_group group = { hot_begin, hot_sum, cold_par, cold_end,
+                    {x, cold_ids, weights}, {cpu_x, cpu_ids, cpu_weights}, il };
+            ggml_backend_sched_z6_add_group(lctx.sched, &group);
+        }
+        auto cold_sum = sum_cpu || sum_batch ? cold_end
+                : place(ggml_mul_multi_add_id(ctx, cold_down, weights, cold_ids), gpu, "z6_freddi_somma");
+        auto result = place(ggml_add(ctx, hot_sum, cold_sum), gpu, "z6_caldi_unione");
+        if (z6_shared) {
+            result = place(ggml_add(ctx, result, z6_shared), gpu, "z6_caldi_shexp");
+        }
+        if (add_input) {
+            result = ggml_add(ctx, result, input);
+            cb(result, "ffn_out_with_inp", il);
+        }
+        return result;
+    }
+
     ggml_tensor * cache_ids = nullptr;
     ggml_tensor * cached_up_gate = nullptr;
     ggml_tensor * cached_up = nullptr;
@@ -2010,6 +2124,13 @@ llm_expert_gating_func_type   gating_op,
         if (lctx.cparams.fused_mmad) {
             experts = ggml_mul_multi_add(ctx, experts, weights);
             cb(experts, "ffn_moe_weighted", il);
+            // GGML_Z6_SOMMA_BATCH=1: nei batch con esperti in CPU la somma pesata resta in CPU e verso la GPU
+            // viaggiano [n_embd, n_tokens] invece di [n_embd, n_expert_used, n_tokens]: 10 MiB contro 100 a 1024 token
+            static const bool z6_somma_batch = [] { const char * e = getenv("GGML_Z6_SOMMA_BATCH"); return e && atoi(e) > 0; }();
+            if (z6_somma_batch && n_tokens > 32 && lctx.backend_cpu && !cached_down && !down_exps_s && !down_exps_b &&
+                    down_exps->buffer && ggml_backend_buffer_is_host(down_exps->buffer)) {
+                ggml_backend_sched_set_tensor_backend(lctx.sched, experts, lctx.backend_cpu);
+            }
             if (down_exps_s) {
                 experts->src[2] = down_exps_s;
                 experts->src[3] = selected_experts;
@@ -2090,6 +2211,35 @@ llm_expert_gating_func_type   gating_op,
         auto the_gate_inp_b = gate_inp_b ? gate_inp_b->extra ? ((ggml_split_tensor_t *)gate_inp_b->extra)->splits[lctx.model.main_gpu] : gate_inp_b : nullptr;
         auto the_exp_probs_b = exp_probs_b ? exp_probs_b->extra ? ((ggml_split_tensor_t *)exp_probs_b->extra)->splits[lctx.model.main_gpu] : exp_probs_b : nullptr;
         //int n_before = graph->n_nodes;
+        auto z6_build_shexp = [&](ggml_tensor * x) {
+            auto shared_out = llm_build_ffn(ctx, lctx, nullptr, x,
+                    up_shexp,   up_b_shexp,   nullptr,
+                    gate_shexp, gate_b_shexp, nullptr,
+                    down_shexp, down_b_shexp, nullptr,
+                    nullptr, type_op_shexp, LLM_FFN_PAR, cb, il, graph);
+            cb(shared_out, "ffn_shexp_out", il);
+            if (shexp_gate) {
+                auto shared_gate = llm_build_lora_mm(lctx, ctx, shexp_gate, x);
+                cb(shared_gate, "shared_expert_gate", il);
+                if (shared_gate->ne[1] == 1) {
+                    shared_out = ggml_fused_mul_unary(ctx, shared_gate, shared_out, GGML_UNARY_OP_SIGMOID);
+                } else {
+                    shared_gate = ggml_sigmoid(ctx, shared_gate);
+                    cb(shared_gate, "shared_expert_gate_sigmoid", il);
+                    shared_out = ggml_mul(ctx, shared_out, shared_gate);
+                }
+                cb(shared_out, "ffn_shexp_gated", il);
+            }
+            return shared_out;
+        };
+        static const bool z6_shexp_parallelo = [] {
+            const char * e = getenv("GGML_Z6_SHEXP_PARALLELO");
+            return e && atoi(e) > 0;
+        }();
+        lctx.z6_shexp_fatto = false;
+        if (z6_shexp_parallelo && up_shexp && gate_shexp && down_shexp && !split_up_shexp) {
+            lctx.z6_shexp = z6_build_shexp;
+        }
         auto routed_out = llm_build_moe_ffn(ctx, lctx, cur,
                     the_gate_inp, the_gate_inp_b,
                     up_exps,   up_exps_b,
@@ -2099,6 +2249,9 @@ llm_expert_gating_func_type   gating_op,
                     n_expert, n_expert_used,
                     type_op, norm_w, scale_w, w_scale,
                     gating_op, cb, il, graph, false, up_gate_exps, up_gate_exps_b);
+        lctx.z6_shexp = nullptr;
+        const bool z6_shexp_incluso = lctx.z6_shexp_fatto;
+        lctx.z6_shexp_fatto = false;
         cb(routed_out, "routed_out", il);
         if (add_input) {
             routed_out = ggml_add(ctx, routed_out, input);
@@ -2174,26 +2327,10 @@ llm_expert_gating_func_type   gating_op,
                 GGML_ASSERT(!results.empty());
                 cur = ggml_reduce(ctx, results.data(), split_up_shexp->n_device, GGML_OP_ADD);
                 cb(cur, "ffn_out", il);
+            } else if (z6_shexp_incluso) {
+                cur = routed_out; // già sommato nel gruppo parallelo dei caldi
             } else {
-                auto shared_out = llm_build_ffn(ctx, lctx, nullptr, cur,
-                        up_shexp,   up_b_shexp,   nullptr,
-                        gate_shexp, gate_b_shexp, nullptr,
-                        down_shexp, down_b_shexp, nullptr,
-                        nullptr, type_op_shexp, LLM_FFN_PAR, cb, il, graph);
-                cb(shared_out, "ffn_shexp_out", il);
-                if (shexp_gate) {
-                    auto shared_gate = llm_build_lora_mm(lctx, ctx, shexp_gate, cur);
-                    cb(shared_gate, "shared_expert_gate", il);
-                    if (shared_gate->ne[1] == 1) {
-                        shared_out = ggml_fused_mul_unary(ctx, shared_gate, shared_out, GGML_UNARY_OP_SIGMOID);
-                    } else {
-                        shared_gate = ggml_sigmoid(ctx, shared_gate);
-                        cb(shared_gate, "shared_expert_gate_sigmoid", il);
-                        shared_out = ggml_mul(ctx, shared_out, shared_gate);
-                    }
-                    cb(shared_out, "ffn_shexp_gated", il);
-                }
-                cur = ggml_add(ctx, routed_out, shared_out);
+                cur = ggml_add(ctx, routed_out, z6_build_shexp(cur));
                 cb(cur, "ffn_out", il);
             }
         } else {
@@ -3016,6 +3153,7 @@ ggml_cgraph * llm_build_context::llama_build_graph(
                   bool   worst_case,
                   int    n_outputs) {
     const auto & model = lctx.model;
+    if (lctx.z6_caldi && lctx.z6_caldi->parallel()) ggml_backend_sched_z6_begin_graph(lctx.sched);
 
 #if IK_PRINT_TIMING
     auto tim1 = ggml_time_us();

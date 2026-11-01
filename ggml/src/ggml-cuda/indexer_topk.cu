@@ -15,6 +15,240 @@ __device__ __forceinline__ float indexer_mask_value(const int * m, int col) {
     return col < *m ? 0.0f : -INFINITY;
 }
 
+#include <cub/block/block_scan.cuh>
+
+// Z6 (GGML_Z6_TOPK_SELEZIONE=1): i primi k indici di una riga senza ordinarla tutta. L'ordinamento CUB
+// completo costa 6 kernel per livello (circa 46 µs a 7K celle); qui un blocco per riga trova la soglia del
+// k-esimo valore con 4 passate di istogramma sulle cifre a 8 bit della chiave e poi scrive, in ordine di
+// indice crescente (deterministico), quelli sopra soglia e i primi pari alla soglia. L'ordine dell'uscita
+// non è più per punteggio: la maschera non ne dipende, la raccolta delle celle cambia solo l'ordine delle somme.
+static __device__ __forceinline__ uint32_t z6_chiave(float f) {
+    const uint32_t u = __float_as_uint(f);
+    return (u & 0x80000000u) ? ~u : (u | 0x80000000u);  // crescente come il float
+}
+
+template <int nthreads>
+static __global__ void k_z6_topk_select(const float * __restrict__ score, int * __restrict__ dst,
+        const int n, const int k, const int64_t ld_dst) {
+    score += (int64_t) blockIdx.x*n;
+    dst   += (int64_t) blockIdx.x*ld_dst;
+    __shared__ int hist[256];
+    __shared__ uint32_t s_prefix;
+    __shared__ int s_rest;
+    __shared__ int s_base[2];
+    uint32_t prefix = 0, maschera = 0;
+    int rest = k;  // quanti ne servono ancora fra quelli che hanno il prefisso
+    for (int shift = 24; shift >= 0; shift -= 8) {
+        for (int i = threadIdx.x; i < 256; i += nthreads) hist[i] = 0;
+        __syncthreads();
+        // atomici aggregati nel warp: dopo la relu molti punteggi sono uguali (0) e cadrebbero tutti sulla stessa cifra
+        for (int i0 = 0; i0 < n; i0 += nthreads) {
+            const int i = i0 + threadIdx.x;
+            const uint32_t u = i < n ? z6_chiave(score[i]) : 0u;
+            const bool conta = i < n && (u & maschera) == prefix;
+            const int cifra = conta ? (int) ((u >> shift) & 255) : 256;
+            const unsigned gruppo = __match_any_sync(0xffffffff, cifra);
+            if (conta && (threadIdx.x % WARP_SIZE) == __ffs(gruppo) - 1) atomicAdd(&hist[cifra], __popc(gruppo));
+        }
+        __syncthreads();
+        if (threadIdx.x < WARP_SIZE) {
+            // cifre dalla più alta: ogni lane somma 8 cifre, poi scansione nel warp
+            const int lane = threadIdx.x;
+            int c[8], tot = 0;
+            for (int j = 0; j < 8; ++j) { c[j] = hist[255 - (lane*8 + j)]; tot += c[j]; }
+            int incl = tot;
+            for (int off = 1; off < WARP_SIZE; off <<= 1) {
+                const int v = __shfl_up_sync(0xffffffff, incl, off);
+                if (lane >= off) incl += v;
+            }
+            const int excl = incl - tot;
+            if (excl < rest && incl >= rest) {
+                int acc = excl;
+                for (int j = 0; j < 8; ++j) {
+                    if (acc + c[j] >= rest) {
+                        s_prefix = prefix | ((uint32_t) (255 - (lane*8 + j)) << shift);
+                        s_rest = rest - acc;
+                        break;
+                    }
+                    acc += c[j];
+                }
+            }
+        }
+        __syncthreads();
+        prefix = s_prefix;
+        rest = s_rest;
+        maschera |= 255u << shift;
+        __syncthreads();
+    }
+    // prefix è la chiave del k-esimo; servono rest elementi uguali, k - rest sono maggiori
+    const uint32_t soglia = prefix;
+    const int n_magg = k - rest;
+    typedef cub::BlockScan<int, nthreads> scan_t;
+    __shared__ typename scan_t::TempStorage tmp;
+    if (threadIdx.x == 0) { s_base[0] = 0; s_base[1] = 0; }
+    __syncthreads();
+    for (int i0 = 0; i0 < n; i0 += nthreads) {
+        const int i = i0 + threadIdx.x;
+        const uint32_t u = i < n ? z6_chiave(score[i]) : 0u;
+        const int magg = i < n && u > soglia;
+        const int ug   = i < n && u == soglia;
+        int pos_m, pos_u, tot_m, tot_u;
+        scan_t(tmp).ExclusiveSum(magg, pos_m, tot_m);
+        __syncthreads();
+        scan_t(tmp).ExclusiveSum(ug, pos_u, tot_u);
+        const int base_m = s_base[0], base_u = s_base[1];
+        if (magg) dst[base_m + pos_m] = i;
+        if (ug && base_u + pos_u < rest) dst[n_magg + base_u + pos_u] = i;
+        __syncthreads();
+        if (threadIdx.x == 0) { s_base[0] = base_m + tot_m; s_base[1] = base_u + tot_u; }
+        __syncthreads();
+    }
+}
+
+static bool z6_topk_selezione() {
+    static const bool v = [] { const char * e = getenv("GGML_Z6_TOPK_SELEZIONE"); return e && atoi(e) > 0; }();
+    return v;
+}
+
+// ---- versione multi-blocco, per righe lunghe (contesti da decine o centinaia di migliaia di celle).
+// Un solo blocco legge la riga 5 volte con un multiprocessore: 271 µs a 117K celle. Qui la riga è divisa fra
+// molti blocchi: 3 round di istogramma su cifre da 11+11+10 bit (istogrammi globali per round), poi conteggio
+// per blocco e scrittura in ordine di indice. Ogni blocco ricalcola la soglia dagli istogrammi precedenti, così
+// non servono kernel intermedi; un memset azzera gli istogrammi a ogni chiamata.
+#define Z6_TK_BIN 2048
+static __device__ __forceinline__ int z6_tk_shift(int r) { return r == 0 ? 21 : r == 1 ? 10 : 0; }
+static __device__ __forceinline__ int z6_tk_bits(int r)  { return r == 2 ? 10 : 11; }
+
+// soglia dopo i round [0, round): prefisso della chiave e quanti ne servono ancora fra quelli col prefisso
+static __device__ void z6_tk_soglia(const int * __restrict__ hist, int round, int k, uint32_t * prefix_out, int * rest_out) {
+    __shared__ int s_digit, s_rest;
+    __shared__ int part[256];
+    uint32_t prefix = 0;
+    int rest = k;
+    for (int r = 0; r < round; ++r) {
+        const int nbin = 1 << z6_tk_bits(r);
+        const int * h = hist + r*Z6_TK_BIN;
+        // ogni thread somma un gruppo di cifre dall'alto, poi scansione seriale dei 256 gruppi nel thread 0
+        const int per = (nbin + 255)/256;
+        int tot = 0;
+        for (int j = 0; j < per; ++j) {
+            const int d = nbin - 1 - (threadIdx.x*per + j);
+            if (d >= 0) tot += h[d];
+        }
+        part[threadIdx.x] = tot;
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            int acc = 0, g = 0;
+            for (; g < 256; ++g) { if (acc + part[g] >= rest) break; acc += part[g]; }
+            int d = nbin - 1 - g*per;
+            for (int j = 0; j < per; ++j, --d) { if (acc + h[d] >= rest) break; acc += h[d]; }
+            s_digit = d; s_rest = rest - acc;
+        }
+        __syncthreads();
+        prefix |= (uint32_t) s_digit << z6_tk_shift(r);
+        rest = s_rest;
+        __syncthreads();
+    }
+    *prefix_out = prefix;
+    *rest_out = rest;
+}
+
+static __device__ __forceinline__ uint32_t z6_tk_maschera(int round) {
+    return round == 0 ? 0u : round == 1 ? 0xFFE00000u : 0xFFFFFC00u;
+}
+
+static __global__ void k_z6_tk_hist(const float * __restrict__ score, int * __restrict__ hist_all,
+        const int n, const int k, const int round, const int per_blocco) {
+    const int row = blockIdx.y;
+    score += (int64_t) row*n;
+    int * hist = hist_all + (int64_t) row*3*Z6_TK_BIN;
+    uint32_t prefix; int rest;
+    z6_tk_soglia(hist, round, k, &prefix, &rest);
+    const uint32_t maschera = z6_tk_maschera(round);
+    const int shift = z6_tk_shift(round), nbin = 1 << z6_tk_bits(round);
+    __shared__ int h[Z6_TK_BIN];
+    for (int i = threadIdx.x; i < nbin; i += blockDim.x) h[i] = 0;
+    __syncthreads();
+    const int i0 = blockIdx.x*per_blocco, i1 = min(n, i0 + per_blocco);
+    for (int b = i0; b < i1; b += blockDim.x) {
+        const int i = b + threadIdx.x;
+        const uint32_t u = i < i1 ? z6_chiave(score[i]) : 0u;
+        const bool conta = i < i1 && (u & maschera) == prefix;
+        const int cifra = conta ? (int) ((u >> shift) & (nbin - 1)) : Z6_TK_BIN;
+        const unsigned gruppo = __match_any_sync(0xffffffff, cifra);
+        if (conta && (threadIdx.x % WARP_SIZE) == __ffs(gruppo) - 1) atomicAdd(&h[cifra], __popc(gruppo));
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < nbin; i += blockDim.x) {
+        if (h[i]) atomicAdd(&hist[round*Z6_TK_BIN + i], h[i]);
+    }
+}
+
+// fase 0: conta per blocco i maggiori e gli uguali alla soglia; fase 1: scrive in ordine di indice
+template <int nthreads>
+static __global__ void k_z6_tk_scrivi(const float * __restrict__ score, const int * __restrict__ hist_all,
+        int * __restrict__ conti_all, int * __restrict__ dst, const int n, const int k, const int per_blocco,
+        const int64_t ld_dst, const int fase) {
+    const int row = blockIdx.y;
+    score += (int64_t) row*n;
+    const int * hist = hist_all + (int64_t) row*3*Z6_TK_BIN;
+    int * conti = conti_all + (int64_t) row*2*gridDim.x;
+    dst += (int64_t) row*ld_dst;
+    uint32_t soglia; int rest;
+    z6_tk_soglia(hist, 3, k, &soglia, &rest);
+    const int n_magg = k - rest;
+    const int i0 = blockIdx.x*per_blocco, i1 = min(n, i0 + per_blocco);
+    typedef cub::BlockScan<int, nthreads> scan_t;
+    __shared__ typename scan_t::TempStorage tmp;
+    __shared__ int s_base[2];
+    if (threadIdx.x == 0) {
+        int bm = 0, bu = 0;
+        if (fase == 1) for (int b = 0; b < (int) blockIdx.x; ++b) { bm += conti[2*b]; bu += conti[2*b + 1]; }
+        s_base[0] = bm; s_base[1] = bu;
+    }
+    __syncthreads();
+    for (int b = i0; b < i1; b += nthreads) {
+        const int i = b + threadIdx.x;
+        const uint32_t u = i < i1 ? z6_chiave(score[i]) : 0u;
+        const int magg = i < i1 && u > soglia;
+        const int ug   = i < i1 && u == soglia;
+        int pos_m, pos_u, tot_m, tot_u;
+        scan_t(tmp).ExclusiveSum(magg, pos_m, tot_m);
+        __syncthreads();
+        scan_t(tmp).ExclusiveSum(ug, pos_u, tot_u);
+        const int base_m = s_base[0], base_u = s_base[1];
+        if (fase == 1) {
+            if (magg) dst[base_m + pos_m] = i;
+            if (ug && base_u + pos_u < rest) dst[n_magg + base_u + pos_u] = i;
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) { s_base[0] = base_m + tot_m; s_base[1] = base_u + tot_u; }
+        __syncthreads();
+    }
+    if (fase == 0 && threadIdx.x == 0) { conti[2*blockIdx.x] = s_base[0]; conti[2*blockIdx.x + 1] = s_base[1]; }
+}
+
+// righe consecutive di n punteggi: i primi k indici di ognuna in dst (passo ld_dst interi)
+static void z6_topk_select_cuda(ggml_cuda_pool & pool, const float * score, int * dst, int n, int k, int nrows,
+        int64_t ld_dst, cudaStream_t stream) {
+    if (n <= 16384) {
+        k_z6_topk_select<1024><<<nrows, 1024, 0, stream>>>(score, dst, n, k, ld_dst);
+        return;
+    }
+    constexpr int nthreads = 256;
+    const int per_blocco = 2048;
+    const int nblocchi = (n + per_blocco - 1)/per_blocco;
+    ggml_cuda_pool_alloc<int> hist(pool, (int64_t) nrows*3*Z6_TK_BIN);
+    ggml_cuda_pool_alloc<int> conti(pool, (int64_t) nrows*2*nblocchi);
+    CUDA_CHECK(cudaMemsetAsync(hist.get(), 0, (size_t) nrows*3*Z6_TK_BIN*sizeof(int), stream));
+    const dim3 grid(nblocchi, nrows, 1);
+    for (int round = 0; round < 3; ++round) {
+        k_z6_tk_hist<<<grid, nthreads, 0, stream>>>(score, hist.get(), n, k, round, per_blocco);
+    }
+    k_z6_tk_scrivi<nthreads><<<grid, nthreads, 0, stream>>>(score, hist.get(), conti.get(), dst, n, k, per_blocco, ld_dst, 0);
+    k_z6_tk_scrivi<nthreads><<<grid, nthreads, 0, stream>>>(score, hist.get(), conti.get(), dst, n, k, per_blocco, ld_dst, 1);
+}
+
 template <typename kq_t, typename mask_t>
 static __global__ void k_fused_relu_mul_sum_rows(const kq_t * __restrict__ kq, const float * __restrict__ w, const mask_t * __restrict__ m, float * __restrict__ dst, const int ncols, const int nhead, size_t nbm) {
     const int row = blockIdx.x;
@@ -574,6 +808,13 @@ void ggml_cuda_op_indexer_topk(ggml_backend_cuda_context & ctx, ggml_tensor * ds
                 CUDA_CHECK(cudaGetLastError());
             }
 
+            if (z6_topk_selezione() && dst->ne[0] < n_kv) {
+                z6_topk_select_cuda(ctx.pool(), score.get(), (int *)((char *)dst->data + first_row*dst->nb[1]), n_kv, dst->ne[0],
+                        nrows, dst->nb[1]/sizeof(int), ctx.stream());
+                CUDA_CHECK(cudaGetLastError());
+                continue;
+            }
+
             indexer_select_top_k(ctx, score.get(), sorted.get(), (int *)((char *)dst->data + first_row*dst->nb[1]),
                     n_kv, nrows, dst->ne[0]);
         }
@@ -650,6 +891,13 @@ void ggml_cuda_op_indexer_topk(ggml_backend_cuda_context & ctx, ggml_tensor * ds
                     score.get(), k->ne[1], q->ne[1], m->nb[1]);
         }
         CUDA_CHECK(cudaGetLastError());
+
+        if (z6_topk_selezione() && dst->ne[0] < k->ne[1]) {
+            z6_topk_select_cuda(ctx.pool(), score.get(), (int *)((char *)dst->data + first*dst->nb[1]), k->ne[1], dst->ne[0],
+                    nrows, dst->nb[1]/sizeof(int), ctx.stream());
+            CUDA_CHECK(cudaGetLastError());
+            continue;
+        }
 
         indexer_select_top_k(ctx, score.get(), sorted.get(), (int *)((char *)dst->data + first*dst->nb[1]),
                 k->ne[1], nrows, dst->ne[0]);

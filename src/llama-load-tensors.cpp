@@ -2040,9 +2040,12 @@ bool create_tensors_helper::create_qwen4exp_tensors(const LLM_TN & tn) {
     model.hc_head_norm = create_tensor(ctx_output, tn(LLM_TENSOR_HC_HEAD_NORM, "weight"), {hc_dim}, out_mixer_flags);
     model.hc_head_down = create_tensor(ctx_output, tn(LLM_TENSOR_HC_HEAD_DOWN, "weight"), {hc_dim, hc_rank}, out_mixer_flags);
     model.hc_head_up   = create_tensor(ctx_output, tn(LLM_TENSOR_HC_HEAD_UP,   "weight"), {hc_rank, hc_dim}, out_mixer_flags);
-    model.output       = create_tensor(ctx_output, tn(LLM_TENSOR_OUTPUT,       "weight"), {n_embd, n_vocab}, llama_model_loader::TENSOR_NOT_REQUIRED);
+    // Context-owned GPU shards replace the full GPU1 head only when opted in.
+    const char * z6_head = std::getenv("GGML_Z6_TESTA_DIVISA");
+    auto head_ctx = z6_head && std::atoi(z6_head) > 0 ? ctx_for_buft(default_cpu_buft) : ctx_output;
+    model.output       = create_tensor(head_ctx, tn(LLM_TENSOR_OUTPUT,       "weight"), {n_embd, n_vocab}, llama_model_loader::TENSOR_NOT_REQUIRED);
     if (model.output == NULL && model.tok_embd != nullptr) {
-        model.output = create_tensor(ctx_output, tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, llama_model_loader::TENSOR_DUPLICATED);
+        model.output = create_tensor(head_ctx, tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, llama_model_loader::TENSOR_DUPLICATED);
     }
 
     bool ple_table_needed = hparams.ple_n_heads > 0;

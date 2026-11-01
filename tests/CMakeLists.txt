@@ -1,5 +1,16 @@
 #llama_add_compile_flags()
 
+add_executable(test-z6-caldi test-z6-caldi.cpp)
+target_link_libraries(test-z6-caldi PRIVATE common)
+add_executable(test-z6-software test-z6-software.cpp)
+target_link_libraries(test-z6-software PRIVATE common)
+add_executable(test-z6-logits test-z6-logits.cpp)
+target_link_libraries(test-z6-logits PRIVATE common)
+if (GGML_CUDA)
+    add_executable(test-z6-parallelo test-z6-parallelo.cpp)
+    target_link_libraries(test-z6-parallelo PRIVATE common)
+endif()
+
 function(llama_build source)
     set(TEST_SOURCES ${source} ${ARGN})
 
@@ -225,5 +236,9 @@ add_executable(${TEST_TARGET} test-c.c)
 target_link_libraries(${TEST_TARGET} PRIVATE llama)
 
 add_executable(test-moe-cache-shares test-moe-cache-shares.cpp)
+if (GGML_CUDA AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_executable(test-z6-numa-pinned test-z6-numa-pinned.cpp)
+    target_link_libraries(test-z6-numa-pinned PRIVATE ggml)
+endif()
 target_include_directories(test-moe-cache-shares PRIVATE ${PROJECT_SOURCE_DIR}/src)
 add_test(NAME test-moe-cache-shares COMMAND $<TARGET_FILE:test-moe-cache-shares>)

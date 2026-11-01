@@ -3,6 +3,9 @@
 #include "ggml-impl.h"
 #include "ggml-rpc.h"
 #include "ggml-moe-prefetch.h"
+#ifdef GGML_USE_CUDA
+#include "ggml-cuda.h"
+#endif
 
 #include <cassert>
 #include <climits>
@@ -17,6 +20,7 @@
 #include <chrono>
 #include <barrier>
 #include <thread>
+#include <unordered_map>
 #ifdef GGML_USE_OPENMP
 #include <omp.h>
 #endif
@@ -1165,6 +1169,31 @@ struct ggml_backend_sched_split {
     struct ggml_cgraph graph;
 };
 
+struct z6_caldi_ticket {
+    std::array<ggml_backend_event_t, GGML_SCHED_MAX_BACKENDS> ready = {};
+    ggml_backend_event_t hot_done = nullptr;
+    ggml_backend_event_t uploaded = nullptr;
+    uint64_t epoch = 0;
+};
+struct z6_caldi_plan {
+    std::vector<ggml_z6_caldi_group> groups;
+    std::unordered_map<const ggml_tensor *, size_t> hot_begins;
+    std::unordered_map<const ggml_tensor *, size_t> hot_ends;
+    std::unordered_map<const ggml_tensor *, size_t> cold_begins;
+    std::unordered_map<const ggml_tensor *, size_t> cold_outputs;
+    std::vector<z6_caldi_ticket> tickets; // retained across graph rebuilds
+    uint64_t epoch = 0;
+    int64_t samples = 0, overlapping = 0;
+    ggml_backend_event_t last_upload = nullptr;
+    ~z6_caldi_plan() {
+        for (auto & t : tickets) {
+            for (auto event : t.ready) if (event) ggml_backend_event_free(event);
+            if (t.hot_done) ggml_backend_event_free(t.hot_done);
+            if (t.uploaded) ggml_backend_event_free(t.uploaded);
+        }
+    }
+};
+
 struct ggml_backend_sched {
     bool is_reset; // true if the scheduler has been reset since the last graph split
     bool is_alloc;
@@ -1228,7 +1257,34 @@ struct ggml_backend_sched {
     bool is_async = false;
     bool debug;
     bool has_reduce = false;
+    z6_caldi_plan * z6_plan = nullptr;
 };
+
+void ggml_backend_sched_z6_begin_graph(ggml_backend_sched_t sched) {
+    if (!sched->z6_plan) sched->z6_plan = new z6_caldi_plan;
+    // New tensor metadata/addresses cannot replace a graph still in flight.
+    ggml_backend_sched_synchronize(sched);
+    sched->z6_plan->groups.clear();
+    sched->z6_plan->hot_begins.clear();
+    sched->z6_plan->hot_ends.clear();
+    sched->z6_plan->cold_begins.clear();
+    sched->z6_plan->cold_outputs.clear();
+}
+void ggml_backend_sched_z6_add_group(ggml_backend_sched_t sched, const ggml_z6_caldi_group * group) {
+    GGML_ASSERT(sched->z6_plan && sched->n_copies == 1);
+    auto & p = *sched->z6_plan;
+    const size_t i = p.groups.size();
+    p.groups.push_back(*group);
+    p.hot_begins[group->hot_begin] = i;
+    p.hot_ends[group->hot_end] = i;
+    p.cold_begins[group->cold_begin] = i;
+    p.cold_outputs[group->cold_end] = i;
+    if (p.tickets.size() <= i) p.tickets.emplace_back();
+}
+void ggml_backend_sched_z6_stats(ggml_backend_sched_t sched, int64_t * groups, int64_t * overlapping) {
+    *groups = sched->z6_plan ? sched->z6_plan->samples : 0;
+    *overlapping = sched->z6_plan ? sched->z6_plan->overlapping : 0;
+}
 
 void ggml_backend_sched_set_op_offload(ggml_backend_sched_t sched, enum ggml_op op, bool on_or_off) {
     int int_op = (int)op;
@@ -1781,7 +1837,8 @@ static void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct gg
             if (node->op == GGML_OP_REDUCE) {
                 sched->has_reduce = true;
             }
-            if ((node->op == GGML_OP_ADD && node->op_params[0] == 0xff) ||
+            if ((sched->z6_plan && sched->z6_plan->hot_begins.count(node)) ||
+                 (node->op == GGML_OP_ADD && node->op_params[0] == 0xff) ||
                  node->op == GGML_OP_REDUCE ||
                  node->op == GGML_OP_FAKE_CPY ||
                  node->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] == 0xff) {
@@ -2038,6 +2095,43 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     return true;
 }
 
+// Z6: GGML_Z6_H2D_ASYNC=1 manda in modo asincrono alla GPU gli input che arrivano dalla CPU
+static bool z6_h2d_async() {
+    static const bool v = [] { const char * e = getenv("GGML_Z6_H2D_ASYNC"); return e && atoi(e) > 0; }();
+    return v;
+}
+
+// Called before launching the hot split: copies are in each producer's stream,
+// and completion events are recorded BEFORE any hot work is queued.
+static void z6_caldi_prepare(ggml_backend_sched_t sched, size_t index) {
+#ifdef GGML_USE_CUDA
+    auto & p = *sched->z6_plan;
+    auto & g = p.groups[index];
+    auto & t = p.tickets[index];
+    // The shared host packet cannot be reused while a previous H2D reads it.
+    if (p.last_upload) ggml_backend_event_synchronize(p.last_upload);
+    t.epoch = p.epoch;
+    std::array<bool, GGML_SCHED_MAX_BACKENDS> used = {};
+    for (int k = 0; k < 3; ++k) {
+        auto src = g.device_inputs[k];
+        auto dst = g.host_inputs[k];
+        auto producer = ggml_backend_sched_get_tensor_backend(sched, src);
+        const int b = producer ? ggml_backend_sched_backend_id(sched, producer) : -1;
+        if (b < 0 || b >= sched->n_backends || !ggml_backend_is_cuda(sched->backends[b]))
+            fprintf(stderr, "z6 invalid producer: layer %d input %d %s backend %d buffer %s\n", g.layer, k, src->name, b, src->buffer ? ggml_backend_buffer_name(src->buffer) : "none");
+        GGML_ASSERT(b >= 0 && b < sched->n_backends && ggml_backend_is_cuda(sched->backends[b]));
+        GGML_ASSERT(ggml_are_same_layout(src, dst) && ggml_is_contiguous(src));
+        if (!t.ready[b]) t.ready[b] = ggml_backend_cuda_z6_event_new(sched->backends[b]);
+        ggml_backend_cuda_z6_get_async(sched->backends[b], src, dst->data);
+        used[b] = true;
+    }
+    for (int b = 0; b < sched->n_backends; ++b) if (used[b]) ggml_backend_cuda_z6_event_record(t.ready[b]);
+#else
+    GGML_UNUSED(sched); GGML_UNUSED(index);
+    GGML_ABORT("Z6 parallelo requires CUDA");
+#endif
+}
+
 static void ggml_backend_sched_copy_inputs(ggml_backend_sched_t sched, ggml_backend_sched_split * split, std::array<bool, GGML_SCHED_MAX_BACKENDS> & needs_sync,
         std::vector<int32_t> & ids, std::vector<uint32_t> & unique_ids, ggml_tensor * last_ids_tensor) {
     if (split->n_inputs < 1) return;
@@ -2060,6 +2154,24 @@ static void ggml_backend_sched_copy_inputs(ggml_backend_sched_t sched, ggml_back
         if (callback_handles_copy != callback_copy_pass) {
             continue;
         }
+
+#ifdef GGML_USE_CUDA
+        if (sched->z6_plan && ggml_backend_is_cuda(split_backend)) {
+            auto it = sched->z6_plan->cold_outputs.find(input);
+            if (it != sched->z6_plan->cold_outputs.end()) {
+                auto & p = *sched->z6_plan;
+                auto & ticket = p.tickets[it->second];
+                GGML_ASSERT(ticket.epoch == p.epoch);
+                // Queue order protects this GPU allocation; the ticket protects
+                // the host source. Do not clear needs_sync for unrelated inputs.
+                ggml_backend_cuda_z6_set_async(split_backend, input_cpy, input->data);
+                if (!ticket.uploaded) ticket.uploaded = ggml_backend_cuda_z6_event_new(split_backend);
+                ggml_backend_cuda_z6_event_record(ticket.uploaded);
+                p.last_upload = ticket.uploaded;
+                continue;
+            }
+        }
+#endif
 
         if (input->flags & GGML_TENSOR_FLAG_INPUT) {
             // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
@@ -2182,6 +2294,12 @@ static void ggml_backend_sched_copy_inputs(ggml_backend_sched_t sched, ggml_back
                     ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, copy_size);
                 }
 
+            } else if (z6_h2d_async() && ggml_backend_is_cpu(input_backend) && !ggml_backend_is_cpu(split_backend) &&
+                       input->buffer && ggml_backend_buffer_is_host(input->buffer) && ggml_is_contiguous(input) &&
+                       ggml_nbytes(input) == ggml_nbytes(input_cpy)) {
+                // Z6: risultati della CPU verso la GPU in modo asincrono sulla coda della GPU. Il calcolo della GPU
+                // che li usa viene dopo sulla stessa coda; la CPU riscrive quel buffer solo dopo aver aspettato la GPU.
+                ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input));
             } else
                 // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
                 // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
@@ -2252,6 +2370,19 @@ static ggml_status ggml_backend_sched_eval(ggml_backend_sched_t sched, ggml_back
         }
     }
     return GGML_STATUS_SUCCESS;
+}
+
+// Z6: tempi dei pezzi del grafo in generazione (GGML_Z6_TEMPI=1). Le copie prima di un pezzo della CPU
+// aspettano la fine della GPU, quindi "verso la CPU" contiene il tempo di calcolo della GPU.
+struct z6_sched_tempi {
+    int64_t n = 0, totale = 0, copia_cpu = 0, calcolo_cpu = 0, copia_gpu = 0, avvio_gpu = 0, pezzi_cpu = 0, pezzi_gpu = 0;
+    int64_t attesa_prefisso = 0, gruppi = 0, caldi_dopo_freddi = 0;
+};
+static z6_sched_tempi z6_st;
+
+static bool z6_sched_tempi_attivi() {
+    static const bool v = [] { const char * e = getenv("GGML_Z6_TEMPI"); return e && atoi(e) > 0; }();
+    return v;
 }
 
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
@@ -2536,6 +2667,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     size_t moe_next  = 0; // first moe_infos entry with split >= current split
     size_t moe_enq   = 0; // moe_infos entries already enqueued for lookahead
 
+    const bool z6_misura = z6_sched_tempi_attivi();
+    z6_sched_tempi z6_qui;
+    const int64_t z6_inizio = z6_misura ? ggml_time_us() : 0;
+    if (sched->z6_plan) ++sched->z6_plan->epoch;
+
     for (int i = 0; i < sched->n_splits; i++) {
 #if IK_PRINT_TIMING
         int64_t tim1 = ggml_time_us();
@@ -2543,6 +2679,41 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         struct ggml_backend_sched_split * split = &splits[i];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
+
+        size_t z6_hot = SIZE_MAX, z6_cold = SIZE_MAX;
+        if (sched->z6_plan && split->graph.n_nodes) {
+            auto first = split->graph.nodes[0];
+            auto hi = sched->z6_plan->hot_begins.find(first);
+            auto ci = sched->z6_plan->cold_begins.find(first);
+            if (hi != sched->z6_plan->hot_begins.end()) z6_hot = hi->second;
+            if (ci != sched->z6_plan->cold_begins.end()) z6_cold = ci->second;
+            if (z6_hot != SIZE_MAX) z6_caldi_prepare(sched, z6_hot);
+            if (z6_cold != SIZE_MAX) {
+                auto & p = *sched->z6_plan;
+                auto & ticket = p.tickets[z6_cold];
+                GGML_ASSERT(ticket.epoch == p.epoch);
+                // Wait on the producer prefix, never on its queued hot tail.
+                const int64_t z6_p = z6_misura ? ggml_time_us() : 0;
+#ifdef GGML_USE_CUDA
+                // GGML_Z6_ATTESA_ATTIVA=1: interroga l'evento in un ciclo invece di aspettare nel driver
+                static const bool z6_attesa_attiva = [] { const char * e = getenv("GGML_Z6_ATTESA_ATTIVA"); return e && atoi(e) > 0; }();
+                if (z6_attesa_attiva) {
+                    for (auto event : ticket.ready) if (event) while (!ggml_backend_cuda_z6_event_ready(event)) {}
+                } else
+#endif
+                for (auto event : ticket.ready) if (event) ggml_backend_event_synchronize(event);
+                if (z6_misura) { z6_qui.attesa_prefisso += ggml_time_us() - z6_p; z6_qui.gruppi++; }
+#ifdef GGML_USE_CUDA
+                const bool pending = ticket.hot_done && !ggml_backend_cuda_z6_event_ready(ticket.hot_done);
+                if (z6_misura) {
+                    p.samples++; p.overlapping += pending;
+                    if (p.samples % 5000 == 0) fprintf(stderr,
+                            "z6 parallelo: %lld gruppi, CPU avviata con caldi ancora in corso %lld (%.2f%%)\n",
+                            (long long)p.samples, (long long)p.overlapping, 100.0*p.overlapping/p.samples);
+                }
+#endif
+            }
+        }
 
         if (moe_prefetch && !moe_infos.empty()) {
             while (moe_next < moe_infos.size() && moe_infos[moe_next].split < i) {
@@ -2562,7 +2733,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
 
         // copy the input tensors to the split backend
+        const bool z6_cpu = z6_misura && ggml_backend_is_cpu(split_backend);
+        const int64_t z6_a = z6_misura ? ggml_time_us() : 0;
         ggml_backend_sched_copy_inputs(sched, split, sched->needs_sync, ids, unique_ids, last_ids_tensor);
+        const int64_t z6_b = z6_misura ? ggml_time_us() : 0;
 
         // ids are now final and host-visible; enqueue the selected expert
         // slices of this split's host-computed MoE matmuls (up/gate and down
@@ -2584,7 +2758,41 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
         auto ec = ggml_backend_sched_eval(sched, split_backend, split);
         if (ec != GGML_STATUS_SUCCESS) {
+            if (sched->z6_plan) ggml_backend_sched_synchronize(sched);
             return ec;
+        }
+#ifdef GGML_USE_CUDA
+        if (sched->z6_plan && ggml_backend_is_cuda(split_backend)) {
+            for (int n = 0; n < split->graph.n_nodes; ++n) {
+                auto it = sched->z6_plan->hot_ends.find(split->graph.nodes[n]);
+                if (it == sched->z6_plan->hot_ends.end()) continue;
+                auto & ticket = sched->z6_plan->tickets[it->second];
+                if (!ticket.hot_done) ticket.hot_done = ggml_backend_cuda_z6_event_new(split_backend);
+                ggml_backend_cuda_z6_event_record(ticket.hot_done);
+            }
+        }
+#endif
+        if (z6_misura) {
+            const int64_t z6_c = ggml_time_us();
+#ifdef GGML_USE_CUDA
+            if (z6_cold != SIZE_MAX) {
+                auto & t = sched->z6_plan->tickets[z6_cold];
+                z6_qui.caldi_dopo_freddi += t.hot_done && !ggml_backend_cuda_z6_event_ready(t.hot_done);
+            }
+#endif
+            if (z6_cpu) { z6_qui.copia_cpu += z6_b - z6_a; z6_qui.calcolo_cpu += z6_c - z6_b; z6_qui.pezzi_cpu++; }
+            else        { z6_qui.copia_gpu += z6_b - z6_a; z6_qui.avvio_gpu   += z6_c - z6_b; z6_qui.pezzi_gpu++; }
+            const auto last = split->graph.n_nodes ? split->graph.nodes[split->graph.n_nodes - 1] : nullptr;
+            if (z6_cpu && last && last->op == GGML_OP_CONCAT && last->ne[1] == 1 &&
+                    last->ne[0] == 248320 && strcmp(last->name, "result_output") == 0) {
+                static int64_t n = 0, copy = 0, concat = 0;
+                ++n; copy += z6_b - z6_a; concat += z6_c - z6_b;
+                if (n == 100) {
+                    fprintf(stderr, "z6 testa join: n=%lld copia_attesa_cpu_us=%.3f concat_cpu_us=%.3f\n",
+                            (long long)n, double(copy)/n, double(concat)/n);
+                    n = copy = concat = 0;
+                }
+            }
         }
 
         // the pages the lookahead streamer just read for this split are one-shot
@@ -2605,6 +2813,44 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     }
 
     sched->cur_copy = (sched->cur_copy + 1) % sched->n_copies;
+
+    if (z6_misura) {
+        const int64_t totale = ggml_time_us() - z6_inizio;
+        if (totale < 200000) {  // solo generazione: i blocchi di prompt durano secondi
+            z6_st.n++; z6_st.totale += totale;
+            z6_st.copia_cpu += z6_qui.copia_cpu; z6_st.calcolo_cpu += z6_qui.calcolo_cpu;
+            z6_st.copia_gpu += z6_qui.copia_gpu; z6_st.avvio_gpu += z6_qui.avvio_gpu;
+            z6_st.pezzi_cpu += z6_qui.pezzi_cpu; z6_st.pezzi_gpu += z6_qui.pezzi_gpu;
+            z6_st.attesa_prefisso += z6_qui.attesa_prefisso; z6_st.gruppi += z6_qui.gruppi;
+            z6_st.caldi_dopo_freddi += z6_qui.caldi_dopo_freddi;
+            if (z6_st.n == 100) {
+                const double n = (double) z6_st.n;
+                fprintf(stderr, "z6 sched: %lld grafi, medio %.2f ms; attesa+copia verso CPU %.2f ms, calcolo CPU %.2f ms, "
+                        "copia verso GPU %.2f ms, avvio GPU %.2f ms; pezzi CPU %.1f, GPU %.1f per grafo\n",
+                        (long long) z6_st.n, z6_st.totale / n / 1000, z6_st.copia_cpu / n / 1000, z6_st.calcolo_cpu / n / 1000,
+                        z6_st.copia_gpu / n / 1000, z6_st.avvio_gpu / n / 1000, z6_st.pezzi_cpu / n, z6_st.pezzi_gpu / n);
+                fprintf(stderr, "z6 consegne: attesa prefisso GPU %.2f ms per grafo, %.1f gruppi, caldi ancora attivi a fine freddi %.1f%%\n",
+                        z6_st.attesa_prefisso / n / 1000, z6_st.gruppi / n,
+                        z6_st.gruppi ? 100.0 * z6_st.caldi_dopo_freddi / z6_st.gruppi : 0.0);
+                z6_st = z6_sched_tempi();
+            }
+        } else {
+            // prompt: l'attesa della GPU sta nella copia verso la CPU
+            static z6_sched_tempi z6_pr;
+            z6_pr.n++; z6_pr.totale += totale;
+            z6_pr.copia_cpu += z6_qui.copia_cpu; z6_pr.calcolo_cpu += z6_qui.calcolo_cpu;
+            z6_pr.copia_gpu += z6_qui.copia_gpu; z6_pr.avvio_gpu += z6_qui.avvio_gpu;
+            z6_pr.pezzi_cpu += z6_qui.pezzi_cpu; z6_pr.pezzi_gpu += z6_qui.pezzi_gpu;
+            if (z6_pr.n == 20) {
+                const double n = (double) z6_pr.n;
+                fprintf(stderr, "z6 prompt: %lld grafi, medio %.1f ms; attesa+copia verso CPU %.1f ms, calcolo CPU %.1f ms, "
+                        "copia verso GPU %.1f ms, avvio GPU %.1f ms; pezzi CPU %.1f, GPU %.1f per grafo\n",
+                        (long long) z6_pr.n, z6_pr.totale / n / 1000, z6_pr.copia_cpu / n / 1000, z6_pr.calcolo_cpu / n / 1000,
+                        z6_pr.copia_gpu / n / 1000, z6_pr.avvio_gpu / n / 1000, z6_pr.pezzi_cpu / n, z6_pr.pezzi_gpu / n);
+                z6_pr = z6_sched_tempi();
+            }
+        }
+    }
 
     return GGML_STATUS_SUCCESS;
 }
@@ -2672,6 +2918,10 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     if (sched == NULL) {
         return;
     }
+    if (sched->z6_plan) {
+        ggml_backend_sched_synchronize(sched);
+        delete sched->z6_plan;
+    }
     for (int b = 0; b < sched->n_backends; b++) {
         for (int c = 0; c < sched->n_copies; c++) {
             ggml_backend_event_free(sched->events[b][c]);
@@ -2699,6 +2949,7 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
 }
 
 void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
+    if (sched->z6_plan) ggml_backend_sched_synchronize(sched);
     // reset state for the next run
     if (!sched->is_reset) {
         ggml_hash_set_reset(&sched->hash_set);
