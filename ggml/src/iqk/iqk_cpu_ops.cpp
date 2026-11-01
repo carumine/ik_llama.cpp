@@ -451,6 +451,26 @@ void iqk_mul_multi_add(struct ggml_tensor * dst, int ith, int nth) {
 
     auto src2 = dst->src[2];
     auto src3 = dst->src[3];
+    if (dst->src[4]) {
+        const auto valid = dst->src[4];
+        GGML_ASSERT(valid->type == GGML_TYPE_I32 && valid->nb[0] == sizeof(int32_t));
+        for (int ir = first; ir < last; ++ir) {
+            auto y = (float *)((char *)dst->data + ir*dst->nb[1]);
+            std::fill(y, y + ne00, 0.0f);
+            const auto ids = (const int32_t *)((const char *)valid->data + ir*valid->nb[1]);
+            for (int j = 0; j < ne01; ++j) {
+                if (ids[j] < 0) continue;
+                const auto x = (const float *)((const char *)src0->data + ir*src0->nb[2] + j*src0->nb[1]);
+                float w = *(const float *)((const char *)src1->data + ir*src1->nb[2] + j*src1->nb[1]);
+                if (src2 && src3) {
+                    const auto original = (const int32_t *)((const char *)src3->data + ir*src3->nb[1]);
+                    w *= ((const float *)src2->data)[original[j]];
+                }
+                for (int k = 0; k < ne00; ++k) y[k] += x[k]*w;
+            }
+        }
+        return;
+    }
     if (src2 && src3) {
         GGML_ASSERT(src2->type == GGML_TYPE_F32);
         GGML_ASSERT(src3->type == GGML_TYPE_I32);

@@ -42,12 +42,51 @@ static bool server_speculative_multimodal_supported(const common_params_speculat
 #include <cstdio>
 #include <filesystem>
 
+// Z6 (IK_Z6_CKPT_VELOCE=1): un checkpoint nuovo da 112 MB costa circa 55 ms solo per allocare e azzerare il
+// vettore (page fault). I buffer dei checkpoint cancellati restano qui, al massimo 4, e il prossimo li riusa.
+static bool z6_ckpt_veloce() {
+    static const bool attivo = [] { const char * e = getenv("IK_Z6_CKPT_VELOCE"); return e && atoi(e) > 0; }();
+    return attivo;
+}
+
+static std::vector<std::vector<uint8_t>> z6_ckpt_liberi;
+
+static void z6_ckpt_ricicla(std::vector<uint8_t> & data) {
+    if (z6_ckpt_veloce() && data.capacity() > 0 && z6_ckpt_liberi.size() < 4) {
+        z6_ckpt_liberi.push_back(std::move(data));
+    }
+}
+
+static void z6_ckpt_prepara(std::vector<uint8_t> & data, size_t size) {
+    if (!z6_ckpt_veloce()) {
+        data.resize(size);
+        return;
+    }
+    if (data.capacity() < size) {
+        for (auto it = z6_ckpt_liberi.begin(); it != z6_ckpt_liberi.end(); ++it) {
+            if (it->capacity() >= size) {
+                data = std::move(*it);
+                z6_ckpt_liberi.erase(it);
+                break;
+            }
+        }
+    }
+    if (data.capacity() < size) {
+        // margine: gli stati crescono di pochi KB fra un checkpoint e l'altro, il buffer resta riusabile
+        data.clear();
+        data.shrink_to_fit();
+        data.reserve(size + size/32);
+    }
+    data.resize(size);
+}
+
 static std::list<server_prompt_checkpoint>::iterator drop_checkpoint_entry(
         std::list<server_prompt_checkpoint> & ckpts,
         std::list<server_prompt_checkpoint>::iterator it) {
     if (!it->spill_path.empty()) {
         remove(it->spill_path.c_str());
     }
+    z6_ckpt_ricicla(it->data);
     return ckpts.erase(it);
 }
 
@@ -56,6 +95,7 @@ static void clear_checkpoints_and_spill(std::list<server_prompt_checkpoint> & ck
         if (!c.spill_path.empty()) {
             remove(c.spill_path.c_str());
         }
+        z6_ckpt_ricicla(c.data);
     }
     ckpts.clear();
 }
@@ -66,7 +106,7 @@ static void server_prompt_checkpoint_update(server_prompt_checkpoint & ckpt, lla
     ckpt.n_tokens = n_tokens;
 
     const size_t checkpoint_size = llama_state_seq_get_size(ctx, id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-    ckpt.data.resize(checkpoint_size);
+    z6_ckpt_prepara(ckpt.data, checkpoint_size);
 
     const size_t n = llama_state_seq_get_data(ctx, ckpt.data.data(), ckpt.data.size(), id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
     if (n != checkpoint_size) {

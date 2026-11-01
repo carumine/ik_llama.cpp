@@ -974,6 +974,7 @@ struct ggml_tensor_extra_gpu {
 
 struct ggml_cuda_graph;
 struct ggml_cuda_f8_lt_context;
+struct ggml_cuda_z6_state;
 
 struct ggml_backend_cuda_context {
     int device;
@@ -1064,6 +1065,9 @@ struct ggml_backend_cuda_context {
 
     // pool
     std::unique_ptr<ggml_cuda_pool> pools[GGML_CUDA_MAX_DEVICES];
+
+    // Opt-in Z6 kernel storage, separate from the temporary LIFO pool.
+    std::shared_ptr<ggml_cuda_z6_state> z6_state;
 
     static std::unique_ptr<ggml_cuda_pool> new_pool_for_device(int device);
 

@@ -1,6 +1,7 @@
 #include "ggml-cuda/common.cuh"
 #include "ggml.h"
 #include "topk-moe.cuh"
+#include "z6-topk-moe.cuh"
 
 /*
     This kernel does the following:
@@ -255,6 +256,11 @@ void ggml_cuda_op_topk_moe(ggml_backend_cuda_context & ctx,
     }
 
     if (normalize) {
+        static const bool z6 = [] { const char * e = getenv("GGML_Z6_TOPK_MOE"); return e && atoi(e) > 0; }();
+        if (z6 && n_rows == 1 && n_experts == 512 && n_expert_used == 10 && !bias) {
+            z6_topk_moe_cuda<true><<<1, WARP_SIZE, 0, stream>>>(logits_d, weights_d, ids_d);
+            return;
+        }
         launch_topk_moe_cuda<true >(ctx, logits_d, weights_d, ids_d, bias_d, n_rows, n_experts, n_expert_used);
     } else {
         launch_topk_moe_cuda<false>(ctx, logits_d, weights_d, ids_d, bias_d, n_rows, n_experts, n_expert_used);

@@ -6,6 +6,16 @@
 //
 
 #include "binbcast.cuh"
+#include "quantize.cuh"
+
+static __global__ void z6_mul_q8(const float * x, const float * y, float * dst, block_q8_1 * q, int n) {
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    const float v = i < n ? x[i]*y[i] : 0.0f;
+    if (i < n) {
+        dst[i] = v;
+    }
+    ggml_cuda_z6_store_q8(v, q, i);
+}
 
 static __device__ __forceinline__ float op_repeat(const float a, const float b) {
     return b;
@@ -588,6 +598,16 @@ static __global__ void k_mul_fast(int ne0, int nelem, const float * x, const flo
 }
 
 void ggml_cuda_op_mul(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    if (ggml_nelements(dst) == 6144 && dst->type == GGML_TYPE_F32 &&
+        dst->src[0]->type == GGML_TYPE_F32 && dst->src[1]->type == GGML_TYPE_F32 &&
+        ggml_are_same_shape(dst->src[0], dst->src[1]) && ggml_is_contiguous(dst->src[0]) && ggml_is_contiguous(dst->src[1])) {
+        if (auto q = ggml_cuda_z6_q8_flat_producer(ctx, dst)) {
+            const int n = ggml_nelements(dst);
+            z6_mul_q8<<<GGML_PAD(n, MATRIX_ROW_PADDING)/256, 256, 0, ctx.stream()>>>(
+                (const float *)dst->src[0]->data, (const float *)dst->src[1]->data, (float *)dst->data, q, n);
+            return;
+        }
+    }
     // The scalar fast-path reads src0 and writes dst as flat/contiguous buffers, so it is only
     // valid when both are contiguous. A non-contiguous (e.g. row-gapped view) src0 must fall
     // through to the general bin_bcast path, which honours the per-dimension strides.

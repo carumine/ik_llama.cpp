@@ -6,6 +6,17 @@
 //
 
 #include "unary.cuh"
+#include "quantize.cuh"
+
+static __global__ void z6_silu_q8(const float * x, float * dst, block_q8_1 * q, const int k, const float scale) {
+    const int i = blockDim.x*blockIdx.x + threadIdx.x;
+    const float sx = i < k ? scale*x[i] : 0.0f;
+    const float v = sx / (1.0f + expf(-sx));
+    if (i < k) {
+        dst[i] = v;
+    }
+    ggml_cuda_z6_store_q8(v, q, i);
+}
 
 static __global__ void gelu_f32(const float * x, float * dst, const int k) {
     const float GELU_COEF_A    = 0.044715f;
@@ -447,7 +458,13 @@ void ggml_cuda_op_silu(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     GGML_ASSERT(src0->type == GGML_TYPE_F32);
     GGML_ASSERT( dst->type == GGML_TYPE_F32);
 
-    silu_f32_cuda(src0_d, dst_d, ggml_nelements(src0), stream);
+    if (auto q = ggml_cuda_z6_q8_producer(ctx, dst)) {
+        const int n = ggml_nelements(dst);
+        z6_silu_q8<<<GGML_PAD(n, MATRIX_ROW_PADDING)/CUDA_SILU_BLOCK_SIZE, CUDA_SILU_BLOCK_SIZE, 0, stream>>>(
+            src0_d, dst_d, q, n, 1.0f);
+    } else {
+        silu_f32_cuda(src0_d, dst_d, ggml_nelements(src0), stream);
+    }
 }
 
 #if 0
@@ -591,7 +608,13 @@ bool ggml_cuda_op_scale_unary(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     float scale;
     memcpy(&scale, src->op_params, sizeof(scale));
     if (op == GGML_UNARY_OP_SILU) {
-        scaled_silu_f32_cuda((const float *)src0->data, (float *)dst->data, ggml_nelements(src0), scale, ctx.stream());
+        if (auto q = ggml_cuda_z6_q8_producer(ctx, dst)) {
+            const int n = ggml_nelements(dst);
+            z6_silu_q8<<<GGML_PAD(n, MATRIX_ROW_PADDING)/CUDA_SILU_BLOCK_SIZE, CUDA_SILU_BLOCK_SIZE, 0, ctx.stream()>>>(
+                (const float *)src0->data, (float *)dst->data, q, n, scale);
+        } else {
+            scaled_silu_f32_cuda((const float *)src0->data, (float *)dst->data, ggml_nelements(src0), scale, ctx.stream());
+        }
     } else {
         scaled_sigmoid_f32_cuda((const float *)src0->data, (float *)dst->data, ggml_nelements(src0), scale, ctx.stream());
     }
