@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <mutex>
+#include <unordered_map>
 
 using raw_buffer = std::vector<uint8_t>;
 
@@ -1034,6 +1036,82 @@ json json_get_nested_values(const std::vector<std::string>& paths, const json& j
  * - only string, example: "string"
  * - mixed string and tokens, example: [12, 34, "string", 56, 78]
  */
+// Z6 (IK_Z6_TOKEN_CACHE=1): un agente rimanda a ogni giro tutta la conversazione, e tokenizzarla da capo
+// costa circa 0,2 s a 100K token. Il prompt si divide prima di ogni <|im_start|>: con parse_special i token
+// speciali separano i pezzi di testo, che il tokenizzatore tratta ciascuno per conto suo, quindi un pezzo
+// uguale a uno della richiesta precedente ha gli stessi token. Con 2 confronta ogni volta il risultato con
+// la tokenizzazione intera, segnala le differenze e usa quella.
+static int z6_token_cache_modo() {
+    static const int modo = [] { const char * e = getenv("IK_Z6_TOKEN_CACHE"); return e ? atoi(e) : 0; }();
+    return modo;
+}
+
+static std::vector<llama_token> z6_tokenize_cache(const llama_vocab * vocab, const std::string & s, bool add_special) {
+    static const std::string sep = "<|im_start|>";
+    static std::mutex mutex;
+    static const llama_vocab * cache_vocab = nullptr;
+    static bool sep_ok = false;
+    static std::unordered_map<std::string, std::vector<llama_token>> pezzi; // pezzi dell'ultima richiesta
+
+    std::lock_guard<std::mutex> lock(mutex);
+    if (vocab != cache_vocab) {
+        cache_vocab = vocab;
+        sep_ok = llama_tokenize(vocab, sep, false, true).size() == 1 && !llama_vocab_get_add_eos(vocab);
+        pezzi.clear();
+    }
+    if (!sep_ok) {
+        return llama_tokenize(vocab, s, add_special, true);
+    }
+    const int64_t t0 = ggml_time_us();
+    std::vector<llama_token> out;
+    std::unordered_map<std::string, std::vector<llama_token>> nuovi;
+    size_t n_riusati = 0, n_pezzi = 0;
+    for (size_t inizio = 0; inizio < s.size(); ++n_pezzi) {
+        size_t fine = s.find(sep, inizio + 1);
+        if (fine == std::string::npos) {
+            fine = s.size();
+        }
+        // il BOS, se il vocabolario lo aggiunge, va solo sul primo pezzo: fa parte della chiave
+        std::string chiave(1, inizio == 0 && add_special ? '\1' : '\0');
+        chiave.append(s, inizio, fine - inizio);
+        auto it = nuovi.find(chiave);
+        if (it == nuovi.end()) {
+            auto vecchio = pezzi.find(chiave);
+            if (vecchio != pezzi.end()) {
+                n_riusati += vecchio->second.size();
+                it = nuovi.emplace(std::move(chiave), vecchio->second).first;
+            } else {
+                auto t = llama_tokenize(vocab, s.substr(inizio, fine - inizio), inizio == 0 && add_special, true);
+                it = nuovi.emplace(std::move(chiave), std::move(t)).first;
+            }
+        }
+        out.insert(out.end(), it->second.begin(), it->second.end());
+        inizio = fine;
+    }
+    pezzi = std::move(nuovi);
+    const int64_t t1 = ggml_time_us();
+    if (z6_token_cache_modo() >= 2) {
+        auto intero = llama_tokenize(vocab, s, add_special, true);
+        const int64_t t2 = ggml_time_us();
+        size_t i = 0;
+        while (i < out.size() && i < intero.size() && out[i] == intero[i]) {
+            ++i;
+        }
+        const bool uguale = i == out.size() && i == intero.size();
+        LOG_INF("z6 token cache: %zu pezzi, %zu token, %zu riusati, %.1f ms contro %.1f ms intera, %s\n",
+                n_pezzi, out.size(), n_riusati, (t1 - t0) / 1000.0, (t2 - t1) / 1000.0,
+                uguale ? "uguale" : "DIVERSA");
+        if (!uguale) {
+            LOG_WRN("z6 token cache: primo token diverso in posizione %zu su %zu e %zu\n", i, out.size(), intero.size());
+            return intero;
+        }
+    } else {
+        LOG_INF("z6 token cache: %zu pezzi, %zu token, %zu riusati, %.1f ms\n",
+                n_pezzi, out.size(), n_riusati, (t1 - t0) / 1000.0);
+    }
+    return out;
+}
+
 std::vector<llama_token> tokenize_mixed(const llama_vocab* vocab, const json& json_prompt, bool add_special, bool parse_special) {
     // If `add_bos` is true, we only add BOS, when json_prompt is a string,
     // or the first element of the json_prompt array is a string.
@@ -1067,7 +1145,11 @@ std::vector<llama_token> tokenize_mixed(const llama_vocab* vocab, const json& js
     }
     else {
         auto s = json_prompt.template get<std::string>();
-        prompt_tokens = llama_tokenize(vocab, s, add_special, parse_special);
+        if (z6_token_cache_modo() > 0 && parse_special && s.size() >= 4096) {
+            prompt_tokens = z6_tokenize_cache(vocab, s, add_special);
+        } else {
+            prompt_tokens = llama_tokenize(vocab, s, add_special, parse_special);
+        }
     }
 
     return prompt_tokens;
