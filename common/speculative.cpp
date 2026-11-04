@@ -2687,6 +2687,16 @@ bool common_speculative_checkpoint_restore(
         return true;
     }
 
+    // IK_Z6_SPEC_KEEP_SAMPLER=1: con le bozze da lookup la verifica ha già accettato nel campionatore
+    // proprio i token tenuti, primo rifiuto compreso. Ricopiarlo dal checkpoint riporterebbe indietro
+    // anche il generatore casuale, e il passo dopo riuserebbe estrazioni già condizionate dal rifiuto.
+    // Si ripristinano solo KV e stato ricorrente.
+    static const bool z6_keep_sampler_on = [] {
+        const char * e = std::getenv("IK_Z6_SPEC_KEEP_SAMPLER");
+        return e && std::atoi(e) > 0;
+    }();
+    const bool z6_keep_sampler = z6_keep_sampler_on && common_speculative_type_is_self_spec(spec_type_used);
+
     const int step = (int) ids.size() - 1;
     const enum llama_spec_ckpt_restore_result restore_result = llama_spec_ckpt_restore_ex(
             ctx, spec_ckpt, seq_id, ckpt.n_past, ckpt.mode == LLAMA_SPEC_CKPT_PER_STEP ? step : 0);
@@ -2697,10 +2707,10 @@ bool common_speculative_checkpoint_restore(
     }
 
     if (restore_result == LLAMA_SPEC_CKPT_RESTORE_DIRECT) {
-        if (ckpt.sampler != nullptr && sampler_dst != nullptr) {
+        if (!z6_keep_sampler && ckpt.sampler != nullptr && sampler_dst != nullptr) {
             common_sampler_clone(ckpt.sampler, sampler_dst);
         }
-        if (sampler_dst != nullptr) {
+        if (!z6_keep_sampler && sampler_dst != nullptr) {
             for (llama_token id : ids) {
                 common_sampler_accept(sampler_dst, ctx, id, true);
             }
@@ -2725,7 +2735,7 @@ bool common_speculative_checkpoint_restore(
         LOG_DBG("%s: seq_id=%d per-step restore: step=%d (rejected %d drafts)\n",
                 __func__, (int) seq_id, step, (int) (n_draft - (ids.size() - 1)));
     } else {
-        if (ckpt.sampler != nullptr && sampler_dst != nullptr) {
+        if (!z6_keep_sampler && ckpt.sampler != nullptr && sampler_dst != nullptr) {
             common_sampler_clone(ckpt.sampler, sampler_dst);
         }
 
@@ -2774,7 +2784,7 @@ bool common_speculative_checkpoint_restore(
             }
             llama_batch_free(re_batch);
 
-            if (sampler_dst != nullptr) {
+            if (!z6_keep_sampler && sampler_dst != nullptr) {
                 for (llama_token id : ids) {
                     common_sampler_accept(sampler_dst, ctx, id, true);
                 }
