@@ -19047,7 +19047,7 @@ static int z6_giri(void) {
 }
 
 // Initialize once before entering OpenMP; no getenv/string scan in the chunk loop.
-static struct { bool queue, affinity, barrier, pinned, rows, batch_quant; int chunks, unit, batch_chunks; } z6_options;
+static struct { bool queue, affinity, barrier, pinned, rows, batch_quant; int chunks, unit, batch_chunks, pp_split_min; float pp_split; } z6_options;
 static atomic_int z6_options_ready = 0;
 
 static bool z6_env_on(const char * key) {
@@ -19071,6 +19071,10 @@ static void z6_options_init(void) {
         z6_options.unit = unit && (atoi(unit) == 8 || atoi(unit) == 4) ? atoi(unit) : 16;
         const char * chunks = getenv("GGML_Z6_NUMA_CHUNKS");
         z6_options.chunks = chunks ? atoi(chunks) : 0;
+        const char * pp_split = getenv("GGML_Z6_PP_SPLIT"); // quota di righe del nodo 0 nei batch grandi
+        z6_options.pp_split = pp_split && atof(pp_split) > 0.0 && atof(pp_split) < 1.0 ? (float) atof(pp_split) : 0.0f;
+        const char * pp_split_min = getenv("GGML_Z6_PP_SPLIT_MIN");
+        z6_options.pp_split_min = pp_split_min ? MAX(33, atoi(pp_split_min)) : 256;
         atomic_store_explicit(&z6_options_ready, 2, memory_order_release);
     } else {
         while (atomic_load_explicit(&z6_options_ready, memory_order_acquire) != 2) sched_yield();
@@ -19184,6 +19188,20 @@ static int z6_row_range(int64_t rows, int q, int nth, int * lo, int * hi) {
     *lo = q ? r : 0;
     *hi = q ? (int) rows : r;
     return MAX(1, z6_options.chunks > 0 ? z6_options.chunks : nth / 2);
+}
+
+// GGML_Z6_PP_SPLIT=<quota>: nei batch da almeno GGML_Z6_PP_SPLIT_MIN token (256) i pesi si riusano su
+// molti token e il tempo segue il calcolo, non la banda: con la quota scelta per la banda il socket 1
+// finisce prima e aspetta. Qui il nodo 0 calcola solo [0, quota·righe); le righe in più del socket 1
+// restano sul nodo 0 e lui le legge da remoto. Ogni riga resta calcolata da un solo thread, come prima.
+static int z6_row_range_batch(int64_t rows, int q, int nth, int64_t n_tok, int * lo, int * hi) {
+    const int parti = z6_row_range(rows, q, nth, lo, hi);
+    if (z6_options.pp_split > 0.0f && n_tok >= z6_options.pp_split_min) {
+        const int64_t r = MAX(MIN((int64_t) (z6_options.pp_split * rows / 32.0f + 0.5f) * 32, rows - 32), 32);
+        *lo = q ? (int) r : 0;
+        *hi = q ? (int) rows : (int) r;
+    }
+    return parti;
 }
 
 // Parte c di n: segmenti (esperto, prima riga, righe) in seg, restituisce quanti
@@ -19615,7 +19633,7 @@ static void ggml_compute_forward_mul_mat_id(
             const int mio = z6_thread_node();
             if (z6_options.rows && ne01 >= 64) {
                 int lo, hi;
-                const int original_parts = z6_row_range(ne01, mio, nth, &lo, &hi);
+                const int original_parts = z6_row_range_batch(ne01, mio, nth, ids->ne[1], &lo, &hi);
                 const int parti = z6_options.batch_chunks > 0 && z6_batch_medio(ids) ? z6_options.batch_chunks : original_parts;
                 const int n_att = z6_esperti_attivi(matrix_row_counts, n_as, mio, att);
                 struct z6_seg seg[512];
@@ -20087,7 +20105,7 @@ static void ggml_compute_forward_mul_mat_id_up_gate(
         const int mio = z6_thread_node();
         if (z6_options.rows && src0_2 && nr0_base >= 64) {
             int lo, hi;
-            const int original_parts = z6_row_range(nr0_base, mio, nth, &lo, &hi);
+            const int original_parts = z6_row_range_batch(nr0_base, mio, nth, ids->ne[1], &lo, &hi);
             const int parti = z6_options.batch_chunks > 0 && z6_batch_medio(ids) ? z6_options.batch_chunks : original_parts;
             const int n_att = z6_esperti_attivi(matrix_row_counts, n_as, mio, att);
             struct z6_seg seg[512];
@@ -31065,6 +31083,56 @@ static void z6_tempi_riepilogo(int n_threads) {
     z6_graph_n = 0;
 }
 
+// Z6: tempi del prefill per thread (GGML_Z6_PP_TEMPI=1), solo per n_batch > 32: up/gate fusi, mul_mat_id, altro, attese.
+// Il thread 0 somma anche la durata di ogni nodo per tipo di operazione, barriera compresa, cioè il tempo del grafo.
+// Ogni 50 grafi scrive su stderr medie per grafo e azzera.
+static struct { int64_t ug, mmid, altro, attesa; int node; char pad[28]; } z6_pp[128];
+static int64_t z6_pp_op_us[GGML_OP_COUNT], z6_pp_op_n[GGML_OP_COUNT];
+static int64_t z6_pp_us = 0, z6_pp_n = 0, z6_pp_tok = 0;
+
+static bool z6_pp_tempi(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char * e = getenv("GGML_Z6_PP_TEMPI");
+        v = e && atoi(e) > 0;
+    }
+    return v;
+}
+
+static void z6_pp_riepilogo(int n_threads) {
+    if (z6_pp_n < 50) return;
+    const double n = (double) z6_pp_n;
+    const int nt = MIN(n_threads, 128);
+    fprintf(stderr, "z6 pp: %lld grafi, %.0f token medi, durata media %.2f ms\n",
+            (long long) z6_pp_n, z6_pp_tok / n, z6_pp_us / n / 1e3);
+    for (int k = 0; k < 4; ++k) {
+        static const char * nomi[4] = {"up/gate fusi", "mul_mat_id", "altro", "attese"};
+        double lo = 1e30, hi = 0, sum = 0, so[2] = {0, 0}; int cs[2] = {0, 0};
+        for (int i = 0; i < nt; ++i) {
+            const int64_t v = k == 0 ? z6_pp[i].ug : k == 1 ? z6_pp[i].mmid : k == 2 ? z6_pp[i].altro : z6_pp[i].attesa;
+            lo = MIN(lo, (double) v); hi = MAX(hi, (double) v); sum += v;
+            so[z6_pp[i].node & 1] += v; cs[z6_pp[i].node & 1]++;
+        }
+        fprintf(stderr, "z6 pp %s: min/medio/max %.2f/%.2f/%.2f ms per grafo; socket0 %.2f socket1 %.2f\n", nomi[k],
+                lo / n / 1e3, sum / nt / n / 1e3, hi / n / 1e3,
+                cs[0] ? so[0] / cs[0] / n / 1e3 : 0, cs[1] ? so[1] / cs[1] / n / 1e3 : 0);
+    }
+    int64_t tot = 0;
+    for (int op = 0; op < GGML_OP_COUNT; ++op) tot += z6_pp_op_us[op];
+    for (int r = 0; r < 10 && tot > 0; ++r) {
+        int best = -1;
+        for (int op = 0; op < GGML_OP_COUNT; ++op) if (z6_pp_op_us[op] > 0 && (best < 0 || z6_pp_op_us[op] > z6_pp_op_us[best])) best = op;
+        if (best < 0) break;
+        fprintf(stderr, "z6 pp op %s: %.2f ms per grafo, %.1f%%, %.1f nodi\n", ggml_op_name((enum ggml_op) best),
+                z6_pp_op_us[best] / n / 1e3, 100.0 * z6_pp_op_us[best] / tot, z6_pp_op_n[best] / n);
+        z6_pp_op_us[best] = 0;
+    }
+    memset(z6_pp, 0, sizeof(z6_pp));
+    memset(z6_pp_op_us, 0, sizeof(z6_pp_op_us));
+    memset(z6_pp_op_n, 0, sizeof(z6_pp_op_n));
+    z6_pp_us = 0; z6_pp_n = 0; z6_pp_tok = 0;
+}
+
 static thread_ret_t ggml_graph_compute_thread(void * data) {
     struct ggml_compute_state * state = (struct ggml_compute_state *) data;
 
@@ -31080,6 +31148,8 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     }
     set_cpu_thread_affinity(cplan, state->ith);
     if (z6_tempi() && state->ith < 128) z6_t[state->ith].node = z6_thread_node(); // explicit affinity takes precedence over NUMA
+    const bool z6_pp_misura = z6_pp_tempi() && state->shared->n_batch > 32 && state->ith < 128;
+    if (z6_pp_misura) z6_pp[state->ith].node = z6_thread_node();
     if (z6_conta) {
         z6_t[state->ith].avvio += z6_partito - z6_inizio_corrente;
         z6_t[state->ith].affinita += ggml_time_us() - z6_partito;
@@ -31111,7 +31181,10 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         const bool z6_misura = z6_tempi() && state->shared->n_batch <= 32 && state->ith < 128;
         const bool z6_moe = node->op == GGML_OP_MUL_MAT_ID || node->op == GGML_OP_MOE_FUSED_UP_GATE;
         const int64_t z6_a = z6_misura ? ggml_time_us() : 0;
+        const int64_t z6_pa = z6_pp_misura ? ggml_time_us() : 0;
+        const enum ggml_op z6_pp_op = node->op;
         node_n = ggml_compute_forward(&params, node, cgraph, node_n);
+        const int64_t z6_pb = z6_pp_misura ? ggml_time_us() : 0;
 #if IK_PRINT_TIMING
         int64_t tim2 = ggml_time_us();
         t_eval += tim2 - tim1;
@@ -31130,6 +31203,14 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             node_n == cgraph->n_nodes - 1 && !cplan->abort_callback;
 #endif
         if (!z6_skip_final) ggml_barrier(state->shared);
+        if (z6_pp_misura) {
+            const int64_t z6_pc = ggml_time_us();
+            if (z6_pp_op == GGML_OP_MOE_FUSED_UP_GATE) z6_pp[state->ith].ug += z6_pb - z6_pa;
+            else if (z6_pp_op == GGML_OP_MUL_MAT_ID) z6_pp[state->ith].mmid += z6_pb - z6_pa;
+            else z6_pp[state->ith].altro += z6_pb - z6_pa;
+            z6_pp[state->ith].attesa += z6_pc - z6_pb;
+            if (state->ith == 0) { z6_pp_op_us[z6_pp_op] += z6_pc - z6_pa; z6_pp_op_n[z6_pp_op] += 1; }
+        }
         if (z6_misura) {
             const int64_t z6_c = ggml_time_us();
             if (z6_moe) z6_t[state->ith].moe += z6_b - z6_a; else z6_t[state->ith].altro += z6_b - z6_a;
@@ -31172,6 +31253,7 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
 
     const int64_t z6_inizio = (z6_tempi() && cgraph->n_batch <= 32) ? ggml_time_us() : 0;
     z6_inizio_corrente = z6_inizio;
+    const int64_t z6_pp_inizio = (z6_pp_tempi() && cgraph->n_batch > 32) ? ggml_time_us() : 0;
 
     struct ggml_compute_state_shared state_shared = {
         /*.cgraph                  =*/ cgraph,
@@ -31278,6 +31360,12 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
         z6_graph_us += ggml_time_us() - z6_inizio;
         z6_graph_n += 1;
         z6_tempi_riepilogo(n_threads);
+    }
+    if (z6_pp_inizio) {
+        z6_pp_us += ggml_time_us() - z6_pp_inizio;
+        z6_pp_n += 1;
+        z6_pp_tok += cgraph->n_batch;
+        z6_pp_riepilogo(n_threads);
     }
 
     return state_shared.ec;
