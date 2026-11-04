@@ -269,6 +269,7 @@ struct common_sampler {
     llama_token_data_array cur_p; // current candidates
 
     std::mt19937 rng;
+    uint64_t z6_estrazioni = 0; // campionamenti fatti con rng; segue rng anche nelle copie
     uint32_t speculative_seed = LLAMA_DEFAULT_SEED;
     std::mt19937 speculative_rng;
 

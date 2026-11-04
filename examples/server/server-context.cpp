@@ -3678,6 +3678,24 @@ void server_context::context_shift_prompt(llama_context* ctx, server_slot& slot,
     slot.n_prompt_tokens = slot.prompt_tokens.size();
 }
 
+// IK_Z6_SPEC_REGISTRO=<file>: a ogni richiesta finita accoda lunghezza del prompt e tutti i token
+// della sequenza, per simulare offline le regole delle bozze. Record: magic, n_prompt, n_token,
+// ultimo campionato, poi i token, tutti int32.
+static void z6_registro_scrivi(const server_slot & slot) {
+    static FILE * f = [] {
+        const char * p = getenv("IK_Z6_SPEC_REGISTRO");
+        return p && *p ? fopen(p, "ab") : nullptr;
+    }();
+    if (f == nullptr) {
+        return;
+    }
+    const std::vector<llama_token> & toks = slot.cache_tokens.get_text_tokens();
+    const int32_t testa[4] = { 0x5A365247, slot.n_prompt_tokens, (int32_t) toks.size(), slot.sampled };
+    fwrite(testa, sizeof(testa), 1, f);
+    fwrite(toks.data(), sizeof(llama_token), toks.size(), f);
+    fflush(f);
+}
+
 void server_context::release_slots()
 {
     for (auto& slot : slots) {
@@ -3695,6 +3713,13 @@ void server_context::release_slots()
                 {"n_cache_tokens",  slot.cache_tokens.size()},
                 {"truncated",       slot.truncated}
                 });
+            z6_registro_scrivi(slot);
+            // IK_Z6_SAMPLER_CONTA=1: a temperatura sopra 0 ogni token emesso deve consumare una sola estrazione
+            static const bool z6_conta = [] { const char * e = getenv("IK_Z6_SAMPLER_CONTA"); return e && atoi(e) > 0; }();
+            if (z6_conta && slot.ctx_sampling != nullptr) {
+                LOG_INF("z6 estrazioni: %llu per %d token generati\n",
+                        (unsigned long long) slot.ctx_sampling->z6_estrazioni, slot.n_decoded);
+            }
 
             queue_tasks.notify_slot_changed();
         }
