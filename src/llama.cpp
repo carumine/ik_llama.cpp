@@ -611,6 +611,97 @@ struct llama_context::Prev {
     ggml_cgraph * graph;
 };
 
+// Persistent second slot. Only graph-local state is exchanged: KV, recurrent
+// state and token history remain global and follow the normal token order.
+struct llama_context::Z6Pair {
+    ggml_backend_sched_t sched = nullptr;
+    uint64_t epoch = 0;
+    decltype(llama_context::buf_compute_meta) buf_compute_meta{};
+    decltype(llama_context::prev) prev{};
+    decltype(llama_context::prev_mtp) prev_mtp{};
+    decltype(llama_context::cache_copies) cache_copies{};
+    decltype(llama_context::dsa_cache_copies) dsa_cache_copies{};
+    decltype(llama_context::openpangu_cache_copies) openpangu_cache_copies{};
+    decltype(llama_context::openpangu_cache_copies_mtp) openpangu_cache_copies_mtp{};
+    decltype(llama_context::z6_mask_append) z6_mask_append{};
+    decltype(llama_context::swa_window_view) swa_window_view{};
+    decltype(llama_context::hadamard_memo) hadamard_memo{};
+    decltype(llama_context::inp_tokens) inp_tokens{};
+    decltype(llama_context::inp_engram_rows) inp_engram_rows{};
+    decltype(llama_context::inp_engram_gate_ids) inp_engram_gate_ids{};
+    decltype(llama_context::inp_engram_gate_mask) inp_engram_gate_mask{};
+    decltype(llama_context::inp_embd) inp_embd{};
+    decltype(llama_context::inp_pos) inp_pos{};
+    decltype(llama_context::inp_out_ids) inp_out_ids{};
+    decltype(llama_context::inp_KQ_mask) inp_KQ_mask{};
+    decltype(llama_context::inp_KQ_mask_swa) inp_KQ_mask_swa{};
+    decltype(llama_context::inp_KQ_mask_swa_win) inp_KQ_mask_swa_win{};
+    decltype(llama_context::inp_K_shift) inp_K_shift{};
+    decltype(llama_context::inp_mean) inp_mean{};
+    decltype(llama_context::inp_cls) inp_cls{};
+    decltype(llama_context::inp_s_copy) inp_s_copy{};
+    decltype(llama_context::inp_s_mask) inp_s_mask{};
+    decltype(llama_context::inp_s_seq) inp_s_seq{};
+    decltype(llama_context::inp_s_seq_qnext) inp_s_seq_qnext{};
+    decltype(llama_context::inp_ple_rows) inp_ple_rows{};
+    decltype(llama_context::inp_pos_bucket) inp_pos_bucket{};
+    decltype(llama_context::inp_embd_enc) inp_embd_enc{};
+    decltype(llama_context::inp_KQ_mask_cross) inp_KQ_mask_cross{};
+    decltype(llama_context::inp_scale) inp_scale{};
+    decltype(llama_context::inp_mtp_states) inp_mtp_states{};
+    decltype(llama_context::inp_mtp_carry) inp_mtp_carry{};
+    decltype(llama_context::inp_dsa_sink) inp_dsa_sink{};
+    decltype(llama_context::inp_kpool_cells) inp_kpool_cells{};
+    decltype(llama_context::inp_kpool_bias) inp_kpool_bias{};
+    decltype(llama_context::inp_kpool_tail) inp_kpool_tail{};
+    decltype(llama_context::inp_kpool_ape_slots) inp_kpool_ape_slots{};
+    decltype(llama_context::inp_qsa) inp_qsa{};
+    void exchange(llama_context & ctx) {
+        using std::swap;
+        swap(buf_compute_meta, ctx.buf_compute_meta);
+        swap(prev, ctx.prev);
+        swap(prev_mtp, ctx.prev_mtp);
+        swap(cache_copies, ctx.cache_copies);
+        swap(dsa_cache_copies, ctx.dsa_cache_copies);
+        swap(openpangu_cache_copies, ctx.openpangu_cache_copies);
+        swap(openpangu_cache_copies_mtp, ctx.openpangu_cache_copies_mtp);
+        swap(z6_mask_append, ctx.z6_mask_append);
+        swap(swa_window_view, ctx.swa_window_view);
+        swap(hadamard_memo, ctx.hadamard_memo);
+        swap(inp_tokens, ctx.inp_tokens);
+        swap(inp_engram_rows, ctx.inp_engram_rows);
+        swap(inp_engram_gate_ids, ctx.inp_engram_gate_ids);
+        swap(inp_engram_gate_mask, ctx.inp_engram_gate_mask);
+        swap(inp_embd, ctx.inp_embd);
+        swap(inp_pos, ctx.inp_pos);
+        swap(inp_out_ids, ctx.inp_out_ids);
+        swap(inp_KQ_mask, ctx.inp_KQ_mask);
+        swap(inp_KQ_mask_swa, ctx.inp_KQ_mask_swa);
+        swap(inp_KQ_mask_swa_win, ctx.inp_KQ_mask_swa_win);
+        swap(inp_K_shift, ctx.inp_K_shift);
+        swap(inp_mean, ctx.inp_mean);
+        swap(inp_cls, ctx.inp_cls);
+        swap(inp_s_copy, ctx.inp_s_copy);
+        swap(inp_s_mask, ctx.inp_s_mask);
+        swap(inp_s_seq, ctx.inp_s_seq);
+        swap(inp_s_seq_qnext, ctx.inp_s_seq_qnext);
+        swap(inp_ple_rows, ctx.inp_ple_rows);
+        swap(inp_pos_bucket, ctx.inp_pos_bucket);
+        swap(inp_embd_enc, ctx.inp_embd_enc);
+        swap(inp_KQ_mask_cross, ctx.inp_KQ_mask_cross);
+        swap(inp_scale, ctx.inp_scale);
+        swap(inp_mtp_states, ctx.inp_mtp_states);
+        swap(inp_mtp_carry, ctx.inp_mtp_carry);
+        swap(inp_dsa_sink, ctx.inp_dsa_sink);
+        swap(inp_kpool_cells, ctx.inp_kpool_cells);
+        swap(inp_kpool_bias, ctx.inp_kpool_bias);
+        swap(inp_kpool_tail, ctx.inp_kpool_tail);
+        swap(inp_kpool_ape_slots, ctx.inp_kpool_ape_slots);
+        swap(inp_qsa, ctx.inp_qsa);
+    }
+    ~Z6Pair() { if (sched) ggml_backend_sched_free(sched); }
+};
+
 static inline bool llama_graph_bakes_seq_state(const llm_arch & arch) {
     return llm_arch_is_hybrid(arch) || llm_arch_is_recurrent(arch);
 }
@@ -902,6 +993,7 @@ void llama_context::set_mtp_n_heads(int32_t value) {
 }
 
 llama_context::~llama_context() {
+    z6_pair_slot.reset();
     if (dflash.kv.cache_sched != nullptr) {
         ggml_backend_sched_free(dflash.kv.cache_sched);
     }
@@ -7674,6 +7766,81 @@ static bool prepare_mtp_graph_inputs(
 // return positive int on warning
 // return negative int on error
 //
+// Experimental pair lifetime: graph metadata and compute arenas are disjoint.
+// Inputs are filled in token order before either graph runs. Never retain a
+// caller's batch past decode(), and never publish a half-completed pair.
+struct z6_pair_decode {
+    llama_context & ctx;
+    ggml_backend_sched_t primary;
+    bool second = false;
+    bool enabled = false;
+    bool retain = true;
+    ggml_cgraph * pending = nullptr;
+    ggml_tensor * pending_output = nullptr;
+    int pending_outputs = 0;
+    uint32_t pending_offset = 0;
+    int64_t preparation_us = 0;
+    int64_t slot_us = 0;
+    int built = 0, reused = 0;
+
+    explicit z6_pair_decode(llama_context & c) : ctx(c), primary(c.sched) {
+        const char * reuse = getenv("GGML_Z6_PP_SOVRAPPOSTO_RIUSO");
+        retain = !reuse || atoi(reuse) != 0;
+    }
+    void select(bool slot) {
+        const int64_t start = ggml_time_us();
+        if (!ctx.z6_pair_slot) {
+            GGML_ASSERT(!second);
+            const char * compact = getenv("GGML_Z6_PP_SOVRAPPOSTO_COMPATTO");
+            if (retain && (!compact || atoi(compact) != 0)) {
+                ctx.reset_scheduler();
+                ggml_backend_sched_z6_pair_trim(primary);
+            }
+            ctx.z6_pair_slot = std::make_unique<llama_context::Z6Pair>();
+            auto & state = *ctx.z6_pair_slot;
+            state.sched = ggml_backend_sched_z6_pair_slot(primary, ctx.max_nodes(ctx.cparams.n_ubatch, ctx.cparams.n_ctx));
+            state.buf_compute_meta.resize(ctx.buf_compute_meta.size());
+            state.cache_copies.resize(ctx.cache_copies.size());
+            state.dsa_cache_copies.resize(ctx.dsa_cache_copies.size());
+            state.openpangu_cache_copies.resize(ctx.openpangu_cache_copies.size());
+            state.openpangu_cache_copies_mtp.resize(ctx.openpangu_cache_copies_mtp.size());
+            state.epoch = ctx.kv_self.z6_inputs_epoch;
+        }
+        if (ctx.z6_pair_slot && ctx.z6_pair_slot->epoch != ctx.kv_self.z6_inputs_epoch) {
+            // Restore/shift/sequence edits invalidate BOTH saved graph descriptions.
+            ctx.prev.reset();
+            ctx.z6_pair_slot->prev.reset();
+            ctx.z6_pair_slot->epoch = ctx.kv_self.z6_inputs_epoch;
+        }
+        if (slot != second) {
+            ctx.z6_pair_slot->exchange(ctx);
+            ctx.sched = slot ? ctx.z6_pair_slot->sched : primary;
+            second = slot;
+        }
+        ctx.z6_caldi->pair_slot(slot ? 1 : 0);
+        if (!retain) ctx.prev.reset();
+        slot_us += ggml_time_us() - start;
+    }
+    ~z6_pair_decode() {
+        if (!enabled) return;
+        const int64_t start = ggml_time_us();
+        // Also on error: queued copies may still reference either arena.
+        ggml_backend_sched_synchronize(primary);
+        select(false);
+        // Metadata, allocator and input fixups stay alive for the next decode.
+        // The normal can_reuse_graph() checks still decide whether a graph fits.
+        if (!retain) {
+            ctx.z6_pair_slot.reset();
+            ctx.reset_scheduler();
+        } else if (pending) {
+            ctx.reset_scheduler();
+            if (ctx.z6_pair_slot) ctx.z6_pair_slot->prev.reset();
+        }
+        LLAMA_LOG_INFO("z6 sovrapposto: chiusura decode %.3f ms, slot conservato %d\n",
+                (ggml_time_us()-start)/1000.0, int(retain));
+    }
+};
+
 static int llama_decode_internal(
          llama_context & lctx,
            llama_batch   batch_all) { // TODO: rename back to batch
@@ -7773,7 +7940,43 @@ static int llama_decode_internal(
     }
 
     bool warned_qnext_mixed_repeat = false;
+    z6_pair_decode z6_pair(lctx);
+    const char * z6_pp = getenv("GGML_Z6_PP_SOVRAPPOSTO");
+    if (z6_pp && atoi(z6_pp) == 1 && model.arch == LLM_ARCH_QWEN4EXP &&
+            n_ubatch >= 256 && n_tokens_all >= n_ubatch+256 && batch_all.token &&
+            cparams.mtp_op_type == MTP_OP_NONE && !has_mtp && !cparams.embeddings &&
+            !cparams.cb_eval && !cparams.split_mode_graph_scheduling &&
+            model.split_mode == LLAMA_SPLIT_MODE_LAYER && lctx.z6_caldi && lctx.z6_caldi->parallel() &&
+            n_ubatch <= (uint32_t)lctx.z6_caldi->staging_tokens() &&
+            !kv_self.has_shift && !kv_self.do_defrag && !kv_self.do_copy && !kv_self.any_compacted() &&
+            !kv_self.save_per_step_ssm && kv_self.ckpt.selected_spec_mode == LLAMA_SPEC_CKPT_NONE &&
+            kv_self.head+n_tokens_all <= kv_self.size &&
+            !cparams.prefetch_experts) {
+        bool eligible = true;
+        const auto seq = batch_all.seq_id && batch_all.seq_id[0] && batch_all.n_seq_id && batch_all.n_seq_id[0] == 1
+                ? batch_all.seq_id[0][0] : batch_all.all_seq_id;
+        for (uint32_t i = 0; i < n_tokens_all; ++i) {
+            if (batch_all.seq_id && (!batch_all.n_seq_id || batch_all.n_seq_id[i] != 1 ||
+                    !batch_all.seq_id[i] || batch_all.seq_id[i][0] != seq)) eligible = false;
+            if (batch_all.pos && batch_all.pos[i] != batch_all.pos[0]+(llama_pos)i) eligible = false;
+        }
+        if (!batch_all.pos && batch_all.all_pos_1 != 1) eligible = false;
+        // The first block's output is copied as a whole. Mixed output masks in
+        // that block use the original path; last-only and logits_all are supported.
+        if (batch_all.logits) for (uint32_t i = 0; i+n_ubatch+256 <= n_tokens_all; i += 2*n_ubatch) {
+            uint32_t outputs = 0;
+            for (uint32_t j = 0; j < n_ubatch; ++j) outputs += batch_all.logits[i+j] != 0;
+            if (outputs != 0 && outputs != n_ubatch) eligible = false;
+        }
+        const char * pesanti = getenv("GGML_Z6_PP_PESANTI");
+        const char * prefetch = getenv("GGML_MOE_PREFETCH");
+        if ((pesanti && atoi(pesanti) > 0) || (prefetch && atoi(prefetch) > 0)) eligible = false;
+        z6_pair.enabled = eligible;
+    }
+    if (z6_pp && atoi(z6_pp) == 1 && n_tokens_all >= 256 && !z6_pair.enabled)
+        LLAMA_LOG_INFO("z6 sovrapposto: fallback sequenziale, batch=%u ubatch=%u\n", n_tokens_all, n_ubatch);
     for (uint32_t cur_token = 0; cur_token < n_tokens_all; ) {
+        if (z6_pair.enabled) z6_pair.select(z6_pair.pending != nullptr);
 #if IK_PRINT_TIMING
         auto tim1 = ggml_time_us();
 #endif
@@ -7964,11 +8167,13 @@ static int llama_decode_internal(
 #if IK_PRINT_TIMING
         tim1 = ggml_time_us();
 #endif
+        const int64_t z6_prepare_start = z6_pair.enabled ? ggml_time_us() : 0;
         auto & prev = cparams.mtp_op_type == MTP_OP_NONE ? lctx.prev : lctx.prev_mtp;
         ggml_cgraph * gf = nullptr;
         const uint64_t seq_fingerprint = llama_ubatch_seq_fingerprint(u_batch, lctx.model.arch);
         const uint64_t state_hash      = model_state_hash(lctx);
         if (!lctx.can_reuse_graph(u_batch, seq_fingerprint, state_hash)) {
+            if (z6_pair.enabled) ++z6_pair.built;
             lctx.reset_scheduler();
             ggml_backend_sched_set_eval_callback(lctx.sched, lctx.cparams.cb_eval, lctx.cparams.cb_eval_user_data);
 #if IK_PRINT_TIMING
@@ -7992,7 +8197,8 @@ static int llama_decode_internal(
 #if IK_PRINT_TIMING
             tim1 = ggml_time_us();
 #endif
-            ggml_backend_sched_alloc_graph(lctx.sched, gf);
+            const bool allocated = ggml_backend_sched_alloc_graph(lctx.sched, gf);
+            if (z6_pair.enabled && !allocated) return GGML_STATUS_ALLOC_FAILED;
 #if IK_PRINT_TIMING
             tim2 = ggml_time_us();
             printf("sched_alloc_graph(...): %d us\n", int(tim2-tim1));
@@ -8012,6 +8218,7 @@ static int llama_decode_internal(
         } else {
             //printf("Reusing graph with type = %d, n_kv = %d, n_tokens = %d\n", cparams.mtp_op_type, (int)prev->n_kv, (int)prev->n_tokens);
             gf = prev->graph;
+            if (z6_pair.enabled) ++z6_pair.reused;
         }
 
         if (cparams.mtp_op_type != MTP_OP_NONE) {
@@ -8099,7 +8306,37 @@ static int llama_decode_internal(
         tim1 = ggml_time_us();
 #endif
         //fprintf(stderr, "%s: invoking llama_graph_compute\n", __func__);
-        llama_graph_compute(lctx, gf, n_threads);
+        if (z6_pair.enabled) z6_pair.preparation_us += ggml_time_us() - z6_prepare_start;
+        const bool z6_defer = z6_pair.enabled && !z6_pair.pending && n_tokens_all-cur_token >= n_ubatch+256;
+        if (z6_defer) {
+            z6_pair.pending = gf;
+            z6_pair.pending_output = res;
+            z6_pair.pending_outputs = lctx.n_outputs;
+            z6_pair.pending_offset = n_outputs_prev;
+            res = nullptr; // downloaded after both graphs have actually executed
+        } else if (z6_pair.pending) {
+            ggml_backend_cpu_set_n_threads(lctx.backend_cpu, n_threads);
+            ggml_backend_cpu_set_abort_callback(lctx.backend_cpu, lctx.abort_callback, lctx.abort_callback_data);
+            ggml_backend_cpu_set_moe_expert_prefetch(lctx.backend_cpu, false);
+            LLAMA_LOG_INFO("z6 sovrapposto: preparazione %.3f ms, slot %.3f ms, grafi nuovi %d riusati %d\n",
+                    z6_pair.preparation_us/1000.0, z6_pair.slot_us/1000.0, z6_pair.built, z6_pair.reused);
+            z6_pair.preparation_us = z6_pair.slot_us = 0;
+            z6_pair.built = z6_pair.reused = 0;
+            auto status = ggml_backend_sched_z6_pair_compute(z6_pair.primary, lctx.sched);
+            if (status != GGML_STATUS_SUCCESS) {
+                LLAMA_LOG_ERROR("z6 sovrapposto: coppia fallita (%d), stato da ripristinare\n", (int)status);
+                return status;
+            }
+            if (z6_pair.pending_output && z6_pair.pending_outputs) {
+                auto backend = ggml_backend_sched_get_tensor_backend(z6_pair.primary, z6_pair.pending_output);
+                ggml_backend_tensor_get_async(backend, z6_pair.pending_output,
+                        lctx.logits+(size_t)z6_pair.pending_offset*n_vocab, 0,
+                        (size_t)z6_pair.pending_outputs*n_vocab*sizeof(float));
+            }
+            z6_pair.pending = nullptr;
+        } else {
+            llama_graph_compute(lctx, gf, n_threads);
+        }
 
         if (llm_arch_is_dsv4(lctx.model.arch) &&
             llama_dsv4_per_step_capture_active(lctx, { LLAMA_CHECKPOINT_SPEC, 0 }) &&
@@ -8332,7 +8569,7 @@ static int llama_decode_internal(
             // positions would reset the recurrent state again, so discard the active slot.
             prev.reset();
         }
-        if (stop_internal_decode) {
+        if (stop_internal_decode && !z6_pair.pending) {
             return -3;
         }
     }

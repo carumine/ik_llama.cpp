@@ -780,6 +780,9 @@ struct llama_context {
 
     ggml_backend_t ggml_backend_by_name(const char * name);
 
+    struct Z6Pair;
+    std::unique_ptr<Z6Pair> z6_pair_slot;
+
     struct Prev;
     std::unique_ptr<Prev> prev;
     std::unique_ptr<Prev> prev_mtp;
