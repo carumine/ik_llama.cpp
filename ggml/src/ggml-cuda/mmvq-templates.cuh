@@ -72,7 +72,7 @@ static constexpr __device__ int get_vdr_mmvq(ggml_type type) {
     }
 }
 
-template <ggml_type type, int ncols_y, int nwarps>
+template <ggml_type type, int ncols_y, int nwarps, int rpb_z6 = 0>
 static __device__ void k_mul_mat_vec_q(
     const void * __restrict__ vx, const void * __restrict__ vy,
     const float * bias, float * __restrict__ dst,
@@ -88,12 +88,14 @@ static __device__ void k_mul_mat_vec_q(
     //    ncols_y < 4 ? 1 : 2 : 1;
 
 #if defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__) && (defined(RDNA2) || defined(RDNA3))
-    constexpr int rows_per_cuda_block = 1;
+    constexpr int rows_per_cuda_block_def = 1;
 #elif defined(__CUDA_ARCH__) && !defined(GGML_USE_MUSA)
-    constexpr int rows_per_cuda_block = mmvq_rows_per_cuda_block(type, ncols_y, __CUDA_ARCH__);
+    constexpr int rows_per_cuda_block_def = mmvq_rows_per_cuda_block(type, ncols_y, __CUDA_ARCH__);
 #else
-    constexpr int rows_per_cuda_block = ncols_y < 4 ? 1 : 2;
+    constexpr int rows_per_cuda_block_def = ncols_y < 4 ? 1 : 2;
 #endif // defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__) && !defined(RDNA2) && !defined(RDNA3)
+    // Z6: rpb_z6 > 0 impone le righe per blocco (GGML_Z6_MMVQ_DUE_RIGHE); l'ordine della somma di ogni riga non cambia
+    constexpr int rows_per_cuda_block = rpb_z6 > 0 ? rpb_z6 : rows_per_cuda_block_def;
 
     const     int tid = WARP_SIZE*threadIdx.y + threadIdx.x;
     const     int row0 = rows_per_cuda_block*blockIdx.x;
@@ -158,7 +160,7 @@ static __device__ void k_mul_mat_vec_q(
     }
 }
 
-template <ggml_type type, int ncols_y, int nwarps>
+template <ggml_type type, int ncols_y, int nwarps, int rpb_z6 = 0>
 static __device__ void k_fused_mul_mat_vec_q(
     const void * __restrict__ vup, const void * __restrict__ vgate,
     const float * __restrict__ bias_u, const float * __restrict__ bias_g,
@@ -175,12 +177,14 @@ static __device__ void k_fused_mul_mat_vec_q(
     //    ncols_y < 4 ? 1 : 2 : 1;
 
 #if defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__) && (defined(RDNA2) || defined(RDNA3))
-    constexpr int rows_per_cuda_block = 1;
+    constexpr int rows_per_cuda_block_def = 1;
 #elif defined(__CUDA_ARCH__) && !defined(GGML_USE_MUSA)
-    constexpr int rows_per_cuda_block = mmvq_rows_per_cuda_block(type, ncols_y, __CUDA_ARCH__);
+    constexpr int rows_per_cuda_block_def = mmvq_rows_per_cuda_block(type, ncols_y, __CUDA_ARCH__);
 #else
-    constexpr int rows_per_cuda_block = ncols_y < 4 ? 1 : 2;
+    constexpr int rows_per_cuda_block_def = ncols_y < 4 ? 1 : 2;
 #endif // defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__) && !defined(RDNA2) && !defined(RDNA3)
+    // Z6: rpb_z6 > 0 impone le righe per blocco (GGML_Z6_MMVQ_DUE_RIGHE); l'ordine della somma di ogni riga non cambia
+    constexpr int rows_per_cuda_block = rpb_z6 > 0 ? rpb_z6 : rows_per_cuda_block_def;
 
     const     int tid = WARP_SIZE*threadIdx.y + threadIdx.x;
     const     int row0 = rows_per_cuda_block*blockIdx.x;
@@ -298,7 +302,7 @@ static __device__ void k_fused_mul_mat_vec_q(
     }
 }
 
-template <ggml_type type, int ncols_y, int nwarps>
+template <ggml_type type, int ncols_y, int nwarps, int rpb_z6 = 0>
 #if !(defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__))
 // tell the compiler to use as many registers as it wants, see nwarps definition below
 __launch_bounds__(nwarps*WARP_SIZE, 1)
@@ -331,10 +335,10 @@ static __global__ void mul_mat_vec_q(
     const char * cx = (const char *)vx + i02*nb02;
     const char * cy = (const char *)vy + i2*nb12;
     const float * b = (const float *)(bias ? ids_data ? (const char *)bias + i02*bias_nb1 : bias : nullptr);
-    k_mul_mat_vec_q<type, ncols_y, nwarps>(cx, cy, b, (float *)cdst, ncols_x, nrows_x, nrows_y, nrows_dst);
+    k_mul_mat_vec_q<type, ncols_y, nwarps, rpb_z6>(cx, cy, b, (float *)cdst, ncols_x, nrows_x, nrows_y, nrows_dst);
 }
 
-template <ggml_type type, int ncols_y, int nwarps>
+template <ggml_type type, int ncols_y, int nwarps, int rpb_z6 = 0>
 #if !(defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__))
 // tell the compiler to use as many registers as it wants, see nwarps definition below
 __launch_bounds__(nwarps*WARP_SIZE, 1)
@@ -361,7 +365,7 @@ static __global__ void fused_mul_mat_vec_q(
     const float * cx_u_b = bias_u ? (const float *)((const char *)bias_u + i02*bias_nb1) : nullptr;
     const float * cx_g_b = bias_g ? (const float *)((const char *)bias_g + i02*bias_nb1) : nullptr;
     const char * cy = (const char *)vy + i2*nb12;
-    k_fused_mul_mat_vec_q<type, ncols_y, nwarps>(cx_u, cx_g, cx_u_b, cx_g_b, cy, (float *)cdst, ncols_x, nrows_x, nrows_y, nrows_dst,
+    k_fused_mul_mat_vec_q<type, ncols_y, nwarps, rpb_z6>(cx_u, cx_g, cx_u_b, cx_g_b, cy, (float *)cdst, ncols_x, nrows_x, nrows_y, nrows_dst,
             unary_op, limit);
 }
 
@@ -380,6 +384,16 @@ static void mul_mat_vec_q_cuda_T(const mmvq_args & args, cudaStream_t stream) {
 
     int64_t rows_per_cuda_block = cc < CC_RDNA2 ? mmvq_rows_per_cuda_block(type, args.ncols_y, ggml_cuda_highest_compiled_arch(cc)) : 1;
 #endif
+    // Z6 (GGML_Z6_MMVQ_DUE_RIGHE=1): un token, due righe per blocco anche dove la scelta di sempre ne mette una.
+    // Ogni thread somma gli stessi blocchi di ogni riga nello stesso ordine: risultati identici bit a bit.
+    static const bool z6_due_righe = [] { const char * e = getenv("GGML_Z6_MMVQ_DUE_RIGHE"); return e && atoi(e) > 0; }();
+#ifdef GGML_USE_MUSA
+    const bool z6_due = false;
+#else
+    const bool z6_due = z6_due_righe && args.ncols_y == 1 && rows_per_cuda_block == 1 && args.nrows_x % 2 == 0 &&
+                        cc < CC_OFFSET_AMD && type != GGML_TYPE_Q3_K;
+#endif
+    if (z6_due) rows_per_cuda_block = 2;
 
     const int64_t nblocks = (args.nrows_x + rows_per_cuda_block - 1) / rows_per_cuda_block;
     const dim3 block_nums(nblocks, args.ne2, 1);
@@ -388,6 +402,13 @@ static void mul_mat_vec_q_cuda_T(const mmvq_args & args, cudaStream_t stream) {
     if (args.vx_u && args.vx_g && args.unary_op != GGML_UNARY_OP_COUNT) {
     switch (args.ncols_y) {
         case 1:
+            if (z6_due) {
+                fused_mul_mat_vec_q<type, 1, nwarps, 2><<<block_nums, block_dims, 0, stream>>>(args.vx_u, args.vx_g, args.vy,
+                    args.dst, args.ids_data, args.bias_u, args.bias_g, args.bias_nb1,
+                    args.ncols_x, args.nrows_x, args.nrows_y, args.nrows_dst, args.nb02, args.nb12, args.nb2, args.ids_nb0,
+                    args.unary_op, args.limit);
+                break;
+            }
             fused_mul_mat_vec_q<type, 1, nwarps><<<block_nums, block_dims, 0, stream>>>(args.vx_u, args.vx_g, args.vy,
                     args.dst, args.ids_data, args.bias_u, args.bias_g, args.bias_nb1,
                     args.ncols_x, args.nrows_x, args.nrows_y, args.nrows_dst, args.nb02, args.nb12, args.nb2, args.ids_nb0,
@@ -442,6 +463,11 @@ static void mul_mat_vec_q_cuda_T(const mmvq_args & args, cudaStream_t stream) {
     } else {
     switch (args.ncols_y) {
         case 1:
+            if (z6_due) {
+                mul_mat_vec_q<type, 1, nwarps, 2><<<block_nums, block_dims, 0, stream>>>(args.vx_u, args.vy, args.dst, args.ids_data, args.bias_u,
+                    args.ncols_x, args.nrows_x, args.nrows_y, args.nrows_dst, args.nb02, args.nb12, args.nb2, args.ids_nb0, args.bias_nb1);
+                break;
+            }
             mul_mat_vec_q<type, 1, nwarps><<<block_nums, block_dims, 0, stream>>>(args.vx_u, args.vy, args.dst, args.ids_data, args.bias_u,
                     args.ncols_x, args.nrows_x, args.nrows_y, args.nrows_dst, args.nb02, args.nb12, args.nb2, args.ids_nb0, args.bias_nb1);
             break;
