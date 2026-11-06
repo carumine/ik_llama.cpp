@@ -6014,6 +6014,12 @@ static bool z6_ingressi_incr() {
     static const bool v = [] { const char * e = getenv("GGML_Z6_INGRESSI_INCR"); return e && atoi(e) > 0; }();
     return v;
 }
+// Z6 (IK_Z6_TB_MIN=N): i microbatch sotto N token usano i thread della generazione (-t) invece di -tb, così un -tb
+// più alto (80, con gli hyperthread: GGML_Z6_PP_HT) vale solo per il prefill e non per la verifica delle bozze.
+static int z6_tb_min() {
+    static const int v = [] { const char * e = getenv("IK_Z6_TB_MIN"); return e ? atoi(e) : 0; }();
+    return v;
+}
 static bool z6_ingressi_verifica() {
     static const bool v = [] { const char * e = getenv("GGML_Z6_INGRESSI_VERIFICA"); return e && atoi(e) > 0; }();
     return v;
@@ -6088,7 +6094,9 @@ static void z6_qsa_append(llama_context & ctx, const llama_batch & batch, llama_
             const bool present = !c.is_empty();
             ids[j] = present && valid ? b : 0;
             const auto p = present ? c.pos : -1;
-            bias[j] = p >= tail && p <= pos ? 65504.f : present && valid ? 0.f : -INFINITY;
+            const float v = p >= tail && p <= pos ? 65504.f : present && valid ? 0.f : -INFINITY;
+            if (qsa.bias->type == GGML_TYPE_F16) ((ggml_fp16_t *) qsa.bias->data)[j] = ggml_fp32_to_fp16(v);
+            else bias[j] = v;
         }
     }
     const int b = kv.head/r;
@@ -6378,8 +6386,28 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
 
         // KQ_mask already carries causality, so this holds only the per-block part: -inf for an
         // unpoolable block, a boost for the incomplete block the query sits in
+        // GGML_Z6_QSA_BIAS_F16: the bias holds only 0, -inf and 65504, all exact in f16
+        const bool z6_b16 = qsa.bias->type == GGML_TYPE_F16;
+        const ggml_fp16_t h_zero = ggml_fp32_to_fp16(0.0f), h_boost = ggml_fp32_to_fp16(65504.f),
+                          h_ninf = ggml_fp32_to_fp16(-INFINITY);
         auto fill_bias = [&](int32_t i0, int32_t i1, int32_t j0 = 0, int32_t j1 = -1) {
             if (j1 < 0) j1 = n_kv;
+            if (z6_b16) {
+                for (int32_t i = i0; i < i1; ++i) {
+                    ggml_fp16_t * cur_bias = (ggml_fp16_t *) qsa.bias->data + (size_t) i*n_kv;
+                    if (i >= batch.n_tokens) {
+                        std::fill(cur_bias + j0, cur_bias + j1, h_zero);
+                        continue;
+                    }
+                    const llama_pos q          = batch.pos[i];
+                    const llama_pos tail_start = (q + 1)/r*r;
+                    for (int32_t j = j0; j < j1; ++j) {
+                        const llama_pos p = cell_pos[j];
+                        cur_bias[j] = (p >= tail_start && p <= q) ? h_boost : (blk_of[j] < 0 ? h_ninf : h_zero);
+                    }
+                }
+                return;
+            }
             for (int32_t i = i0; i < i1; ++i) {
                 // n_kv times n_tokens reaches 2^31 at the model's full context, so index wide
                 float * cur_bias = dst_bias + (size_t) i*n_kv;
@@ -7854,7 +7882,7 @@ static int llama_decode_internal(
             lctx.n_outputs = n_outputs_new;
         }
 
-        int n_threads = n_tokens == 1 ? cparams.n_threads : cparams.n_threads_batch;
+        int n_threads = n_tokens == 1 || (int) n_tokens < z6_tb_min() ? cparams.n_threads : cparams.n_threads_batch;
         GGML_ASSERT(n_threads > 0);
 
         // helpers for smoother batch API transition

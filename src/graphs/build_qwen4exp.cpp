@@ -374,7 +374,12 @@ static ggml_tensor * qwen4exp_qsa_mask(
         inp = &lctx.inp_qsa.back();
         inp->ratio      = (int32_t) r;
         inp->cell_blk   = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_kv);
-        inp->bias       = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_kv, n_tokens);
+        // GGML_Z6_QSA_BIAS_F16=1: 0, -inf and 65504 are exact in f16; halves the largest input
+        // (1 GiB at 262K cells and 1024 tokens) and its copy to the GPU at every microbatch
+        static const bool z6_bias_f16 = [] {
+            const char * e = getenv("GGML_Z6_QSA_BIAS_F16"); return e && atoi(e) > 0;
+        }();
+        inp->bias       = ggml_new_tensor_2d(ctx0, z6_bias_f16 ? GGML_TYPE_F16 : GGML_TYPE_F32, n_kv, n_tokens);
         inp->win_blocks = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_win);
         inp->win_cells  = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, r*n_win);
         inp->win_pos    = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, GGML_MROPE_SECTIONS*n_win);
@@ -394,7 +399,14 @@ static ggml_tensor * qwen4exp_qsa_mask(
             }
             ggml_build_forward_expand(gf, t);
         }
-        auto causal = ggml_view_2d(ctx0, KQ_mask, n_kv, n_tokens, KQ_mask->nb[1], 0);
+        // GGML_Z6_MASCHERA_UNICA=1: when the view covers the whole mask, use the mask itself.
+        // The scheduler copies a view as a separate input, so a GPU holding both the attention
+        // and the add got two identical 512 MiB copies at 262K cells (peak of CUDA0, 04/11/2026).
+        static const bool z6_maschera_unica = [] {
+            const char * e = getenv("GGML_Z6_MASCHERA_UNICA"); return e && atoi(e) > 0;
+        }();
+        auto causal = z6_maschera_unica && KQ_mask->ne[0] == n_kv && KQ_mask->ne[1] == n_tokens
+                ? KQ_mask : ggml_view_2d(ctx0, KQ_mask, n_kv, n_tokens, KQ_mask->nb[1], 0);
         auto cut_mask = ggml_add(ctx0, causal, inp->bias);
         cb(cut_mask, "qsa_cut_mask", il);
         inp->cut_mask = cut_mask;
