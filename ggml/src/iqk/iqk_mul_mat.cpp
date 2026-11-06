@@ -977,6 +977,21 @@ extern "C" IQK_API bool iqk_mul_mat_4d(long Nx, long Ny, long ne00,
     return true;
 }
 
+// Z6: GGML_Z6_PP_DEQ=N anticipa da 32 a N token per esperto la conversione in Q8_1 dei pesi Q4_K, Q5_K e
+// Q5_1 degli esperti, cioè il percorso che is_dequant_better sceglie già da 32 token. N vale almeno 10:
+// la generazione e la verifica delle bozze (al massimo 9 token) restano sul percorso di prima.
+static inline ggml_type z6_dequant_moe(ggml_type type, int Ny) {
+    static const int soglia = []() {
+        const char * value = std::getenv("GGML_Z6_PP_DEQ");
+        return value && std::atoi(value) > 0 ? std::max(10, std::atoi(value)) : 0;
+    }();
+    if (soglia && Ny >= soglia && Ny < 32 &&
+        (type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q5_1)) {
+        return GGML_TYPE_Q8_1;
+    }
+    return MulMat::is_dequant_better(type, Ny);
+}
+
 extern "C" IQK_API bool iqk_mul_mat_moe(long Nx, long Ny, long ne00, int ne11,
         int typeA, const void * A, long strideA,
         int typeB, const void * B, long strideB,
@@ -989,7 +1004,7 @@ extern "C" IQK_API bool iqk_mul_mat_moe(long Nx, long Ny, long ne00, int ne11,
     auto etypeA = ggml_type(typeA);
     //auto etypeB = ggml_type(typeB);
     const bool f8_q80 = is_f8_q80(typeA, typeB);
-    auto dequant_type = f8_q80 ? f8_q80_type(Nx, Ny) : MulMat::is_dequant_better(etypeA, Ny);
+    auto dequant_type = f8_q80 ? f8_q80_type(Nx, Ny) : z6_dequant_moe(etypeA, Ny);
     //if (etypeB != GGML_TYPE_F32) {
     //    if (ith == 0) printf("%s: typeA = %s, typeB = %s, dequant_type = %s\n", __func__, ggml_type_name(etypeA), ggml_type_name(etypeB), ggml_type_name(dequant_type));
     //}
@@ -1069,7 +1084,7 @@ extern "C" IQK_API bool iqk_moe_fused_up_gate(long Nx, long Ny, long ne00, int n
 
     auto etypeA = ggml_type(typeA);
     const bool f8_q80 = is_f8_q80(typeA, typeB);
-    if (auto dequant_type = f8_q80 ? f8_q80_type(Nx, Ny) : typeA == GGML_TYPE_F8_E4M3_KS ? etypeA : MulMat::is_dequant_better(etypeA, Ny); dequant_type != etypeA) {
+    if (auto dequant_type = f8_q80 ? f8_q80_type(Nx, Ny) : typeA == GGML_TYPE_F8_E4M3_KS ? etypeA : z6_dequant_moe(etypeA, Ny); dequant_type != etypeA) {
         if (MulMat::prepare(dequant_type, typeB, ne00, mm, Ny)) {
 
             constexpr int k_x_step = 64;
