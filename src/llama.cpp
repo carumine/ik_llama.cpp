@@ -6183,6 +6183,12 @@ static bool z6_ingressi_incr() {
     static const bool v = [] { const char * e = getenv("GGML_Z6_INGRESSI_INCR"); return e && atoi(e) > 0; }();
     return v;
 }
+// Z6 (IK_Z6_TB_MIN=N): i microbatch sotto N token usano i thread della generazione (-t) invece di -tb, così un -tb
+// più alto (80, con gli hyperthread: GGML_Z6_PP_HT) vale solo per il prefill e non per la verifica delle bozze.
+static int z6_tb_min() {
+    static const int v = [] { const char * e = getenv("IK_Z6_TB_MIN"); return e ? atoi(e) : 0; }();
+    return v;
+}
 static bool z6_ingressi_verifica() {
     static const bool v = [] { const char * e = getenv("GGML_Z6_INGRESSI_VERIFICA"); return e && atoi(e) > 0; }();
     return v;
@@ -8120,7 +8126,7 @@ static int llama_decode_internal(
             lctx.n_outputs = n_outputs_new;
         }
 
-        int n_threads = n_tokens == 1 ? cparams.n_threads : cparams.n_threads_batch;
+        int n_threads = n_tokens == 1 || (int) n_tokens < z6_tb_min() ? cparams.n_threads : cparams.n_threads_batch;
         GGML_ASSERT(n_threads > 0);
 
         // helpers for smoother batch API transition
