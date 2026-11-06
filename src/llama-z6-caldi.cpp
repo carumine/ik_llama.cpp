@@ -210,6 +210,9 @@ struct llama_z6_caldi::impl {
     std::unordered_map<const ggml_tensor *, ggml_tensor *> banks;
     std::unique_ptr<void, pinned_deleter> pinned;
     ggml_backend_buffer_ptr host_buffer;
+    std::unique_ptr<void, pinned_deleter> pair_pinned;
+    ggml_backend_buffer_ptr pair_host_buffer;
+    int pair_slot = 0;
     size_t ids_offset = 0, weights_offset = 0, output_offset = 0, packet_size = 0;
     int64_t n_embd = 0, n_used = 0, staging_tokens = 32;
 
@@ -411,14 +414,26 @@ ggml_tensor * llama_z6_caldi::experts(const ggml_tensor * source) const {
 }
 bool llama_z6_caldi::parallel() const { return bool(pimpl->pinned); }
 int64_t llama_z6_caldi::staging_tokens() const { return pimpl->staging_tokens; }
+void llama_z6_caldi::pair_slot(int slot) {
+    GGML_ASSERT(slot == 0 || slot == 1);
+#ifdef GGML_USE_CUDA
+    if (slot == 1 && !pimpl->pair_host_buffer) {
+        pimpl->pair_pinned.reset(ggml_backend_cuda_z6_host_alloc(pimpl->packet_size));
+        if (pimpl->pair_pinned) pimpl->pair_host_buffer.reset(
+                ggml_backend_cpu_buffer_from_ptr(pimpl->pair_pinned.get(), pimpl->packet_size));
+        if (!pimpl->pair_host_buffer) throw std::runtime_error("z6 sovrapposto: secondo staging non disponibile");
+    }
+#endif
+    pimpl->pair_slot = slot;
+}
 void llama_z6_caldi::dopo_token() { if (pimpl->dyn_period) pimpl->dopo_token(); }
 void llama_z6_caldi::staging(ggml_context * ctx, int layer, int64_t nt, ggml_tensor ** x, ggml_tensor ** ids, ggml_tensor ** w) const {
     GGML_ASSERT(parallel() && nt > 0 && nt <= pimpl->staging_tokens);
     auto make = [&](ggml_type type, int64_t a, int64_t b, int64_t c, size_t offset, const char * name) {
         auto t = ggml_new_tensor_3d(ctx, type, a, b, c);
         GGML_ASSERT(offset + ggml_nbytes(t) <= pimpl->packet_size);
-        t->buffer = pimpl->host_buffer.get();
-        t->data = (char *)pimpl->pinned.get() + offset;
+        t->buffer = pimpl->pair_slot ? pimpl->pair_host_buffer.get() : pimpl->host_buffer.get();
+        t->data = (char *)(pimpl->pair_slot ? pimpl->pair_pinned.get() : pimpl->pinned.get()) + offset;
         ggml_format_name(t, "%s-%d", name, layer);
         return t;
     };
@@ -428,6 +443,6 @@ void llama_z6_caldi::staging(ggml_context * ctx, int layer, int64_t nt, ggml_ten
 }
 void llama_z6_caldi::stage_output(ggml_tensor * out) const {
     GGML_ASSERT(parallel() && pimpl->output_offset + ggml_nbytes(out) <= pimpl->packet_size);
-    out->buffer = pimpl->host_buffer.get();
-    out->data = (char *)pimpl->pinned.get() + pimpl->output_offset;
+    out->buffer = pimpl->pair_slot ? pimpl->pair_host_buffer.get() : pimpl->host_buffer.get();
+    out->data = (char *)(pimpl->pair_slot ? pimpl->pair_pinned.get() : pimpl->pinned.get()) + pimpl->output_offset;
 }
