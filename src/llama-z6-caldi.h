@@ -19,6 +19,7 @@ public:
     ggml_tensor * experts(const ggml_tensor * source) const;
     bool parallel() const;
     int64_t staging_tokens() const;
+    void pair_slot(int slot);
     void staging(ggml_context * ctx, int layer, int64_t n_tokens, ggml_tensor ** x, ggml_tensor ** ids, ggml_tensor ** weights) const;
     void stage_output(ggml_tensor * output) const;
     // GGML_Z6_CALDI_DINAMICI=<periodo in token>: da chiamare dopo ogni decode a un token
