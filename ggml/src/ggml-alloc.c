@@ -538,6 +538,16 @@ static void ggml_gallocr_allocate_node(ggml_gallocr_t galloc, struct ggml_tensor
         size_t offset = ggml_dyn_tallocr_alloc(alloc, size, node);
         hn->buffer_id = buffer_id;
         hn->offset = offset;
+        // Z6 (GGML_Z6_ALLOC_DUMP=<MiB>): ogni tensore da almeno <MiB> con buffer, posizione e massimo raggiunto,
+        // per capire che cosa fissa la dimensione dei buffer di calcolo
+        static int z6_dump = -1;
+        if (z6_dump < 0) { const char * e = getenv("GGML_Z6_ALLOC_DUMP"); z6_dump = e ? atoi(e) : 0; }
+        if (z6_dump > 0 && size >= (size_t) z6_dump * 1024 * 1024) {
+            fprintf(stderr, "z6 alloc: %s %s op %s tipo %s ne [%lld %lld %lld %lld] %.1f MiB a %.1f-%.1f MiB, massimo %.1f MiB\n",
+                    ggml_backend_buft_name(buft), node->name, ggml_op_desc(node), ggml_type_name(node->type),
+                    (long long) node->ne[0], (long long) node->ne[1], (long long) node->ne[2], (long long) node->ne[3],
+                    size / 1048576.0, offset / 1048576.0, (offset + size) / 1048576.0, alloc->max_size / 1048576.0);
+        }
         return;
     }
 }

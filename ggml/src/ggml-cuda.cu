@@ -3514,6 +3514,31 @@ static int ggml_cuda_moe_up_gate_unary(ggml_backend_cuda_context & ctx, ggml_ten
     const ggml_tensor * src1 = dst->src[2];
     const ggml_tensor * ids  = dst->src[3];
 
+    // Only the auxiliary heavy-expert graph; disabled unless explicitly requested.
+    static const int z6_debug_env = [] {
+        const char * e = getenv("GGML_Z6_PP_PESANTI_DEBUG");
+        return e ? atoi(e) : 0;
+    }();
+    // 1: il mini-grafo della leva 5; 2: anche i caldi con più di 32 token
+    const bool z6_debug = (z6_debug_env > 0 && strcmp(dst->name, "z6_pesanti_up_gate") == 0) ||
+        (z6_debug_env > 1 && strncmp(dst->name, "z6_caldi_up_gate", 16) == 0 && dst->src[2] && dst->src[2]->ne[2] > 32);
+    auto z6_check = [&](const char * stage) {
+        if (!z6_debug) return;
+        fprintf(stderr, "z6 pesanti debug: device %d, %s\n", ctx.device, stage);
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+    };
+    if (z6_debug) {
+        for (auto t : {src0_1, src0_2, src1, ids, (const ggml_tensor *)dst}) {
+            if (!t) continue;
+            fprintf(stderr, "z6 pesanti debug: %s %s data=%p ne=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu]\n",
+                    t->name, ggml_type_name(t->type), t->data,
+                    (long long)t->ne[0], (long long)t->ne[1], (long long)t->ne[2], (long long)t->ne[3],
+                    t->nb[0], t->nb[1], t->nb[2], t->nb[3]);
+        }
+    }
+    z6_check("ingresso: copie H2D e lavoro precedente");
+
     if (src1->ne[1] == 1 && src1->ne[2] <= 8 && src1->ne[3] == 1 &&
         ggml_is_quantized(src0_1->type) &&
         (!src0_2 || ggml_is_quantized(src0_2->type)) &&
@@ -3691,6 +3716,36 @@ static int ggml_cuda_moe_up_gate_unary(ggml_backend_cuda_context & ctx, ggml_ten
 
         compute_row_ids((const int32_t *)ids->data, ids_src1, ids_dst, expert_bounds,
                 ne02, ne12, n_ids, ne11, nb11, nb12, ids->nb[1], stream);
+        z6_check("dopo compute_row_ids");
+        if (z6_debug) {
+            // rilegge ID, liste compatte e limiti per esperto e ne controlla la coerenza
+            std::vector<int32_t> h_ids(ne12*n_ids), h_dev(2*ne_get_rows + n_as + 1);
+            CUDA_CHECK(cudaMemcpy2DAsync(h_ids.data(), n_ids*sizeof(int32_t), ids->data, ids->nb[1], n_ids*sizeof(int32_t), ne12, cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(cudaMemcpyAsync(h_dev.data(), ids_device.get(), h_dev.size()*sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            const int32_t * h_dst = h_dev.data() + ne_get_rows, * h_b = h_dev.data() + 2*ne_get_rows;
+            std::vector<int> cnt(n_as, 0); int neg = 0, fuori = 0, doppi = 0;
+            for (int64_t t = 0; t < ne12; ++t) for (int64_t k = 0; k < n_ids; ++k) {
+                const int e = h_ids[t*n_ids + k];
+                if (e < 0) { ++neg; continue; }
+                if (e >= n_as) { ++fuori; continue; }
+                ++cnt[e];
+                for (int64_t k2 = 0; k2 < k; ++k2) doppi += h_ids[t*n_ids + k2] == e;
+            }
+            int errori = 0;
+            if (h_b[0] != neg) { ++errori; fprintf(stderr, "z6 pesanti debug: limite[0]=%d, negativi %d\n", h_b[0], neg); }
+            for (int e = 0; e < n_as; ++e) {
+                if (h_b[e+1] - h_b[e] != cnt[e] && errori++ < 8)
+                    fprintf(stderr, "z6 pesanti debug: esperto %d limiti [%d,%d) contro %d colonne\n", e, h_b[e], h_b[e+1], cnt[e]);
+                for (int c = h_b[e]; c < h_b[e+1] && c >= 0 && c < ne_get_rows; ++c) {
+                    const int v = h_dst[c];
+                    if ((v < 0 || v >= ne_get_rows || h_ids[v] != e) && errori++ < 8)
+                        fprintf(stderr, "z6 pesanti debug: esperto %d colonna %d ids_dst=%d\n", e, c, v);
+                }
+            }
+            fprintf(stderr, "z6 pesanti debug: controllo ID %s: %d negativi, %d fuori, %d doppi, %d errori, massimo per esperto %d\n",
+                    dst->name, neg, fuori, doppi, errori, *std::max_element(cnt.begin(), cnt.end()));
+        }
 
         const int64_t ne11_flat = ne12*n_ids;
         const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
@@ -3702,13 +3757,16 @@ static int ggml_cuda_moe_up_gate_unary(ggml_backend_cuda_context & ctx, ggml_ten
         quantize_mmq_q8_1_cuda_id((const float *)src1->data, ids_src1, src1_quantized.get(),
                 src0_1->type, ne10, src1->nb[1] / ts_src1, src1->nb[2] / ts_src1, src1->nb[2] / ts_src1,
                 ne10_padded, ne11_flat, 1, 1, stream);
+        z6_check("dopo quantize_mmq_q8_1_cuda_id");
 
         if (src0_2) {
         ggml_cuda_pool_alloc<char> dst_up_contiguous(ctx.pool(), sizeof(float)*ggml_nelements(dst));
         ggml_cuda_pool_alloc<char> dst_gate_contiguous(ctx.pool(), sizeof(float)*ggml_nelements(dst));
 
         dst_row.data = dst_up_contiguous.get();
+        z6_check("prima MMQ up");
         ggml_cuda_mul_mat_q_id(ctx, src0_1, src1, ids, &dst_row, (char *)ids_device.get(), src1_quantized.get());
+        z6_check("dopo MMQ up");
         if (dst->src[4]) {
             ggml_cuda_add_id((const float *)dst_row.data, (const float *)dst->src[4]->data, (const int32_t *)ids->data,
                     (float *)dst_row.data, dst_row.ne[0], dst_row.ne[1], dst_row.ne[2], dst_row.ne[0], dst_row.ne[1],
@@ -3717,7 +3775,9 @@ static int ggml_cuda_moe_up_gate_unary(ggml_backend_cuda_context & ctx, ggml_ten
         }
 
         dst_row.data = dst_gate_contiguous.get();
+        z6_check("prima MMQ gate");
         ggml_cuda_mul_mat_q_id(ctx, src0_2, src1, ids, &dst_row, (char *)ids_device.get(), src1_quantized.get());
+        z6_check("dopo MMQ gate");
         if (dst->src[5]) {
             ggml_cuda_add_id((const float *)dst_row.data, (const float *)dst->src[5]->data, (const int32_t *)ids->data,
                     (float *)dst_row.data, dst_row.ne[0], dst_row.ne[1], dst_row.ne[2], dst_row.ne[0], dst_row.ne[1],
@@ -3767,12 +3827,48 @@ static int ggml_cuda_moe_up_gate_unary(ggml_backend_cuda_context & ctx, ggml_ten
                         (const float *)dst_up_gate_contiguous.get(), (float *)dst->data, limit);
             }
         }
+        z6_check("dopo attivazione up/gate");
         CUDA_CHECK(cudaGetLastError());
 
         if (next && next->op == GGML_OP_MUL_MAT_ID && ggml_is_quantized(next->src[0]->type) &&
             ggml_cuda_should_use_mmq(next->src[0]->type, ggml_cuda_info().devices[ctx.device].cc, src1->ne[2])) {
             //ggml_cuda_mul_mat_q_id(ctx, next->src[0], dst, ids, next, (char *)ids_device.get(), nullptr);
             ggml_cuda_mul_mat_q_id(ctx, next->src[0], dst, ids, next, nullptr, nullptr);
+            z6_check("dopo MMQ down fuso");
+            // The backend marks only layer 32 when GGML_Z6_PP_PESANTI_DOWN_CHECK is enabled.
+            if (strcmp(next->src[0]->name, "z6_pesanti_down_check") == 0) {
+                const auto weights = next->src[0];
+                std::vector<float> h_par(ggml_nelements(dst)), h_down(ggml_nelements(next));
+                std::vector<int32_t> h_ids(ggml_nelements(ids));
+                CUDA_CHECK(cudaMemcpyAsync(h_par.data(), dst->data, ggml_nbytes(dst), cudaMemcpyDeviceToHost, stream));
+                CUDA_CHECK(cudaMemcpyAsync(h_down.data(), next->data, ggml_nbytes(next), cudaMemcpyDeviceToHost, stream));
+                CUDA_CHECK(cudaMemcpyAsync(h_ids.data(), ids->data, ggml_nbytes(ids), cudaMemcpyDeviceToHost, stream));
+                CUDA_CHECK(cudaStreamSynchronize(stream));
+                const auto traits = ggml_internal_get_type_traits(weights->type);
+                int bad = 0;
+                for (int64_t c = 0; c < (int64_t)h_ids.size(); ++c) {
+                    if (h_ids[c] < 0) continue;
+                    for (int64_t row = 0; row < next->ne[0]; ++row) {
+                        if (std::isfinite(h_down[c*next->ne[0] + row])) continue;
+                        if (++bad > 4 || !traits.to_float) continue;
+                        std::vector<char> packed(weights->nb[1]);
+                        std::vector<float> unpacked(weights->ne[0]);
+                        CUDA_CHECK(cudaMemcpyAsync(packed.data(), (char *)weights->data + h_ids[c]*weights->nb[2] + row*weights->nb[1],
+                            packed.size(), cudaMemcpyDeviceToHost, stream));
+                        CUDA_CHECK(cudaStreamSynchronize(stream));
+                        traits.to_float(packed.data(), unpacked.data(), weights->ne[0]);
+                        float dot = 0; int bad_x = 0, bad_w = 0;
+                        for (int64_t j = 0; j < weights->ne[0]; ++j) {
+                            const float x = h_par[c*weights->ne[0] + j];
+                            bad_x += !std::isfinite(x); bad_w += !std::isfinite(unpacked[j]);
+                            dot += x*unpacked[j];
+                        }
+                        fprintf(stderr, "z6 down check: token %lld slot %d row %lld GPU %g CPU-f32 %g nonfinite-x %d nonfinite-w %d\n",
+                            (long long)(c/n_ids), h_ids[c], (long long)row, h_down[c*next->ne[0]+row], dot, bad_x, bad_w);
+                    }
+                }
+                fprintf(stderr, "z6 down check: nonfinite down %d\n", bad);
+            }
             return i+1;
         }
 

@@ -19171,6 +19171,19 @@ static void z6_place_experts(const struct ggml_tensor * t) {
     if (ggml_z6_numa_place_tensor(t) && n_fatti < 2048) fatti[n_fatti++] = t->data;
 }
 
+// Z6: con GGML_Z6_PP_TEMPI=1, nei batch da più di 32 token, quanti token ha ogni esperto in ogni chiamata
+// iqk degli esperti freddi: chiamate e lavoro (righe × token) per fascia, up/gate (0) e down (1).
+static bool z6_pp_tempi(void);
+static const int z6_pp_fasce[10] = {1, 4, 8, 12, 16, 20, 24, 32, 64, 128};
+static atomic_llong z6_pp_h[2][10][2];
+static inline void z6_pp_conta(int quale, int64_t token_batch, int64_t righe, int64_t token) {
+    if (token_batch <= 32 || token < 1 || !z6_pp_tempi()) return;
+    int f = 9;
+    while (f > 0 && token < z6_pp_fasce[f]) --f;
+    atomic_fetch_add_explicit(&z6_pp_h[quale][f][0], 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&z6_pp_h[quale][f][1], righe * token, memory_order_relaxed);
+}
+
 // Pezzi della coda q (0 o 1) per gli esperti attivi: in att[q] gli indici, restituisce quanti
 static int z6_esperti_attivi(const int64_t * conteggi, int n_as, int q, int * att) {
     int n = 0;
@@ -19248,11 +19261,57 @@ static int z6_cpu_node(int cpu) {
     return cpu >= 0 && cpu < 1024 ? nodi[cpu] : -1;
 }
 
+// Z6 (GGML_Z6_PP_HT=1): con il doppio dei thread della lista delle CPU (-tb 80 con --cpu-range 0-39) ogni socket
+// tiene i suoi: i primi n/2 thread vanno sui core del nodo 0 e poi sui loro fratelli hyperthread, gli altri sul
+// nodo 1 allo stesso modo. Con un altro numero di thread vale la lista com'è.
+static bool z6_pp_ht(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char * e = getenv("GGML_Z6_PP_HT");
+        v = e && atoi(e) > 0;
+    }
+    return v;
+}
+
+static int z6_fratello_ht(int cpu) {
+    static int fratelli[1024];
+    static atomic_int pronto = 0;
+    if (atomic_load_explicit(&pronto, memory_order_acquire) == 0) {
+        for (int c = 0; c < 1024; ++c) {
+            fratelli[c] = c;
+            char path[96];
+            snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/topology/thread_siblings_list", c);
+            FILE * f = fopen(path, "r");
+            if (!f) continue;
+            int a = -1, b = -1;
+            char sep = 0;
+            if (fscanf(f, "%d%c%d", &a, &sep, &b) == 3 && (sep == ',' || sep == '-')) fratelli[c] = a == c ? b : a;
+            fclose(f);
+        }
+        atomic_store_explicit(&pronto, 1, memory_order_release);
+    }
+    return cpu >= 0 && cpu < 1024 ? fratelli[cpu] : cpu;
+}
+
+static bool z6_ht_attivo(const struct ggml_cplan * cplan, int nth) {
+    return z6_pp_ht() && cplan->n_cpu_affinity > 0 && cplan->n_cpu_affinity % 2 == 0 && nth == 2 * cplan->n_cpu_affinity;
+}
+
+static int z6_cpu_del_thread(const struct ggml_cplan * cplan, int ith, int nth) {
+    const int n = cplan->n_cpu_affinity;
+    if (z6_ht_attivo(cplan, nth)) {
+        const int meta = n / 2, j = ith % n;
+        const int cpu = cplan->cpu_affinity[(ith >= n) * meta + j % meta];
+        return j >= meta ? z6_fratello_ht(cpu) : cpu;
+    }
+    return cplan->cpu_affinity[ith % n];
+}
+
 static int z6_locale_valido(const struct ggml_cplan * cplan, int nth) {
     if (!z6_options.rows || !z6_numa_experts() || !z6_options.affinity || nth < 2 || nth % 2) return 0;
-    if (!cplan->cpu_affinity || cplan->n_cpu_affinity < nth) return 0;
+    if (!cplan->cpu_affinity || (cplan->n_cpu_affinity < nth && !z6_ht_attivo(cplan, nth))) return 0;
     for (int i = 0; i < nth; ++i) {
-        if (z6_cpu_node(cplan->cpu_affinity[i]) != (i >= nth / 2)) return 0;
+        if (z6_cpu_node(z6_cpu_del_thread(cplan, i, nth)) != (i >= nth / 2)) return 0;
     }
     return 1;
 }
@@ -19643,6 +19702,7 @@ static void ggml_compute_forward_mul_mat_id(
                     const int k = z6_row_part(att, n_att, lo, hi, c, parti, 16, seg);
                     for (int i = 0; i < k; ++i) {
                         const int cur_a = seg[i].a;
+                        z6_pp_conta(1, ids->ne[1], seg[i].n, matrix_row_counts[cur_a]);
                         if (!iqk_mul_mat_moe(seg[i].n, matrix_row_counts[cur_a], ne00, ne11,
                                     src0->type, (const char *) src0->data + cur_a*nb02 + seg[i].r*nb01, nb01,
                                     vec_dot_type, (const char *)wdata_mm, row_size_mm,
@@ -20117,6 +20177,7 @@ static void ggml_compute_forward_mul_mat_id_up_gate(
                     const int cur_a = seg[i].a, r = seg[i].r;
                     const char * up_b_cur   = up_b   ? (const char *)up_b->data   + cur_a*nb41 + r*sizeof(float) : NULL;
                     const char * gate_b_cur = gate_b ? (const char *)gate_b->data + cur_a*nb51 + r*sizeof(float) : NULL;
+                    z6_pp_conta(0, ids->ne[1], seg[i].n, matrix_row_counts[cur_a]);
                     if (!iqk_moe_fused_up_gate(seg[i].n, matrix_row_counts[cur_a], ne00, ne11, dst->op_params[0],
                                         type, (const char *) src0_1->data + cur_a*nb02 + r*nb01,
                                         (const char *) src0_2->data + cur_a*nb02 + r*nb01, nb01,
@@ -30475,7 +30536,7 @@ static void set_cpu_thread_affinity(const struct ggml_cplan * cplan, int thread_
         return;
     }
 
-    if (thread_n == 0 && cplan->n_threads > cplan->n_cpu_affinity) {
+    if (thread_n == 0 && cplan->n_threads > cplan->n_cpu_affinity && !z6_ht_attivo(cplan, cplan->n_threads)) {
         static bool warned = false;
         if (!warned) {
             warned = true;
@@ -30484,7 +30545,7 @@ static void set_cpu_thread_affinity(const struct ggml_cplan * cplan, int thread_
         }
     }
 
-    const int cpu = cplan->cpu_affinity[thread_n % cplan->n_cpu_affinity];
+    const int cpu = z6_cpu_del_thread(cplan, thread_n, cplan->n_threads);
     if (cpu < 0 || cpu >= CPU_SETSIZE) {
         return;
     }
@@ -31126,6 +31187,23 @@ static void z6_pp_riepilogo(int n_threads) {
         fprintf(stderr, "z6 pp op %s: %.2f ms per grafo, %.1f%%, %.1f nodi\n", ggml_op_name((enum ggml_op) best),
                 z6_pp_op_us[best] / n / 1e3, 100.0 * z6_pp_op_us[best] / tot, z6_pp_op_n[best] / n);
         z6_pp_op_us[best] = 0;
+    }
+    for (int q = 0; q < 2; ++q) {
+        int64_t chiamate = 0, lavoro = 0;
+        for (int f = 0; f < 10; ++f) { chiamate += z6_pp_h[q][f][0]; lavoro += z6_pp_h[q][f][1]; }
+        if (!lavoro) continue;
+        char riga[512];
+        int n_c = 0;
+        for (int f = 0; f < 10; ++f) {
+            const long long c = atomic_exchange_explicit(&z6_pp_h[q][f][0], 0, memory_order_relaxed);
+            const long long w = atomic_exchange_explicit(&z6_pp_h[q][f][1], 0, memory_order_relaxed);
+            if (!c) continue;
+            if (f < 9) n_c += snprintf(riga + n_c, sizeof(riga) - n_c, " %d-%d: %.1f%% (%.1f%%)", z6_pp_fasce[f], z6_pp_fasce[f + 1] - 1, 100.0 * w / lavoro, 100.0 * c / chiamate);
+            else n_c += snprintf(riga + n_c, sizeof(riga) - n_c, " %d+: %.1f%% (%.1f%%)", z6_pp_fasce[f], 100.0 * w / lavoro, 100.0 * c / chiamate);
+            if (n_c >= (int) sizeof(riga)) break;
+        }
+        fprintf(stderr, "z6 pp token per esperto, %s: lavoro (chiamate) per fascia%s; %.0f chiamate per grafo\n",
+                q == 0 ? "up/gate" : "down", riga, chiamate / n);
     }
     memset(z6_pp, 0, sizeof(z6_pp));
     memset(z6_pp_op_us, 0, sizeof(z6_pp_op_us));

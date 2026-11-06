@@ -15,6 +15,8 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include <algorithm>
+#include <initializer_list>
 #include <set>
 #include <array>
 #include <chrono>
@@ -1175,8 +1177,31 @@ struct z6_caldi_ticket {
     ggml_backend_event_t uploaded = nullptr;
     uint64_t epoch = 0;
 };
+// Z6 (GGML_Z6_PP_PESANTI=<token>): nei microbatch da almeno 256 token gli esperti freddi con almeno <token> token
+// vanno sulla GPU GGML_Z6_PP_PESANTI_GPU (1), che nella fase degli esperti freddi altrimenti aspetta la CPU. I loro
+// pesi arrivano dalla memoria pinned in un banco di GGML_Z6_PP_PESANTI_MAX posti (64), con gli stessi kernel dei
+// caldi; la CPU li trova esclusi dai suoi ID e, finiti gli altri, aggiunge la somma della GPU alla propria.
+struct z6_pesanti_stato {
+    ggml_backend_t backend = nullptr;
+    ggml_backend_buffer_t banco = nullptr, ingressi = nullptr;
+    ggml_gallocr_t galloc = nullptr;
+    ggml_context * ctx = nullptr;
+    // memoria fissa del contesto: i nodi tornano agli stessi indirizzi, e la cache dei CUDA graph (chiave: il
+    // primo nodo) tiene una sola voce invece di riempirsi e scacciare quelle della generazione
+    std::vector<uint8_t> ctx_mem;
+    void * ids_host = nullptr, * somma_host = nullptr;
+    size_t ids_size = 0, somma_size = 0, somma_bytes = 0;
+    ggml_backend_event_t fatto = nullptr;
+    const ggml_tensor * cold_end = nullptr; // la somma della CPU che aspetta quella della GPU
+    const int32_t * ids_cpu = nullptr; int64_t ids_n = 0, ids_neg = 0; std::vector<int> scelti; int64_t n_used = 0, ne0 = 0; // diagnostica: gli ID della CPU restano quelli scritti?
+    bool spento = false;
+    int64_t gruppi = 0, esperti = 0, coppie = 0, coppie_tot = 0, attesa_us = 0, lancio_us = 0;
+    ~z6_pesanti_stato();
+};
+
 struct z6_caldi_plan {
     std::vector<ggml_z6_caldi_group> groups;
+    z6_pesanti_stato pesanti;
     std::unordered_map<const ggml_tensor *, size_t> hot_begins;
     std::unordered_map<const ggml_tensor *, size_t> hot_ends;
     std::unordered_map<const ggml_tensor *, size_t> cold_begins;
@@ -2101,6 +2126,299 @@ static bool z6_h2d_async() {
     return v;
 }
 
+z6_pesanti_stato::~z6_pesanti_stato() {
+    if (ctx) ggml_free(ctx);
+    if (galloc) ggml_gallocr_free(galloc);
+    if (banco) ggml_backend_buffer_free(banco);
+    if (ingressi) ggml_backend_buffer_free(ingressi);
+#ifdef GGML_USE_CUDA
+    if (ids_host) ggml_backend_cuda_z6_host_free(ids_host);
+    if (somma_host) ggml_backend_cuda_z6_host_free(somma_host);
+#endif
+    if (fatto) ggml_backend_event_free(fatto);
+}
+
+struct z6_pesanti_cfg { int soglia = 0, posti = 64, gpu = 1, min_batch = 256; };
+static const z6_pesanti_cfg & z6_pesanti_config() {
+    static const z6_pesanti_cfg c = [] {
+        z6_pesanti_cfg c;
+        if (const char * e = getenv("GGML_Z6_PP_PESANTI")) c.soglia = atoi(e);
+        // almeno 32 posti: con 1024 token CUDA resta sul percorso MMQ-ID, senza sincronizzazioni con la CPU
+        if (const char * e = getenv("GGML_Z6_PP_PESANTI_MAX")) c.posti = std::max(32, atoi(e));
+        if (const char * e = getenv("GGML_Z6_PP_PESANTI_GPU")) c.gpu = atoi(e);
+        return c;
+    }();
+    return c;
+}
+
+#ifdef GGML_USE_CUDA
+// ids sono pronti in memoria host: sceglie gli esperti pesanti, li toglie dagli ID della CPU e accoda sulla GPU
+// copie, calcolo e ritorno della somma, tutto asincrono, prima che la CPU parta con gli altri.
+static void z6_pesanti_lancia(ggml_backend_sched_t sched, size_t index) {
+    const auto & cfg = z6_pesanti_config();
+    auto & p = *sched->z6_plan;
+    auto & s = p.pesanti;
+    s.cold_end = nullptr;
+    if (cfg.soglia <= 0 || s.spento) return;
+    const auto & g = p.groups[index];
+    ggml_tensor * par_cpu = g.cold_begin, * end_cpu = g.cold_end;
+    ggml_tensor * x_h = g.host_inputs[0], * ids_h = g.host_inputs[1], * w_h = g.host_inputs[2];
+    if (!par_cpu || !end_cpu || !x_h || !ids_h || !w_h) return;
+    if (par_cpu->op != GGML_OP_MOE_FUSED_UP_GATE || !par_cpu->src[1] || end_cpu->op != GGML_OP_MUL_MULTI_ADD || !end_cpu->src[4]) return;
+    ggml_tensor * down_cpu = end_cpu->src[0];
+    if (!down_cpu || down_cpu->op != GGML_OP_MUL_MAT_ID || down_cpu->src[1] != par_cpu) return;
+    if (ids_h->type != GGML_TYPE_I32 || !ggml_is_contiguous(ids_h) || x_h->type != GGML_TYPE_F32 ||
+        end_cpu->type != GGML_TYPE_F32 || !ggml_is_contiguous(end_cpu) || !end_cpu->data) return;
+    const int64_t n_used = ids_h->ne[0], n_tok = ids_h->ne[1];
+    if (n_tok < cfg.min_batch) return;
+    ggml_tensor * up = par_cpu->src[0], * gate = par_cpu->src[1], * down = down_cpu->src[0];
+    const int n_as = (int) up->ne[2];
+    if (gate->ne[2] != n_as || down->ne[2] != n_as || !up->data || !gate->data || !down->data) return;
+
+    const int64_t t0 = ggml_time_us();
+    int32_t * ids = (int32_t *) ids_h->data;
+    std::vector<int> cnt(n_as, 0);
+    int64_t coppie = 0;
+    for (int64_t i = 0; i < n_used*n_tok; ++i) {
+        const int e = ids[i];
+        if (e >= 0 && e < n_as) { cnt[e]++; coppie++; }
+    }
+    std::vector<int> scelti;
+    for (int e = 0; e < n_as; ++e) if (cnt[e] >= cfg.soglia) scelti.push_back(e);
+    s.coppie_tot += coppie;
+    if (scelti.empty()) return;
+    std::sort(scelti.begin(), scelti.end(), [&](int a, int b) { return cnt[a] > cnt[b]; });
+    if ((int) scelti.size() > cfg.posti) scelti.resize(cfg.posti);
+
+    if (!s.backend) {
+        char nome[16];
+        snprintf(nome, sizeof(nome), "CUDA%d", cfg.gpu);
+        for (int b = 0; b < sched->n_backends; ++b) {
+            if (ggml_backend_is_cuda(sched->backends[b]) && strcmp(ggml_backend_name(sched->backends[b]), nome) == 0) s.backend = sched->backends[b];
+        }
+        if (!s.backend) { fprintf(stderr, "z6 pesanti: %s non trovata, spento\n", nome); s.spento = true; return; }
+        s.fatto = ggml_backend_cuda_z6_event_new(s.backend);
+        s.galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(s.backend));
+    }
+    const int K = cfg.posti;
+    auto buft = ggml_backend_get_default_buffer_type(s.backend);
+    const size_t al = ggml_backend_buft_get_alignment(buft);
+
+    if (s.ctx) ggml_free(s.ctx);
+    s.ctx_mem.resize(ggml_tensor_overhead()*16 + ggml_graph_overhead_custom(16, false));
+    ggml_init_params ip = { s.ctx_mem.size(), s.ctx_mem.data(), true };
+    s.ctx = ggml_init(ip);
+    ggml_tensor * b_up   = ggml_new_tensor_3d(s.ctx, up->type,   up->ne[0],   up->ne[1],   K);
+    ggml_tensor * b_gate = ggml_new_tensor_3d(s.ctx, gate->type, gate->ne[0], gate->ne[1], K);
+    ggml_tensor * b_down = ggml_new_tensor_3d(s.ctx, down->type, down->ne[0], down->ne[1], K);
+    ggml_tensor * x   = ggml_new_tensor(s.ctx, GGML_TYPE_F32, GGML_MAX_DIMS, x_h->ne);
+    ggml_tensor * hid = ggml_new_tensor_2d(s.ctx, GGML_TYPE_I32, n_used, n_tok);
+    ggml_tensor * w   = ggml_new_tensor(s.ctx, w_h->type, GGML_MAX_DIMS, w_h->ne);
+    // la dimensione allocata, non ggml_nbytes: sulla GPU le righe quantizzate hanno un riempimento in coda
+    auto spazio = [&](std::initializer_list<ggml_tensor *> ts) {
+        size_t n = al;
+        for (auto t : ts) n += GGML_PAD(ggml_backend_buft_get_alloc_size(buft, t), al);
+        return n;
+    };
+    const size_t banco_size = spazio({b_up, b_gate, b_down}), ingressi_size = spazio({x, hid, w});
+    // Initialize new buffers; reused, unselected slots may still contain a different layer/type.
+    if (!s.banco || ggml_backend_buffer_get_size(s.banco) < banco_size) {
+        if (s.banco) ggml_backend_buffer_free(s.banco);
+        s.banco = ggml_backend_buft_alloc_buffer(buft, banco_size);
+        if (s.banco) ggml_backend_buffer_clear(s.banco, 0);
+    }
+    if (!s.ingressi || ggml_backend_buffer_get_size(s.ingressi) < ingressi_size) {
+        if (s.ingressi) ggml_backend_buffer_free(s.ingressi);
+        s.ingressi = ggml_backend_buft_alloc_buffer(buft, ingressi_size);
+        if (s.ingressi) ggml_backend_buffer_clear(s.ingressi, 0);
+    }
+    if (!s.banco || !s.ingressi) { fprintf(stderr, "z6 pesanti: VRAM insufficiente, spento\n"); s.spento = true; return; }
+    if (s.ids_size < n_used*n_tok*sizeof(int32_t)) {
+        if (s.ids_host) ggml_backend_cuda_z6_host_free(s.ids_host);
+        s.ids_size = n_used*n_tok*sizeof(int32_t);
+        s.ids_host = ggml_backend_cuda_z6_host_alloc(s.ids_size);
+    }
+    if (s.somma_size < ggml_nbytes(end_cpu)) {
+        if (s.somma_host) ggml_backend_cuda_z6_host_free(s.somma_host);
+        s.somma_size = ggml_nbytes(end_cpu);
+        s.somma_host = ggml_backend_cuda_z6_host_alloc(s.somma_size);
+    }
+    size_t off = 0;
+    auto metti = [&](ggml_backend_buffer_t buf, ggml_tensor * t) {
+        off = GGML_PAD(off, al);
+        ggml_backend_tensor_alloc(buf, t, (char *) ggml_backend_buffer_get_base(buf) + off);
+        off += ggml_backend_buft_get_alloc_size(buft, t);
+    };
+    metti(s.banco, b_up); metti(s.banco, b_gate); metti(s.banco, b_down);
+    off = 0;
+    metti(s.ingressi, x); metti(s.ingressi, hid); metti(s.ingressi, w);
+    ggml_tensor * par = ggml_moe_up_gate(s.ctx, b_up, b_gate, x, hid, GGML_UNARY_OP_SILU);
+    memcpy(par->op_params, par_cpu->op_params, sizeof(par->op_params));
+    ggml_tensor * dn  = ggml_mul_mat_id(s.ctx, b_down, par, hid);
+    ggml_tensor * sum = ggml_mul_multi_add_id(s.ctx, dn, w, hid);
+    ggml_set_name(par, "z6_pesanti_up_gate");
+    ggml_set_name(dn,  "z6_pesanti_down");
+    ggml_set_name(sum, "z6_pesanti_somma");
+    if (ggml_nbytes(sum) != ggml_nbytes(end_cpu)) { fprintf(stderr, "z6 pesanti: forme diverse, spento\n"); s.spento = true; return; }
+    ggml_cgraph * gf = ggml_new_graph_custom(s.ctx, 16, false);
+    ggml_build_forward_expand(gf, sum);
+    if (!ggml_gallocr_alloc_graph(s.galloc, gf)) { fprintf(stderr, "z6 pesanti: allocazione fallita, spento\n"); s.spento = true; return; }
+
+    static const bool z6_debug = [] { const char * e = getenv("GGML_Z6_PP_PESANTI_DEBUG"); return e && atoi(e) > 0; }();
+    if (z6_debug) {
+        auto prod = ggml_backend_sched_get_tensor_backend(sched, g.device_inputs[0]);
+        fprintf(stderr, "z6 pesanti debug: livello %d, livello su %s, banco su %s, %zu esperti, %lld coppie\n", g.layer,
+                prod ? ggml_backend_name(prod) : "?", ggml_backend_name(s.backend), scelti.size(), (long long) coppie);
+    }
+    // da qui in poi la CPU non calcola più gli esperti scelti
+    std::vector<int> posto(n_as, -1);
+    for (size_t k = 0; k < scelti.size(); ++k) posto[scelti[k]] = (int) k;
+    int32_t * hid_h = (int32_t *) s.ids_host;
+    int64_t spostate = 0;
+    // Gli ID freddi possono ripetere un esperto nello stesso token (dal livello 33 con i caldi dinamici, misurato il
+    // 05/11/2026). La lista compatta di MMQ-ID vuole esperti unici per token: con un doppione lascia indici senza
+    // senso e la scrittura del risultato esce dalla memoria. Va sulla GPU solo la prima occorrenza, le altre restano
+    // alla CPU, che le calcola come oggi.
+    for (int64_t t = 0; t < n_tok; ++t) {
+        for (int64_t k = 0; k < n_used; ++k) {
+            const int64_t i = t*n_used + k;
+            const int e = ids[i];
+            bool gia = false;
+            if (e >= 0 && e < n_as && posto[e] >= 0) {
+                for (int64_t k2 = 0; k2 < k && !gia; ++k2) gia = hid_h[t*n_used + k2] == posto[e];
+            }
+            if (e >= 0 && e < n_as && posto[e] >= 0 && !gia) { hid_h[i] = posto[e]; ids[i] = -1; ++spostate; }
+            else hid_h[i] = -1;
+        }
+    }
+    // Timing diagnostic only, WRONG results: skip the weight copies. The bank stays zeroed
+    // (cleared at allocation), so the heavy experts contribute 0 and nothing turns NaN.
+    static const bool z6_senza_pesi = [] {
+        const char * e = getenv("GGML_Z6_PP_PESANTI_SENZA_PESI"); return e && atoi(e) > 0;
+    }();
+    if (!z6_senza_pesi) for (size_t k = 0; k < scelti.size(); ++k) {
+        const int64_t e = scelti[k];
+        ggml_backend_tensor_set_async(s.backend, b_up,  (const char *) up->data   + e*up->nb[2],   k*b_up->nb[2],   up->nb[2]);
+        ggml_backend_tensor_set_async(s.backend, b_gate, (const char *) gate->data + e*gate->nb[2], k*b_gate->nb[2], gate->nb[2]);
+        ggml_backend_tensor_set_async(s.backend, b_down, (const char *) down->data + e*down->nb[2], k*b_down->nb[2], down->nb[2]);
+    }
+    // MMQ can read past the last row into the first unused slot. Its old bytes can belong
+    // to another quantization type, so even a zero activation can produce 0 * NaN.
+    // Refresh only the read-ahead padding after the selected prefix, on the backend stream.
+    // The padding after the full tensor (all K slots selected) is handled by init_tensor.
+    static const bool z6_pad = [] {
+        const char * e = getenv("GGML_Z6_PP_PESANTI_PAD"); return e && atoi(e) > 0;
+    }();
+    if (z6_pad && scelti.size() < (size_t)K) {
+        static const char zeros[4096] = {};
+        for (auto t : {b_up, b_gate, b_down}) {
+            const size_t end = scelti.size()*t->nb[2];
+            const size_t padding = std::min(ggml_backend_buft_get_alloc_size(buft, t) - ggml_nbytes(t), ggml_nbytes(t) - end);
+            GGML_ASSERT(padding <= sizeof(zeros));
+            if (padding) ggml_backend_tensor_set_async(s.backend, t, zeros, end, padding);
+        }
+    }
+    // Opt-in forensic check: compare the bank with the host and decode the MMQ overread.
+    static const bool z6_down_check = [] {
+        const char * e = getenv("GGML_Z6_PP_PESANTI_DOWN_CHECK"); return e && atoi(e) > 0;
+    }();
+    if (z6_down_check && g.layer == 32) {
+        ggml_set_name(b_down, "z6_pesanti_down_check");
+        std::vector<char> bank(ggml_nbytes(b_down));
+        ggml_backend_tensor_get_async(s.backend, b_down, bank.data(), 0, bank.size());
+        ggml_backend_synchronize(s.backend);
+        const auto traits = ggml_internal_get_type_traits(down->type);
+        fprintf(stderr, "z6 down check: type %s ne %lld %lld %lld host nb %zu %zu %zu bank nb %zu %zu %zu\n",
+                ggml_type_name(down->type), (long long)down->ne[0], (long long)down->ne[1], (long long)down->ne[2],
+                down->nb[0], down->nb[1], down->nb[2], b_down->nb[0], b_down->nb[1], b_down->nb[2]);
+        for (size_t k = 0; k < scelti.size(); ++k) {
+            const bool equal = down->nb[2] == b_down->nb[2] &&
+                memcmp(bank.data() + k*b_down->nb[2], (const char *)down->data + scelti[k]*down->nb[2], down->nb[2]) == 0;
+            fprintf(stderr, "z6 down check: slot %zu expert %d equal %d", k, scelti[k], equal);
+            const int64_t tail = GGML_PAD(down->ne[0], 256) - down->ne[0];
+            if (traits.to_float && tail && k+1 < (size_t)K && tail % ggml_blck_size(down->type) == 0) {
+                std::vector<float> values(tail);
+                traits.to_float(bank.data() + (k+1)*b_down->nb[2], values.data(), tail);
+                int nonfinite = 0;
+                for (float v : values) nonfinite += !std::isfinite(v);
+                fprintf(stderr, " tail %lld nonfinite %d", (long long)tail, nonfinite);
+            }
+            fprintf(stderr, "\n");
+        }
+    }
+    ggml_backend_tensor_set_async(s.backend, x, x_h->data, 0, ggml_nbytes(x));
+    ggml_backend_tensor_set_async(s.backend, hid, hid_h, 0, ggml_nbytes(hid));
+    ggml_backend_tensor_set_async(s.backend, w, w_h->data, 0, ggml_nbytes(w));
+    ggml_backend_graph_compute_async(s.backend, gf);
+    ggml_backend_tensor_get_async(s.backend, sum, s.somma_host, 0, ggml_nbytes(sum));
+    ggml_backend_cuda_z6_event_record(s.fatto);
+    s.cold_end = end_cpu;
+    s.somma_bytes = ggml_nbytes(sum);
+    if (z6_debug) {
+        s.ids_cpu = ids; s.ids_n = n_used*n_tok; s.ids_neg = 0; s.scelti = scelti; s.n_used = n_used; s.ne0 = end_cpu->ne[0];
+        for (int64_t i = 0; i < s.ids_n; ++i) s.ids_neg += ids[i] < 0;
+    }
+    s.gruppi++; s.esperti += (int64_t) scelti.size(); s.coppie += spostate;
+    s.lancio_us += ggml_time_us() - t0;
+}
+
+// Dopo lo split CPU che contiene la somma dei freddi: aspetta la GPU e aggiunge la sua somma, prima che lo split
+// GPU dell'unione la copi.
+static void z6_pesanti_somma(ggml_backend_sched_t sched, const ggml_backend_sched_split * split) {
+    auto & s = sched->z6_plan->pesanti;
+    if (!s.cold_end) return;
+    bool qui = false;
+    for (int n = 0; n < split->graph.n_nodes && !qui; ++n) qui = split->graph.nodes[n] == s.cold_end;
+    if (!qui) return;
+    if (s.ids_cpu) {
+        int64_t neg = 0;
+        for (int64_t i = 0; i < s.ids_n; ++i) neg += s.ids_cpu[i] < 0;
+        fprintf(stderr, "z6 pesanti debug: ID della CPU negativi al lancio %lld, dopo lo split CPU %lld\n", (long long) s.ids_neg, (long long) neg);
+        s.ids_cpu = nullptr;
+    }
+    const int64_t t0 = ggml_time_us();
+    ggml_backend_event_synchronize(s.fatto);
+    s.attesa_us += ggml_time_us() - t0;
+    float * dst = (float *) s.cold_end->data;
+    const float * src = (const float *) s.somma_host;
+    const int64_t n = (int64_t) (s.somma_bytes / sizeof(float));
+    static const bool z6_debug = [] { const char * e = getenv("GGML_Z6_PP_PESANTI_DEBUG"); return e && atoi(e) > 0; }();
+    if (z6_debug) {
+        int64_t nan_g = 0, nan_c = 0; float max_g = 0, max_c = 0; double s_g = 0, s_c = 0;
+        for (int64_t i = 0; i < n; ++i) {
+            const float g = src[i], c = dst[i];
+            if (!std::isfinite(g)) ++nan_g; else { max_g = std::max(max_g, std::fabs(g)); s_g += (double) g*g; }
+            if (!std::isfinite(c)) ++nan_c; else { max_c = std::max(max_c, std::fabs(c)); s_c += (double) c*c; }
+        }
+        if (nan_g > 0 && nan_c == 0) {
+            const int32_t * hid = (const int32_t *) s.ids_host;
+            int64_t stampati = 0;
+            for (int64_t i = 0; i < n && stampati < 4; ++i) {
+                if (std::isfinite(src[i])) continue;
+                const int64_t t = i / s.ne0;
+                fprintf(stderr, "z6 pesanti debug: NaN a token %lld dim %lld; posti del token:", (long long) t, (long long) (i % s.ne0));
+                for (int64_t k = 0; k < s.n_used; ++k) { const int h = hid[t*s.n_used + k]; if (h >= 0) fprintf(stderr, " %d(esperto %d)", h, s.scelti[h]); }
+                fprintf(stderr, "\n");
+                ++stampati;
+                i = (t + 1)*s.ne0 - 1; // un token alla volta
+            }
+        }
+        fprintf(stderr, "z6 pesanti debug: somme GPU nan %lld max %.3g rms %.3g, CPU nan %lld max %.3g rms %.3g\n",
+                (long long) nan_g, max_g, std::sqrt(s_g/n), (long long) nan_c, max_c, std::sqrt(s_c/n));
+    }
+#ifdef _OPENMP
+    #pragma omp parallel for num_threads(20) schedule(static)
+#endif
+    for (int64_t i = 0; i < n; ++i) dst[i] += src[i];
+    s.cold_end = nullptr;
+    if (s.gruppi % 480 == 0) {
+        fprintf(stderr, "z6 pesanti: %lld gruppi, %.1f esperti e %.1f%% delle coppie token-esperto freddi sulla GPU; "
+                "lancio %.2f ms, attesa della GPU %.2f ms per gruppo\n", (long long) s.gruppi, (double) s.esperti / s.gruppi,
+                100.0 * s.coppie / std::max<int64_t>(1, s.coppie_tot), s.lancio_us / 1e3 / s.gruppi, s.attesa_us / 1e3 / s.gruppi);
+    }
+}
+#endif
+
 // Called before launching the hot split: copies are in each producer's stream,
 // and completion events are recorded BEFORE any hot work is queued.
 static void z6_caldi_prepare(ggml_backend_sched_t sched, size_t index) {
@@ -2711,6 +3029,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             "z6 parallelo: %lld gruppi, CPU avviata con caldi ancora in corso %lld (%.2f%%)\n",
                             (long long)p.samples, (long long)p.overlapping, 100.0*p.overlapping/p.samples);
                 }
+                z6_pesanti_lancia(sched, z6_cold);
 #endif
             }
         }
@@ -2762,6 +3081,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             return ec;
         }
 #ifdef GGML_USE_CUDA
+        if (sched->z6_plan && ggml_backend_is_cpu(split_backend)) z6_pesanti_somma(sched, split);
         if (sched->z6_plan && ggml_backend_is_cuda(split_backend)) {
             for (int n = 0; n < split->graph.n_nodes; ++n) {
                 auto it = sched->z6_plan->hot_ends.find(split->graph.nodes[n]);
