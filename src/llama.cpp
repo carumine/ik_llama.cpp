@@ -7781,6 +7781,7 @@ struct z6_pair_decode {
     uint32_t pending_offset = 0;
     int64_t preparation_us = 0;
     int64_t slot_us = 0;
+    int64_t reset_us = 0, build_us = 0, alloc_us = 0, inputs_us = 0;
     int built = 0, reused = 0;
 
     explicit z6_pair_decode(llama_context & c) : ctx(c), primary(c.sched) {
@@ -7942,7 +7943,21 @@ static int llama_decode_internal(
     bool warned_qnext_mixed_repeat = false;
     z6_pair_decode z6_pair(lctx);
     const char * z6_pp = getenv("GGML_Z6_PP_SOVRAPPOSTO");
-    if (z6_pp && atoi(z6_pp) == 1 && model.arch == LLM_ARCH_QWEN4EXP &&
+    // Optional operational limit: above it, release the second arena and use
+    // the original schedule, without changing context capacity or microbatch.
+    uint64_t z6_max_kv = 0;
+    if (z6_pp && atoi(z6_pp) == 1) {
+        if (const char * limit = getenv("GGML_Z6_PP_SOVRAPPOSTO_MAX_KV"))
+            z6_max_kv = strtoull(limit, nullptr, 10);
+    }
+    const bool z6_memory_fallback = z6_max_kv &&
+            std::max<uint64_t>(kv_self.n, uint64_t(kv_self.head)+n_tokens_all) > z6_max_kv;
+    if (z6_memory_fallback && n_tokens_all >= 256 && lctx.z6_pair_slot) {
+        ggml_backend_sched_synchronize(lctx.sched);
+        lctx.z6_pair_slot.reset();
+        LLAMA_LOG_INFO("z6 sovrapposto: secondo slot liberato, limite KV %llu\n", (unsigned long long)z6_max_kv);
+    }
+    if (z6_pp && atoi(z6_pp) == 1 && !z6_memory_fallback && model.arch == LLM_ARCH_QWEN4EXP &&
             n_ubatch >= 256 && n_tokens_all >= n_ubatch+256 && batch_all.token &&
             cparams.mtp_op_type == MTP_OP_NONE && !has_mtp && !cparams.embeddings &&
             !cparams.cb_eval && !cparams.split_mode_graph_scheduling &&
@@ -8174,7 +8189,9 @@ static int llama_decode_internal(
         const uint64_t state_hash      = model_state_hash(lctx);
         if (!lctx.can_reuse_graph(u_batch, seq_fingerprint, state_hash)) {
             if (z6_pair.enabled) ++z6_pair.built;
+            const int64_t z6_reset_start = z6_pair.enabled ? ggml_time_us() : 0;
             lctx.reset_scheduler();
+            if (z6_pair.enabled) z6_pair.reset_us += ggml_time_us()-z6_reset_start;
             ggml_backend_sched_set_eval_callback(lctx.sched, lctx.cparams.cb_eval, lctx.cparams.cb_eval_user_data);
 #if IK_PRINT_TIMING
             tim2 = ggml_time_us();
@@ -8185,7 +8202,9 @@ static int llama_decode_internal(
             tim1 = ggml_time_us();
 #endif
 
+            const int64_t z6_build_start = z6_pair.enabled ? ggml_time_us() : 0;
             gf = llm_build_context::llama_build_graph(lctx, u_batch, false);
+            if (z6_pair.enabled) z6_pair.build_us += ggml_time_us()-z6_build_start;
             if (gf == nullptr) {
                 return GGML_STATUS_FAILED;
             }
@@ -8197,7 +8216,9 @@ static int llama_decode_internal(
 #if IK_PRINT_TIMING
             tim1 = ggml_time_us();
 #endif
+            const int64_t z6_alloc_start = z6_pair.enabled ? ggml_time_us() : 0;
             const bool allocated = ggml_backend_sched_alloc_graph(lctx.sched, gf);
+            if (z6_pair.enabled) z6_pair.alloc_us += ggml_time_us()-z6_alloc_start;
             if (z6_pair.enabled && !allocated) return GGML_STATUS_ALLOC_FAILED;
 #if IK_PRINT_TIMING
             tim2 = ggml_time_us();
@@ -8297,7 +8318,9 @@ static int llama_decode_internal(
                     ? (int32_t) lctx.dsv41_replay.keep : (int32_t) n_tokens, false);
         }
         //fprintf(stderr, "%s: setting inputs\n", __func__);
+        const int64_t z6_inputs_start = z6_pair.enabled ? ggml_time_us() : 0;
         llama_set_inputs(lctx, u_batch);
+        if (z6_pair.enabled) z6_pair.inputs_us += ggml_time_us()-z6_inputs_start;
 #if IK_PRINT_TIMING == 1
         tim2 = ggml_time_us();
         printf("set_inputs(...): %d us\n", int(tim2-tim1));
@@ -8320,6 +8343,9 @@ static int llama_decode_internal(
             ggml_backend_cpu_set_moe_expert_prefetch(lctx.backend_cpu, false);
             LLAMA_LOG_INFO("z6 sovrapposto: preparazione %.3f ms, slot %.3f ms, grafi nuovi %d riusati %d\n",
                     z6_pair.preparation_us/1000.0, z6_pair.slot_us/1000.0, z6_pair.built, z6_pair.reused);
+            LLAMA_LOG_INFO("z6 sovrapposto: dettaglio reset %.3f build %.3f alloc %.3f ingressi %.3f ms\n",
+                    z6_pair.reset_us/1000.0, z6_pair.build_us/1000.0, z6_pair.alloc_us/1000.0, z6_pair.inputs_us/1000.0);
+            z6_pair.reset_us = z6_pair.build_us = z6_pair.alloc_us = z6_pair.inputs_us = 0;
             z6_pair.preparation_us = z6_pair.slot_us = 0;
             z6_pair.built = z6_pair.reused = 0;
             auto status = ggml_backend_sched_z6_pair_compute(z6_pair.primary, lctx.sched);

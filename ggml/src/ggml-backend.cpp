@@ -3325,6 +3325,7 @@ enum ggml_status ggml_backend_sched_z6_pair_compute(ggml_backend_sched_t first, 
         ~trace_slots() { a->z6_pair_slot = b->z6_pair_slot = -1; }
     } trace{first, second};
     first->z6_pair_slot = 0; second->z6_pair_slot = 1;
+    first->z6_pair_layer = second->z6_pair_layer = -1;
     const int64_t start = ggml_time_us();
     const char * serial = getenv("GGML_Z6_PP_SOVRAPPOSTO_SERIALE");
     if (serial && atoi(serial) == 1) {
