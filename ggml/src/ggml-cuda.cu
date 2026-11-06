@@ -5048,6 +5048,19 @@ static inline const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
     return cgraph->nodes[0];
 }
 
+// Z6 (GGML_Z6_PP_SENZA_GRAFI=1): i grafi del prefill (matmul con almeno 32 token) si usano una volta sola; catturarli e
+// istanziarli costa e li mette nella cache dei grafi accanto a quelli della generazione. Lanci diretti, stessi kernel.
+static bool z6_grafo_di_prefill(const ggml_cgraph * cgraph) {
+    static const bool attivo = [] { const char * e = getenv("GGML_Z6_PP_SENZA_GRAFI"); return e && atoi(e) > 0; }();
+    if (!attivo) return false;
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        if (node->op == GGML_OP_MUL_MAT && node->src[1] && node->src[1]->ne[1] >= 32) return true;
+        if ((node->op == GGML_OP_MUL_MAT_ID || node->op == GGML_OP_MOE_FUSED_UP_GATE) && node->ne[2] >= 32) return true;
+    }
+    return false;
+}
+
 static inline ggml_cuda_graph * ggml_cuda_get_graph(ggml_backend_cuda_context & ctx, const void * key) {
     auto & graph = ctx.cuda_graphs[key];
     if (!graph) {
@@ -5417,7 +5430,7 @@ GGML_CALL static enum ggml_status ggml_backend_cuda_graph_compute_impl(ggml_back
     // Disable CUDA graphs in presence of env var, old GPU, use-case which is changing too rapidly,
     // or previous graph capture failure.
     // Also disable for multi-gpu for now. TO DO investigate
-    bool use_cuda_graph = !disable_cuda_graphs_due_to_env && cuda_ctx->use_cuda_graph;
+    bool use_cuda_graph = !disable_cuda_graphs_due_to_env && cuda_ctx->use_cuda_graph && !z6_grafo_di_prefill(cgraph);
 
     ggml_cuda_graph * graph = nullptr;
     if (use_cuda_graph) {
