@@ -403,9 +403,22 @@ ggml_tensor * delta_net::build_qkv(ggml_context * ctx0, ggml_tensor * state_stor
     ggml_tensor * new_conv_states = ggml_view_2d(ctx0, conv_output_raw, ssm_d_conv - 1, conv_dim,
             ssm_d_conv * ggml_element_size(conv_output_raw),
             (1 + conv_dim * n_tok) * ggml_element_size(conv_output_raw));
-    auto new_conv_states_cont = ggml_cont(ctx0, new_conv_states);
-    cb(new_conv_states_cont, "new_conv_states_cont", il);
-    ggml_tensor * new_conv_flat = ggml_reshape_2d(ctx0, new_conv_states_cont, conv_state_dim, 1);
+    // Decode-only opt-in: CPY already flattens a strided source into the
+    // destination layout. Skip the intermediate CONT without changing the
+    // convolution, its checkpoint outputs, or the SSM state-copy ordering.
+    static const bool z6_conv_cpy_diretta = [] {
+        const char * e = std::getenv("GGML_Z6_CONV_CPY_DIRETTA");
+        return e && std::atoi(e) > 0;
+    }();
+    ggml_tensor * new_conv_flat;
+    if (z6_conv_cpy_diretta && n_seq_tokens == 1 && n_seqs == 1 &&
+            new_conv_states->type == GGML_TYPE_F32) {
+        new_conv_flat = new_conv_states;
+    } else {
+        auto new_conv_states_cont = ggml_cont(ctx0, new_conv_states);
+        cb(new_conv_states_cont, "new_conv_states_cont", il);
+        new_conv_flat = ggml_reshape_2d(ctx0, new_conv_states_cont, conv_state_dim, 1);
+    }
     ggml_tensor * new_ssm_flat  = ggml_reshape_2d(ctx0, new_state, ssm_state_dim, 1);
     ggml_tensor * conv_state_dst = ggml_view_2d(ctx0, state_dst, conv_state_dim, 1, state_row_size, 0);
     ggml_tensor * ssm_dst        = ggml_view_2d(ctx0, state_dst, ssm_state_dim, 1, state_row_size,
