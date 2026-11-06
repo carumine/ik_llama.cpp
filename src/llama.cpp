@@ -656,6 +656,8 @@ struct llama_context::Z6Pair {
     decltype(llama_context::inp_kpool_tail) inp_kpool_tail{};
     decltype(llama_context::inp_kpool_ape_slots) inp_kpool_ape_slots{};
     decltype(llama_context::inp_qsa) inp_qsa{};
+    // GGML_Z6_PP_SOVRAPPOSTO_MAX_KV: arena of slot 0/1 already reserved for the limit.
+    bool reserved[2] = {false, false};
     void exchange(llama_context & ctx) {
         using std::swap;
         swap(buf_compute_meta, ctx.buf_compute_meta);
@@ -7767,6 +7769,26 @@ static bool prepare_mtp_graph_inputs(
 // return negative int on error
 //
 // Experimental pair lifetime: graph metadata and compute arenas are disjoint.
+// GGML_Z6_PP_SOVRAPPOSTO_MAX_KV: reserve the current scheduler once on this
+// ubatch's own graph with n_kv raised to n_kv_target (allocation only: the graph
+// actually computed is rebuilt afterwards with its real n_kv). Avoids regrowing
+// the compute and pinned host arenas at every ubatch as the context fills.
+static bool z6_pair_reserve(llama_context & lctx, const llama_batch & u_batch, uint32_t n_kv_target) {
+    auto & kv = lctx.kv_self;
+    const uint32_t saved = kv.n;
+    kv.n = std::max(saved, std::min(kv.size, n_kv_target));
+    const int64_t start = ggml_time_us();
+    lctx.reset_scheduler();
+    ggml_cgraph * gf = llm_build_context::llama_build_graph(lctx, u_batch, false);
+    const bool ok = gf && ggml_backend_sched_reserve(lctx.sched, gf);
+    LLAMA_LOG_INFO("z6 sovrapposto: prenotazione a %u celle %s, %.3f ms\n", kv.n, ok ? "ok" : "FALLITA",
+            (ggml_time_us()-start)/1000.0);
+    kv.n = saved;
+    lctx.reset_scheduler();
+    lctx.prev.reset();
+    return ok;
+}
+
 // Inputs are filled in token order before either graph runs. Never retain a
 // caller's batch past decode(), and never publish a half-completed pair.
 struct z6_pair_decode {
@@ -7946,6 +7968,7 @@ static int llama_decode_internal(
     // Optional operational limit: above it, release the second arena and use
     // the original schedule, without changing context capacity or microbatch.
     uint64_t z6_max_kv = 0;
+    bool z6_reserve_full = false;
     if (z6_pp && atoi(z6_pp) == 1) {
         if (const char * limit = getenv("GGML_Z6_PP_SOVRAPPOSTO_MAX_KV"))
             z6_max_kv = strtoull(limit, nullptr, 10);
@@ -7956,6 +7979,7 @@ static int llama_decode_internal(
         ggml_backend_sched_synchronize(lctx.sched);
         lctx.z6_pair_slot.reset();
         LLAMA_LOG_INFO("z6 sovrapposto: secondo slot liberato, limite KV %llu\n", (unsigned long long)z6_max_kv);
+        z6_reserve_full = true;  // back to the control's allocation, once, at full KV size
     }
     if (z6_pp && atoi(z6_pp) == 1 && !z6_memory_fallback && model.arch == LLM_ARCH_QWEN4EXP &&
             n_ubatch >= 256 && n_tokens_all >= n_ubatch+256 && batch_all.token &&
@@ -8188,6 +8212,14 @@ static int llama_decode_internal(
         const uint64_t seq_fingerprint = llama_ubatch_seq_fingerprint(u_batch, lctx.model.arch);
         const uint64_t state_hash      = model_state_hash(lctx);
         if (!lctx.can_reuse_graph(u_batch, seq_fingerprint, state_hash)) {
+            if (z6_reserve_full) {
+                z6_reserve_full = false;
+                if (!z6_pair_reserve(lctx, u_batch, kv_self.size)) return GGML_STATUS_ALLOC_FAILED;
+            } else if (z6_pair.enabled && z6_max_kv && lctx.z6_pair_slot && z6_pair.retain &&
+                    !lctx.z6_pair_slot->reserved[z6_pair.second]) {
+                lctx.z6_pair_slot->reserved[z6_pair.second] = true;
+                if (!z6_pair_reserve(lctx, u_batch, (uint32_t) GGML_PAD(z6_max_kv, 256))) return GGML_STATUS_ALLOC_FAILED;
+            }
             if (z6_pair.enabled) ++z6_pair.built;
             const int64_t z6_reset_start = z6_pair.enabled ? ggml_time_us() : 0;
             lctx.reset_scheduler();
