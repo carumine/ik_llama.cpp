@@ -1,3 +1,26 @@
+#if defined(GGML_USE_CUDA) && __has_include(<nvtx3/nvToolsExt.h>)
+#include <nvtx3/nvToolsExt.h>
+#define Z6_PAIR_NVTX 1
+#endif
+
+// CPU intervals enclose the synchronous backend call, not GPU event waits.
+// No ranges are emitted outside the explicitly enabled pair path.
+struct z6_pair_range {
+    bool active;
+    explicit z6_pair_range(bool enabled, const char * name) : active(enabled) {
+#ifdef Z6_PAIR_NVTX
+        if (active) nvtxRangePushA(name);
+#else
+        (void) name;
+#endif
+    }
+    ~z6_pair_range() {
+#ifdef Z6_PAIR_NVTX
+        if (active) nvtxRangePop();
+#endif
+    }
+};
+
 #include "ggml-backend-impl.h"
 #include "ggml-alloc.h"
 #include "ggml-impl.h"
@@ -1283,6 +1306,8 @@ struct ggml_backend_sched {
     bool debug;
     bool has_reduce = false;
     z6_caldi_plan * z6_plan = nullptr;
+    int z6_pair_slot = -1;
+    int z6_pair_layer = -1;
 };
 
 void ggml_backend_sched_z6_begin_graph(ggml_backend_sched_t sched) {
@@ -2703,9 +2728,10 @@ static bool z6_sched_tempi_attivi() {
     return v;
 }
 
-static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
+static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched, int begin = 0, int end = -1) {
 
-    for (auto & item : sched->needs_sync) item = true;
+    if (end < 0) end = sched->n_splits;
+    if (begin == 0) for (auto & item : sched->needs_sync) item = true;
 
     if (sched->is_async && sched->n_backends > 2 && sched->split_mode_graph && sched->has_reduce) {
 
@@ -2988,9 +3014,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     const bool z6_misura = z6_sched_tempi_attivi();
     z6_sched_tempi z6_qui;
     const int64_t z6_inizio = z6_misura ? ggml_time_us() : 0;
-    if (sched->z6_plan) ++sched->z6_plan->epoch;
+    if (sched->z6_plan && begin == 0) ++sched->z6_plan->epoch;
 
-    for (int i = 0; i < sched->n_splits; i++) {
+    for (int i = begin; i < end; i++) {
 #if IK_PRINT_TIMING
         int64_t tim1 = ggml_time_us();
 #endif
@@ -3075,7 +3101,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 }
             }
         }
-        auto ec = ggml_backend_sched_eval(sched, split_backend, split);
+        enum ggml_status ec;
+        {
+            const bool trace_cpu = sched->z6_pair_slot >= 0 && ggml_backend_is_cpu(split_backend);
+            char label[80];
+            if (trace_cpu) snprintf(label, sizeof(label), "z6 cold slot=%d layer=%d", sched->z6_pair_slot, sched->z6_pair_layer);
+            z6_pair_range cpu_range(trace_cpu, trace_cpu ? label : "");
+            ec = ggml_backend_sched_eval(sched, split_backend, split);
+        }
         if (ec != GGML_STATUS_SUCCESS) {
             if (sched->z6_plan) ggml_backend_sched_synchronize(sched);
             return ec;
@@ -3132,7 +3165,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
     }
 
-    sched->cur_copy = (sched->cur_copy + 1) % sched->n_copies;
+    if (end == sched->n_splits) sched->cur_copy = (sched->cur_copy + 1) % sched->n_copies;
 
     if (z6_misura) {
         const int64_t totale = ggml_time_us() - z6_inizio;
@@ -3186,6 +3219,9 @@ ggml_backend_sched_t ggml_backend_sched_new(
     GGML_ASSERT(ggml_backend_is_cpu(backends[n_backends - 1])); // last backend must be CPU
 
     struct ggml_backend_sched * sched = (ggml_backend_sched *)calloc(1, sizeof(struct ggml_backend_sched));
+    // calloc does not run C++ member initializers.
+    sched->z6_pair_slot = -1;
+    sched->z6_pair_layer = -1;
 
     for (int i = 0; i < (GGML_OP_COUNT + 31)/32; ++i) sched->op_offload[i] = 0xffffffff;
 
@@ -3232,6 +3268,102 @@ ggml_backend_sched_t ggml_backend_sched_new(
     ggml_backend_sched_reset(sched);
 
     return sched;
+}
+
+void ggml_backend_sched_z6_pair_trim(ggml_backend_sched_t sched) {
+    const char * enabled = getenv("GGML_Z6_PP_SOVRAPPOSTO");
+    GGML_ASSERT(enabled && atoi(enabled) == 1 && sched->n_copies == 1 && sched->is_reset);
+    ggml_backend_sched_synchronize(sched);
+    // Drop the initial worst-case reservation once. Subsequent actual graphs
+    // retain and grow their own arenas through the normal allocator path.
+    ggml_gallocr_free(sched->galloc);
+    sched->galloc = ggml_gallocr_new_n(sched->bufts, sched->n_backends);
+}
+
+ggml_backend_sched_t ggml_backend_sched_z6_pair_slot(ggml_backend_sched_t source, size_t graph_size) {
+    auto slot = ggml_backend_sched_new(source->backends, source->bufts, source->n_backends, graph_size, false);
+    memcpy(slot->op_offload, source->op_offload, sizeof(slot->op_offload));
+    slot->only_active_experts = source->only_active_experts;
+    return slot;
+}
+
+enum ggml_status ggml_backend_sched_z6_pair_compute(ggml_backend_sched_t first, ggml_backend_sched_t second) {
+    // No backend is entered concurrently. Queue the other ubatch's GPU prefix
+    // before entering the blocking CPU split. Per-slot allocation/staging is
+    // independent, while GPU stream order protects the shared recurrent/KV state.
+    const char * enabled = getenv("GGML_Z6_PP_SOVRAPPOSTO");
+    if (!enabled || atoi(enabled) != 1 || ggml_moe_prefetch_enabled()) return GGML_STATUS_FAILED;
+    ggml_backend_sched_t slots[2] = {first, second};
+    std::vector<int> cold[2];
+    for (int s = 0; s < 2; ++s) {
+        auto sched = slots[s];
+        if (!sched->is_alloc || !sched->z6_plan || sched->n_copies != 1 ||
+                sched->split_mode_graph || sched->callback_eval || sched->callback_copy) return GGML_STATUS_FAILED;
+        for (int i = 0; i < sched->n_splits; ++i) {
+            auto & split = sched->splits[i];
+            if (!split.graph.n_nodes) continue;
+            auto it = sched->z6_plan->cold_begins.find(split.graph.nodes[0]);
+            if (it != sched->z6_plan->cold_begins.end()) {
+                if (it->second != cold[s].size() || !ggml_backend_is_cpu(sched->backends[split.backend_id]))
+                    return GGML_STATUS_FAILED;
+                cold[s].push_back(i);
+            }
+        }
+        if (cold[s].size() != sched->z6_plan->groups.size() || cold[s].empty()) return GGML_STATUS_FAILED;
+    }
+    if (cold[0].size() != cold[1].size()) return GGML_STATUS_FAILED;
+    for (size_t i = 0; i < cold[0].size(); ++i) {
+        const auto & a = first->z6_plan->groups[i];
+        const auto & b = second->z6_plan->groups[i];
+        if (a.layer != b.layer || a.host_inputs[0]->data == b.host_inputs[0]->data ||
+                a.cold_end->data == b.cold_end->data || a.host_inputs[1]->ne[1] < 256 ||
+                b.host_inputs[1]->ne[1] < 256) return GGML_STATUS_FAILED;
+    }
+    z6_pair_range pair_range(true, "z6 pair");
+    struct trace_slots {
+        ggml_backend_sched_t a, b;
+        ~trace_slots() { a->z6_pair_slot = b->z6_pair_slot = -1; }
+    } trace{first, second};
+    first->z6_pair_slot = 0; second->z6_pair_slot = 1;
+    const int64_t start = ggml_time_us();
+    const char * serial = getenv("GGML_Z6_PP_SOVRAPPOSTO_SERIALE");
+    if (serial && atoi(serial) == 1) {
+        // Diagnostic control: same two prepared graphs/arenas, original order.
+        for (auto slot : slots) {
+            auto ec = ggml_backend_sched_compute_splits(slot);
+            if (ec != GGML_STATUS_SUCCESS) return ec;
+        }
+        ggml_backend_sched_synchronize(first);
+        fprintf(stderr, "z6 sovrapposto: coppia diagnostica SEQUENZIALE\n");
+        return GGML_STATUS_SUCCESS;
+    }
+    for (int b = 0; b < first->n_backends; ++b) {
+        fprintf(stderr, "z6 sovrapposto: compute %s %.2f + %.2f MiB\n", ggml_backend_name(first->backends[b]),
+                ggml_backend_sched_get_buffer_size(first, first->backends[b])/1048576.0,
+                ggml_backend_sched_get_buffer_size(second, second->backends[b])/1048576.0);
+    }
+    for (int s = 0; s < 2; ++s) {
+        auto ec = ggml_backend_sched_compute_splits(slots[s], 0, cold[s][0]);
+        if (ec != GGML_STATUS_SUCCESS) return ec;
+    }
+    int queued = 0;
+    for (size_t layer = 0; layer < cold[0].size(); ++layer) {
+        for (int s = 0; s < 2; ++s) {
+            slots[s]->z6_pair_layer = slots[s]->z6_plan->groups[layer].layer;
+#ifdef GGML_USE_CUDA
+            // Diagnostic only: other-slot work is still outstanding before CPU.
+            auto & ticket = slots[1-s]->z6_plan->tickets[layer];
+            queued += ticket.hot_done && !ggml_backend_cuda_z6_event_ready(ticket.hot_done);
+#endif
+            const int end = layer+1 < cold[s].size() ? cold[s][layer+1] : slots[s]->n_splits;
+            auto ec = ggml_backend_sched_compute_splits(slots[s], cold[s][layer], end);
+            if (ec != GGML_STATUS_SUCCESS) return ec;
+        }
+    }
+    ggml_backend_sched_synchronize(first);
+    fprintf(stderr, "z6 sovrapposto: coppia eseguita, %zu livelli, altri caldi pendenti %d, %.3f ms\n",
+            cold[0].size(), queued, (ggml_time_us()-start)/1000.0);
+    return GGML_STATUS_SUCCESS;
 }
 
 void ggml_backend_sched_free(ggml_backend_sched_t sched) {

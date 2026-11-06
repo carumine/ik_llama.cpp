@@ -217,6 +217,10 @@ extern "C" {
     };
     GGML_API void ggml_backend_sched_z6_begin_graph(ggml_backend_sched_t sched);
     GGML_API void ggml_backend_sched_z6_add_group(ggml_backend_sched_t sched, const struct ggml_z6_caldi_group * group);
+    // Experimental two-ubatch schedule. Callers own distinct graphs, arenas and host packets.
+    GGML_API ggml_backend_sched_t ggml_backend_sched_z6_pair_slot(ggml_backend_sched_t source, size_t graph_size);
+    GGML_API void ggml_backend_sched_z6_pair_trim(ggml_backend_sched_t sched);
+    GGML_API enum ggml_status ggml_backend_sched_z6_pair_compute(ggml_backend_sched_t first, ggml_backend_sched_t second);
     // Counts are collected with GGML_Z6_TEMPI=1.
     GGML_API void ggml_backend_sched_z6_stats(ggml_backend_sched_t sched, int64_t * groups, int64_t * overlapping);
 
