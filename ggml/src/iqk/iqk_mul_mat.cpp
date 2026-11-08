@@ -33,6 +33,7 @@
 #include "iqk_gemm_1bit.h"
 #include "iqk_gemm_legacy_quants.h"
 #include "iqk_utils.h"
+#include "iqk_z6_q8_panel.h"
 
 #define GGML_COMMON_IMPL_C
 #include "ggml-common.h"
@@ -538,7 +539,15 @@ static work_buffer_t & thread_local_work_buffer() {
     return f;
 }
 
-bool iqk_convert_repack(int typeA, int n, const void * vx, size_t bx, void * vy, size_t stride_y, int nrc_x) {
+bool iqk_convert_repack(int typeA, int n, const void * vx, size_t bx, void * vy, size_t stride_y, int nrc_x, bool panel16 = false) {
+#ifdef HAVE_FANCY_SIMD
+    if (panel16) {
+        GGML_ASSERT(typeA==GGML_TYPE_Q4_K);
+        z6_q4k_panel16(n,vx,bx,vy,nrc_x); return true;
+    }
+#else
+    (void)panel16;
+#endif
     if (typeA == GGML_TYPE_F8_E4M3_KS || typeA == GGML_TYPE_F8_E4M3_B128) {
         return iqk_convert_f8(typeA, n, vx, bx, vy, stride_y, nrc_x);
     }
@@ -1011,6 +1020,7 @@ extern "C" IQK_API bool iqk_mul_mat_moe(long Nx, long Ny, long ne00, int ne11,
     if (dequant_type != etypeA && Nx%MulMat::num_rows(dequant_type) == 0 &&
         MulMat::prepare(dequant_type, typeB, ne00, mm, Ny)) {
 
+        const bool panel16=z6_select_panel16(typeA,typeB,Ny,mm.funcs);
         const int k_x_step = z6_repack_tile();
 
         auto num_rows = MulMat::num_rows(ggml_type(dequant_type));
@@ -1035,7 +1045,7 @@ extern "C" IQK_API bool iqk_mul_mat_moe(long Nx, long Ny, long ne00, int ne11,
             if (f.size() < row_size_qx*this_nrc_x) f.resize(row_size_qx*this_nrc_x);
             if (f8_q80) {
                 convert_f8_q80(dequant_type, typeA, ne00, (const char *)A + (first_x + ix)*strideA, strideA, f.data(), this_nrc_x);
-            } else if (!iqk_convert_repack(typeA, ne00, (const char *)A + (first_x + ix)*strideA, strideA, f.data(), ne00, this_nrc_x)) {
+            } else if (!iqk_convert_repack(typeA, ne00, (const char *)A + (first_x + ix)*strideA, strideA, f.data(), ne00, this_nrc_x, panel16)) {
                 GGML_ABORT("Fatal error");
             }
             if (typeA == GGML_TYPE_F8_E4M3_KS && !f8_q80) {
@@ -1087,6 +1097,9 @@ extern "C" IQK_API bool iqk_moe_fused_up_gate(long Nx, long Ny, long ne00, int n
     if (auto dequant_type = f8_q80 ? f8_q80_type(Nx, Ny) : typeA == GGML_TYPE_F8_E4M3_KS ? etypeA : z6_dequant_moe(etypeA, Ny); dequant_type != etypeA) {
         if (MulMat::prepare(dequant_type, typeB, ne00, mm, Ny)) {
 
+            // Only with a row mapping (MoE experts): there split_units_and_columns always hands over all the
+            // columns. Without it the columns are split in blocks of 8 and a tail of one column has no panel kernel.
+            const bool panel16 = row_mapping ? z6_select_panel16(typeA,typeB,Ny,mm.funcs) : false;
             constexpr int k_x_step = 64;
 
             auto num_rows = MulMat::num_rows(ggml_type(dequant_type));
@@ -1105,10 +1118,10 @@ extern "C" IQK_API bool iqk_moe_fused_up_gate(long Nx, long Ny, long ne00, int n
                     convert_f8_q80(dequant_type, typeA, ne00, (const char *)Aup   + ix*strideA, strideA, Xu, nrc_x);
                     convert_f8_q80(dequant_type, typeA, ne00, (const char *)Agate + ix*strideA, strideA, Xg, nrc_x);
                 } else {
-                    if (!iqk_convert_repack(typeA, ne00, (const char *)Aup   + ix*strideA, strideA, Xu, ne00, nrc_x)) {
+                    if (!iqk_convert_repack(typeA, ne00, (const char *)Aup   + ix*strideA, strideA, Xu, ne00, nrc_x, panel16)) {
                         GGML_ABORT("Fatal error");
                     }
-                    if (!iqk_convert_repack(typeA, ne00, (const char *)Agate + ix*strideA, strideA, Xg, ne00, nrc_x)) {
+                    if (!iqk_convert_repack(typeA, ne00, (const char *)Agate + ix*strideA, strideA, Xg, ne00, nrc_x, panel16)) {
                         GGML_ABORT("Fatal error");
                     }
                 }
