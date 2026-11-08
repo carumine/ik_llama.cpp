@@ -31,6 +31,7 @@
 #include "iqk_gemm_1bit.h"
 #include "iqk_gemm_legacy_quants.h"
 #include "iqk_utils.h"
+#include "iqk_z6_q8_panel.h"
 
 #define GGML_COMMON_IMPL_C
 #include "ggml-common.h"
@@ -526,7 +527,15 @@ static work_buffer_t & thread_local_work_buffer() {
     return f;
 }
 
-bool iqk_convert_repack(int typeA, int n, const void * vx, size_t bx, void * vy, size_t stride_y, int nrc_x) {
+bool iqk_convert_repack(int typeA, int n, const void * vx, size_t bx, void * vy, size_t stride_y, int nrc_x, bool panel16 = false) {
+#ifdef HAVE_FANCY_SIMD
+    if (panel16) {
+        GGML_ASSERT(typeA==GGML_TYPE_Q4_K);
+        z6_q4k_panel16(n,vx,bx,vy,nrc_x); return true;
+    }
+#else
+    (void)panel16;
+#endif
 
     switch (typeA) {
         //case GGML_TYPE_F16:
@@ -896,6 +905,7 @@ extern "C" IQK_API bool iqk_mul_mat_moe(long Nx, long Ny, long ne00, int ne11,
     if (dequant_type != etypeA && Nx%MulMat::num_rows(dequant_type) == 0 &&
         MulMat::prepare(dequant_type, typeB, ne00, mm, Ny)) {
 
+        const bool panel16=z6_select_panel16(typeA,typeB,Ny,mm.funcs);
         const int k_x_step = z6_repack_tile();
 
         auto num_rows = MulMat::num_rows(ggml_type(dequant_type));
@@ -918,7 +928,7 @@ extern "C" IQK_API bool iqk_mul_mat_moe(long Nx, long Ny, long ne00, int ne11,
             this_info.s += ix;
             int this_nrc_x = ix + k_x_step <= nrc_x ? k_x_step : nrc_x - ix;
             if (f.size() < row_size_qx*this_nrc_x) f.resize(row_size_qx*this_nrc_x);
-            if (!iqk_convert_repack(typeA, ne00, (const char *)A + (first_x + ix)*strideA, strideA, f.data(), ne00, this_nrc_x)) {
+            if (!iqk_convert_repack(typeA, ne00, (const char *)A + (first_x + ix)*strideA, strideA, f.data(), ne00, this_nrc_x, panel16)) {
                 GGML_ABORT("Fatal error");
             }
             mm.mul_mat_NxM(ne00, f.data(), row_size_qx, this_info, this_nrc_x, Ny);
@@ -964,6 +974,7 @@ extern "C" IQK_API bool iqk_moe_fused_up_gate(long Nx, long Ny, long ne00, int n
     if (auto dequant_type = z6_dequant_moe(etypeA, Ny); dequant_type != etypeA) {
         if (MulMat::prepare(dequant_type, typeB, ne00, mm, Ny)) {
 
+            const bool panel16=z6_select_panel16(typeA,typeB,Ny,mm.funcs);
             constexpr int k_x_step = 64;
 
             auto num_rows = MulMat::num_rows(ggml_type(dequant_type));
@@ -988,10 +999,10 @@ extern "C" IQK_API bool iqk_moe_fused_up_gate(long Nx, long Ny, long ne00, int n
                 if (f.size() < 2*row_size_qx*this_nrc_x) f.resize(2*row_size_qx*this_nrc_x);
                 auto Xu = f.data();
                 auto Xg = f.data() + row_size_qx*this_nrc_x;
-                if (!iqk_convert_repack(typeA, ne00, (const char *)Aup   + (first_x + ix)*strideA, strideA, Xu, ne00, this_nrc_x)) {
+                if (!iqk_convert_repack(typeA, ne00, (const char *)Aup   + (first_x + ix)*strideA, strideA, Xu, ne00, this_nrc_x, panel16)) {
                     GGML_ABORT("Fatal error");
                 }
-                if (!iqk_convert_repack(typeA, ne00, (const char *)Agate + (first_x + ix)*strideA, strideA, Xg, ne00, this_nrc_x)) {
+                if (!iqk_convert_repack(typeA, ne00, (const char *)Agate + (first_x + ix)*strideA, strideA, Xg, ne00, this_nrc_x, panel16)) {
                     GGML_ABORT("Fatal error");
                 }
                 auto up_b   = up_b_c   ? (const float *)up_b_c + first_x + ix : nullptr;

@@ -823,6 +823,80 @@ static void mul_mat_qX_K_q8_2_X4_T(int n, const void * vx, size_t bx, const Data
     }
 }
 
+#ifdef HAVE_FANCY_SIMD
+// Two independent 8-lane accumulators; no horizontal operation crosses halves.
+template<int nrc_y>
+static void z6_mul_mat_q4k_pairs(int n, const void * vx, size_t bx, const DataInfo & info, int nrc_x) {
+    GGML_ASSERT(n % QK_K == 0);
+    Q8<nrc_y, block_q8_2_x4> q8(info);
+    DequantizerQ4K_AVX2 lo(vx, bx), hi(vx, bx);
+    auto join = [](__m256 a, __m256 b) { return _mm512_insertf32x8(_mm512_castps256_ps512(a), b, 1); };
+    auto joini = [](__m256i a, __m256i b) { return _mm512_inserti32x8(_mm512_castsi256_si512(a), b, 1); };
+    int ix = 0;
+    for (; ix+1 < nrc_x; ix += 2) {
+        lo.new_row(ix); hi.new_row(ix+1);
+        __m512 acc[nrc_y] = {};
+        float d8[8*nrc_y];
+        for (int i=0; i<n/QK_K; ++i) {
+            __m256 mins[2], scales[2][2];
+            for (int r=0; r<2; ++r) {
+                auto & deq = r == 0 ? lo : hi;
+                uint32_t utmp[4];
+                deq.d = GGML_FP16_TO_FP32(deq.x[i].d);
+                auto vm = _mm256_cvtph_ps(_mm_set1_epi16(deq.x[i].dmin));
+                make_q4_scales(deq.x[i].scales, utmp);
+                mins[r] = _mm256_mul_ps(vm, _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i *)(utmp+2)))));
+                mins[r] = _mm256_mul_ps(_mm256_set1_ps(-1.f), mins[r]);
+                auto all = _mm256_mul_ps(_mm256_set1_ps(deq.d), _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i *)utmp))));
+                scales[r][0] = _mm256_set_m128(_mm256_castps256_ps128(all), _mm256_castps256_ps128(all));
+                auto h = _mm256_extractf128_ps(all, 1);
+                scales[r][1] = _mm256_set_m128(h,h);
+            }
+            auto mm = join(mins[0],mins[1]);
+            for (int iy=0; iy<nrc_y; ++iy) {
+                auto d1 = _mm_cvtepu16_epi32(_mm_loadl_epi64((const __m128i *)q8.y[iy][2*i+0].d));
+                auto d2 = _mm_cvtepu16_epi32(_mm_loadl_epi64((const __m128i *)q8.y[iy][2*i+1].d));
+                auto dy = _mm256_castsi256_ps(_mm256_slli_epi32(MM256_SET_M128I(d2,d1),16));
+                _mm256_storeu_ps(d8+8*iy,dy);
+                auto m1 = _mm_cvtepi16_epi32(_mm_loadl_epi64((const __m128i *)(q8.y[iy][2*i+0].d+4)));
+                auto m2 = _mm_cvtepi16_epi32(_mm_loadl_epi64((const __m128i *)(q8.y[iy][2*i+1].d+4)));
+                auto my = _mm256_mul_ps(dy,_mm256_cvtepi32_ps(MM256_SET_M128I(m2,m1)));
+                acc[iy] = _mm512_fmadd_ps(join(my,my),mm,acc[iy]);
+            }
+            for (int j=0; j<2; ++j) {
+                lo.prepare(i,j); hi.prepare(i,j);
+                __m512i bits[4];
+                for (int k=0;k<4;++k) bits[k]=joini(lo.bits.values[k],hi.bits.values[k]);
+                auto sc=join(scales[0][j],scales[1][j]);
+                for (int iy=0;iy<nrc_y;++iy) {
+                    auto & y=q8.y[iy][2*i+j];
+                    __m512i v[4];
+                    for (int k=0;k<4;++k) {
+                        auto yy=_mm256_loadu_si256((const __m256i *)y.qs+k);
+                        v[k]=_mm512_dpbusd_epi32(_mm512_setzero_si512(),bits[k],joini(yy,yy));
+                    }
+                    auto s1=_mm512_add_epi32(_mm512_unpacklo_epi32(v[0],v[1]),_mm512_unpackhi_epi32(v[0],v[1]));
+                    auto s3=_mm512_add_epi32(_mm512_unpacklo_epi32(v[2],v[3]),_mm512_unpackhi_epi32(v[2],v[3]));
+                    s1=_mm512_add_epi32(_mm512_unpacklo_epi64(s1,s3),_mm512_unpackhi_epi64(s1,s3));
+                    auto dy4=_mm_loadu_ps(d8+8*iy+4*j);
+                    auto dy8=_mm256_set_m128(dy4,dy4);
+                    auto d4d8=_mm512_mul_ps(sc,join(dy8,dy8));
+                    acc[iy]=_mm512_fmadd_ps(d4d8,_mm512_cvtepi32_ps(s1),acc[iy]);
+                }
+            }
+        }
+        for (int iy=0;iy<nrc_y;++iy) {
+            info.store(ix,iy,hsum_float_8(_mm512_castps512_ps256(acc[iy])));
+            info.store(ix+1,iy,hsum_float_8(_mm512_extractf32x8_ps(acc[iy],1)));
+        }
+    }
+    if (ix<nrc_x) {
+        auto tail=info; tail.s+=ix;
+        mul_mat_qX_K_q8_2_X4_T<DequantizerQ4K_AVX2,nrc_y>(n,(const char *)vx+ix*bx,bx,tail,1);
+    }
+}
+#endif
+
 struct DequantizerQ6K_AVX2 final : public BaseDequantizer<block_q6_K> {
     DequantizerQ6K_AVX2(const void * vx, size_t bx) : BaseDequantizer(vx, bx) {}
     inline void prepare(int i, int j) {
@@ -3192,7 +3266,17 @@ bool iqk_set_kernels_kquants([[maybe_unused]] int ne00, int typeA, int typeB, st
             //IQK_SET_MUL_MAT_FUNCTIONS_T(mul_mat_qY_K_q8_2_X4_T, DequantizerQ3K_AVX2, kernels);
             break;
         case GGML_TYPE_Q4_K:
+#ifdef HAVE_FANCY_SIMD
+            {
+                static const bool pairs = [] {
+                    const char * e = getenv("GGML_Z6_Q4K_COPPIE"); return e && strcmp(e, "1") == 0;
+                }();
+                if (pairs) { IQK_SET_MUL_MAT_FUNCTIONS(z6_mul_mat_q4k_pairs, kernels) }
+                else { IQK_SET_MUL_MAT_FUNCTIONS_T(mul_mat_qX_K_q8_2_X4_T, DequantizerQ4K_AVX2, kernels); }
+            }
+#else
             IQK_SET_MUL_MAT_FUNCTIONS_T(mul_mat_qX_K_q8_2_X4_T, DequantizerQ4K_AVX2, kernels);
+#endif
             //set_functions<DequantizerQ4K>(kernels);
             break;
         case GGML_TYPE_Q5_K:
