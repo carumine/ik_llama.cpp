@@ -621,7 +621,7 @@ struct IndexHelperIQ3S {
 };
 #endif
 
-struct DequantizerIQ3S final : public BaseDequantizer<block_iq3_s> {
+struct DequantizerIQ3S : public BaseDequantizer<block_iq3_s> {
     DequantizerIQ3S(const void * vx, size_t bx) : BaseDequantizer(vx, bx) {}
 
     constexpr static int num_blocks = 8;
@@ -687,6 +687,58 @@ struct DequantizerIQ3S final : public BaseDequantizer<block_iq3_s> {
     const __m256i min_value = _mm256_set1_epi8(minv);
 
 };
+
+#ifdef HAVE_FANCY_SIMD
+// Z6, GGML_Z6_IQ3S_GATHER=1: same IQ3_S decode with the grid looked up by 256-bit gathers and the signs applied
+// with AVX512 byte masks, instead of 32 scalar lookups and shuffle/compare/sign per 128 weights. The decoded bytes
+// are the same, so every kernel built on this dequantizer returns bit-identical results. On Cascade Lake the
+// single-column kernel reads 4.9 GB/s per thread instead of 2.5 (z6/logs/tetto-20261110/kernel-iq3s).
+struct DequantizerIQ3SZ6 final : public DequantizerIQ3S {
+    DequantizerIQ3SZ6(const void * vx, size_t bx) : DequantizerIQ3S(vx, bx) {}
+
+    static IQK_ALWAYS_INLINE void make2(const uint8_t * qs, const uint8_t * qh, __m256i * values) {
+        const __m256i offset = _mm256_set1_epi32(256);
+        auto i0 = _mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i *)qs));
+        auto i1 = _mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i *)(qs+8)));
+        i0 = _mm256_mask_add_epi32(i0, (__mmask8)qh[0], i0, offset);
+        i1 = _mm256_mask_add_epi32(i1, (__mmask8)qh[1], i1, offset);
+        values[0] = _mm256_i32gather_epi32((const int *)iq3s_grid, i0, 4);
+        values[1] = _mm256_i32gather_epi32((const int *)iq3s_grid, i1, 4);
+    }
+    static IQK_ALWAYS_INLINE void sign_4_values(const uint8_t * sign_bits, __m256i * values) {
+        uint32_t m[4]; std::memcpy(m, sign_bits, sizeof(m));
+        for (int k = 0; k < 4; ++k) values[k] = _mm256_mask_sub_epi8(values[k], (__mmask32)m[k], _mm256_setzero_si256(), values[k]);
+    }
+    // Same body as the base class: forced inline, the multi-column kernels call it once per block.
+    using DequantizerIQ3S::new_block;
+    IQK_ALWAYS_INLINE float new_block(int i, __m256i * scales, __m256i& mins) {
+        auto scales16 = make_scales(i, d);
+        mins = scb.shuffle(scales16);
+        scales[0] = MM256_SET1_M128I(scales16);
+        return -minv*d;
+    }
+    inline void prepare_unsigned(int i, int j) {
+        auto qs = x[i].qs + 32*j;
+        auto qh = x[i].qh +  4*j;
+        make2(qs+ 0, qh+0, bits.values+0);
+        make2(qs+16, qh+2, bits.values+2);
+    }
+    inline void prepare(int i, int j) {
+        prepare_unsigned(i, j);
+        sign_4_values(x[i].signs + 16*j, bits.values);
+        for (int k = 0; k < 4; ++k) bits.values[k] = _mm256_add_epi8(bits.values[k], min_value);
+    }
+    inline void prepare(int i, int j, const Q8<1>& q8, __m256i * q8_quants) {
+        prepare_unsigned(i, j);
+        for (int k = 0; k < 4; ++k) q8_quants[k] = q8.load_quants(0, i, 4*j+k);
+        sign_4_values(x[i].signs + 16*j, q8_quants);
+    }
+    inline void prepare(int i, int j, __m256i * q8_quants) {
+        prepare_unsigned(i, j);
+        sign_4_values(x[i].signs + 16*j, q8_quants);
+    }
+};
+#endif
 
 template <typename Bits>
 inline void multiply_add_1(int j, const Bits& bits, const __m256i * scales, const __m256i * q8, __m256i * sumi) {
@@ -3178,6 +3230,9 @@ void iqk_convert_iq3_s_q8_k_r8(int n, const void * vx, size_t bx, void * vy, int
 
     Q8KRowRepacker<k_nr, 32> rp;
     __m256i values[8];
+#ifdef HAVE_FANCY_SIMD
+    static const bool z6_gather = [] { const char * e = getenv("GGML_Z6_IQ3S_GATHER"); return e && strcmp(e, "1") == 0; }();
+#endif
 
     for (int ix = 0; ix < nrc_x; ix += k_nr) {
         for (int k = 0; k < k_nr; ++k) x8[k] = (const block_iq3_s *)((const char *)vx + (ix + k)*bx);
@@ -3187,12 +3242,21 @@ void iqk_convert_iq3_s_q8_k_r8(int n, const void * vx, size_t bx, void * vy, int
                 auto qs = x8[k][i].qs;
                 auto qh = x8[k][i].qh;
                 auto signs = (const uint16_t *)x8[k][i].signs;
+#ifdef HAVE_FANCY_SIMD
+                if (z6_gather) {   // GGML_Z6_IQ3S_GATHER=1: same bytes, gathers and mask signs
+                    for (int j = 0; j < 4; ++j) DequantizerIQ3SZ6::make2(qs + 16*j, qh + 2*j, values + 2*j);
+                    DequantizerIQ3SZ6::sign_4_values(x8[k][i].signs +  0, values+0);
+                    DequantizerIQ3SZ6::sign_4_values(x8[k][i].signs + 16, values+4);
+                } else
+#endif
+                {
                 helper.make2(qs+ 0, qh+0, values+0);
                 helper.make2(qs+16, qh+2, values+2);
                 sh.sign_4_values(signs+0, values+0);
                 helper.make2(qs+32, qh+4, values+4);
                 helper.make2(qs+48, qh+6, values+6);
                 sh.sign_4_values(signs+8, values+4);
+                }
                 for (int ib32 = 0; ib32 < 8; ++ib32) {
                     ls[2*ib32 + 0] = (2*((x8[k][i].scales[ib32/2] >> 4*(ib32%2)) & 0xf) + 1);
                     ls[2*ib32 + 1] = ls[2*ib32 + 0];
@@ -3406,6 +3470,12 @@ bool iqk_set_kernels_iquants(int ne00, int typeA, int typeB, std::array<mul_mat_
             set_functions<DequantizerIQ3XXS>(kernels);
             break;
         case GGML_TYPE_IQ3_S:
+#ifdef HAVE_FANCY_SIMD
+            {
+                static const bool z6_gather = [] { const char * e = getenv("GGML_Z6_IQ3S_GATHER"); return e && strcmp(e, "1") == 0; }();
+                if (z6_gather) { set_functions<DequantizerIQ3SZ6>(kernels); break; }
+            }
+#endif
             set_functions<DequantizerIQ3S>(kernels);
             break;
         case GGML_TYPE_IQ2_XXS_R4:
