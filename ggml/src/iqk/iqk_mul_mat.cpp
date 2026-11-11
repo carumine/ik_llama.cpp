@@ -280,6 +280,12 @@ struct MulMat {
         }
     }
     static bool prepare(int typeA, int typeB, int ne00, MulMat& mm, int Ny);
+    // Z6, GGML_Z6_IQ3S_CONV_MIN=<columns>: from how many columns IQ3_S is converted to Q8_K_R16 instead of using
+    // the direct kernel. Default 32, as before. The converted path rounds differently: logits change.
+    static inline int z6_iq3s_conv_min() {
+        static const int n = [] { const char * e = getenv("GGML_Z6_IQ3S_CONV_MIN"); int v = e ? atoi(e) : 32; return v >= 8 ? v : 32; }();
+        return n;
+    }
     static inline ggml_type is_dequant_better(ggml_type type, int nrc_y) {
         if (type == GGML_TYPE_F8_E4M3_KS) return nrc_y >= 32 ? GGML_TYPE_BF16 : type;
 #if defined __AVX2__ && !defined __AVX512F__
@@ -304,7 +310,7 @@ struct MulMat {
             case GGML_TYPE_IQ3_XXS_R4: return nrc_y >= 32 ? q8_k_type : type;
             case GGML_TYPE_IQ4_XS : return nrc_y >= k_min_nrc_y ? q8_k_type : type;
             case GGML_TYPE_IQ4_XS_R8: return nrc_y >= 32 ? q8_k_type : type;
-            case GGML_TYPE_IQ3_S  : return nrc_y >= 32 ? q8_k_type : type;
+            case GGML_TYPE_IQ3_S  : return nrc_y >= z6_iq3s_conv_min() ? q8_k_type : type;
             case GGML_TYPE_IQ3_S_R4: return nrc_y >= 32 ? q8_k_type : type;
             case GGML_TYPE_IQ1_S  : return nrc_y >= 32 ? q8_k_type : type;
             case GGML_TYPE_IQ1_M  : return nrc_y >= 32 ? q8_k_type : type;
