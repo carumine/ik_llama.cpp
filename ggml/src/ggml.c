@@ -19316,10 +19316,29 @@ static int z6_locale_valido(const struct ggml_cplan * cplan, int nth) {
     return 1;
 }
 
+// GGML_Z6_LOCALE_RIGHE=<N> (8-16, default 8): righe massime del percorso locale. Con bozze da 8 token il
+// verificatore manda 9 righe (bozza più token corrente), che con 8 passano dal percorso generico. Stesse
+// funzioni iqk con lo stesso numero di token per esperto e la stessa conversione riga per riga: stessi numeri.
+static int z6_locale_righe(void) {
+    static int v = 0;
+    if (v == 0) {
+        const char * e = getenv("GGML_Z6_LOCALE_RIGHE");
+        int n = e ? atoi(e) : 8;
+        if (n < 8 || n > 16) {
+            fprintf(stderr, "z6: GGML_Z6_LOCALE_RIGHE=%s fuori da 8-16, uso 8\n", e);
+            n = 8;
+        }
+        v = n;
+    }
+    return v;
+}
+
 static bool z6_prepara_locale(const struct ggml_compute_params * params, const struct ggml_tensor * src1,
         const struct ggml_tensor * ids, enum ggml_type vec_dot_type, int n_as,
         const char ** B, int64_t ** conteggi, struct z6_mmid ** righe) {
-    if (!params->shared->z6_locale || ids->ne[1] > 8 || src1->ne[3] != 1 || n_as > 512) return false;
+    if (!params->shared->z6_locale || ids->ne[1] > z6_locale_righe() || src1->ne[3] != 1 || n_as > 512) return false;
+    // fatta[512] in z6_converti_righe e map[n_as*ne12]: con 16 righe e 10 esperti per token servono 160 voci
+    if (src1->ne[1]*src1->ne[2] > 512) return false;
     const int64_t ne10 = src1->ne[0], ne11 = src1->ne[1], ne12 = src1->ne[2];
     const size_t nbw1 = ggml_row_size(vec_dot_type, ne10);
     const size_t conv = src1->type == vec_dot_type ? 0 : GGML_PAD(nbw1*ne11*ne12, 64);
