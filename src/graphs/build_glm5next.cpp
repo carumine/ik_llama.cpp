@@ -636,6 +636,27 @@ ggml_cgraph * llm_build_context::build_glm5next() {
                     LLM_FFN_SILU, LLM_FFN_PAR, cb, il);
         } else {
             // MoE: routed experts (add_input=false, mHC owns the residual) + shared expert
+            // Z6 (GGML_Z6_SHEXP_PARALLELO=1): with the hot experts in parallel the shared expert, which depends only
+            // on the layer input, is built inside llm_build_moe_ffn in the GPU piece that runs while the CPU does
+            // the cold experts, instead of after them. Same nodes and same order of the sums: (hot + cold) + shared.
+            static const bool z6_shexp_parallelo = [] {
+                const char * e = getenv("GGML_Z6_SHEXP_PARALLELO");
+                return e && atoi(e) > 0;
+            }();
+            lctx.z6_shexp_fatto = false;
+            if (z6_shexp_parallelo && model.layers[il].ffn_up_shexp && model.layers[il].ffn_gate_shexp &&
+                    model.layers[il].ffn_down_shexp && !model.layers[il].ffn_up_shexp->extra) {
+                lctx.z6_shexp = [&, il](ggml_tensor * x) {
+                    ggml_tensor * shared = llm_build_ffn(ctx0, lctx, nullptr, x,
+                            model.layers[il].ffn_up_shexp,   nullptr, nullptr,
+                            model.layers[il].ffn_gate_shexp, nullptr, nullptr,
+                            model.layers[il].ffn_down_shexp, nullptr, nullptr,
+                            nullptr,
+                            LLM_FFN_SILU, LLM_FFN_PAR, cb, il);
+                    cb(shared, "ffn_shexp", il);
+                    return shared;
+                };
+            }
             auto moe_out = llm_build_moe_ffn(ctx0, lctx, cur,
                         model.layers[il].ffn_gate_inp, nullptr,
                         model.layers[il].ffn_up_exps, nullptr,
@@ -647,19 +668,26 @@ ggml_cgraph * llm_build_context::build_glm5next() {
                         true, hparams.expert_weights_scale,
                         (llm_expert_gating_func_type) hparams.expert_gating_func,
                         cb, il, gf, false, model.layers[il].ffn_up_gate_exps, nullptr, nullptr, nullptr, nullptr);
+            lctx.z6_shexp = nullptr;
+            const bool z6_shexp_incluso = lctx.z6_shexp_fatto;
+            lctx.z6_shexp_fatto = false;
             ggml_build_forward_expand(gf, moe_out);
             cb(moe_out, "ffn_moe_out", il);
 
-            ggml_tensor * ffn_shexp = llm_build_ffn(ctx0, lctx, nullptr, cur,
-                    model.layers[il].ffn_up_shexp,   nullptr, nullptr,
-                    model.layers[il].ffn_gate_shexp, nullptr, nullptr,
-                    model.layers[il].ffn_down_shexp, nullptr, nullptr,
-                    nullptr,
-                    LLM_FFN_SILU, LLM_FFN_PAR, cb, il);
-            cb(ffn_shexp, "ffn_shexp", il);
+            if (z6_shexp_incluso) {
+                cur = moe_out;
+            } else {
+                ggml_tensor * ffn_shexp = llm_build_ffn(ctx0, lctx, nullptr, cur,
+                        model.layers[il].ffn_up_shexp,   nullptr, nullptr,
+                        model.layers[il].ffn_gate_shexp, nullptr, nullptr,
+                        model.layers[il].ffn_down_shexp, nullptr, nullptr,
+                        nullptr,
+                        LLM_FFN_SILU, LLM_FFN_PAR, cb, il);
+                cb(ffn_shexp, "ffn_shexp", il);
 
-            cur = ggml_add(ctx0, moe_out, ffn_shexp);
-            ggml_build_forward_expand(gf, cur);
+                cur = ggml_add(ctx0, moe_out, ffn_shexp);
+                ggml_build_forward_expand(gf, cur);
+            }
         }
         cb(cur, "ffn_out", il);
 
