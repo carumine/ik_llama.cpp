@@ -1214,6 +1214,21 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
         .nrows                    = 1,
         .row_meta_size            = 0,
     },
+    // Z6 (GGML_Z6_IQ3S_LUT=1): IQ3_S with 4 bits per weight, made by the loader for the experts kept in RAM.
+    // Not a file type: no quantization from float, and no backend other than the CPU accepts it.
+    [GGML_TYPE_IQ3_S_Z6] = {
+        .type_name                = "iq3_s_z6",
+        .blck_size                = QK_K,
+        .type_size                = sizeof(block_iq3_s_z6),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_iq3_s_z6,
+        .from_float               = NULL,
+        .from_float_ref           = NULL,
+        .vec_dot                  = ggml_vec_dot_iq3_s_z6_q8_K,
+        .vec_dot_type             = GGML_TYPE_Q8_K,
+        .nrows                    = 1,
+        .row_meta_size            = 0,
+    },
     [GGML_TYPE_IQ3_S_R4] = {
         .type_name                = "iq3_s_r4",
         .blck_size                = QK_K,
@@ -19548,6 +19563,25 @@ static int z6_row_split(int64_t rows) {
     return (int) MAX(MIN(r, rows - 32), 32);
 }
 
+// GGML_Z6_NUMA_SPLIT_DOWN=<quota>: quota of the rows of the down experts on node 0, when it must differ from
+// GGML_Z6_NUMA_SPLIT. A memory lever: with the IQ3_S experts reordered (GGML_Z6_IQ3S_LUT, +22% of bytes) node 0,
+// which also holds the rest of the server and of the system, fills first; a lower quota moves rows of the down
+// experts to node 1. The down has no activation and every row is a dot product on its own, so the numbers do not
+// depend on the split; the socket with the larger share finishes the down later. Unset: the common quota, as before.
+static int z6_row_split_t(const struct ggml_tensor * t, int64_t rows) {
+    static float quota = -2.0f;
+    if (quota < -1.0f) {
+        const char * e = getenv("GGML_Z6_NUMA_SPLIT_DOWN");
+        const float v = e ? (float) atof(e) : -1.0f;
+        quota = v > 0.0f && v < 1.0f ? v : -1.0f;
+    }
+    if (quota > 0.0f && t && strstr(t->name, "ffn_down_exps")) {
+        const int64_t r = (int64_t) (quota * rows / 32.0f + 0.5f) * 32;
+        return (int) MAX(MIN(r, rows - 32), 32);
+    }
+    return z6_row_split(rows);
+}
+
 #if defined(__gnu_linux__)
 static bool z6_mbind(const struct ggml_tensor * t, uintptr_t a, uintptr_t b, int nodo) {
     if (b <= a) return true;
@@ -19570,7 +19604,7 @@ bool ggml_z6_numa_place_tensor(const struct ggml_tensor * t) {
     const int n_as = (int) t->ne[2];
     if (z6_options.rows && t->ne[1] >= 64) {
         // Confini arrotondati alla pagina più vicina: al più mezza pagina per confine resta remota.
-        const int r = z6_row_split(t->ne[1]);
+        const int r = z6_row_split_t(t, t->ne[1]);
         const uintptr_t base = (uintptr_t) t->data;
         const uintptr_t fine = base + (uintptr_t) n_as * t->nb[2];
         uintptr_t prima = (base + pagina - 1) & ~(pagina - 1);
@@ -19608,6 +19642,51 @@ bool ggml_z6_numa_place_tensor(const struct ggml_tensor * t) {
     return true;
 }
 
+// Z6 (GGML_Z6_IQ3S_LUT=1): the IQ3_S experts that stay in RAM are stored as GGML_TYPE_IQ3_S_Z6, 4 bits per weight
+// (134 bytes per block of 256 weights instead of 110). The single-column kernel of generation then decodes 64 weights
+// with one load and two vpshufb instead of 16 gathered grid entries. Magnitudes, signs, scales and summation order
+// are those of IQ3_S: every kernel returns the same floats. Needs the iqk kernels built with AVX512 (HAVE_FANCY_SIMD).
+bool ggml_z6_iq3s_lut_requested(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char * e = getenv("GGML_Z6_IQ3S_LUT");
+        int on = e && atoi(e) > 0;
+#if !(GGML_USE_IQK_MULMAT && defined(HAVE_FANCY_SIMD))
+        if (on) {
+            fprintf(stderr, "z6: GGML_Z6_IQ3S_LUT ignored: this build has no AVX512 iqk kernels for the reordered type\n");
+            on = 0;
+        }
+#endif
+        if (on && !iq3s_z6_prepare()) {
+            fprintf(stderr, "z6: GGML_Z6_IQ3S_LUT ignored: the IQ3_S grid is not invertible\n");
+            on = 0;
+        }
+        v = on;
+    }
+    return v;
+}
+
+// layer, as with GGML_Z6_IQ3S_LUT=1 alone. Up, gate and down of a layer share the choice. A malformed list selects
+// Before allocation only: the block grows from 110 to 134 bytes, so the strides and the buffer size change.
+bool ggml_z6_iq3s_lut_retype(struct ggml_tensor * t) {
+    if (!t || t->type != GGML_TYPE_IQ3_S || t->data || t->buffer || t->view_src || t->ne[0] % QK_K != 0) return false;
+    t->type  = GGML_TYPE_IQ3_S_Z6;
+    t->nb[0] = ggml_type_size(t->type);
+    t->nb[1] = ggml_row_size(t->type, t->ne[0]);
+    for (int i = 2; i < GGML_MAX_DIMS; i++) {
+        t->nb[i] = t->nb[i - 1]*t->ne[i - 1];
+    }
+    return true;
+}
+
+bool ggml_z6_iq3s_lut_from_iq3s(const void * src, void * dst, int64_t n_blocks) {
+    return iq3s_z6_from_iq3s((const block_iq3_s *) src, (block_iq3_s_z6 *) dst, n_blocks);
+}
+
+bool ggml_z6_iq3s_lut_to_iq3s(const void * src, void * dst, int64_t n_blocks) {
+    return iq3s_z6_to_iq3s((const block_iq3_s_z6 *) src, (block_iq3_s *) dst, n_blocks);
+}
+
 // Legacy non-pinned experiments place lazily. Pinned weights were placed by the loader.
 static void z6_place_experts(const struct ggml_tensor * t) {
     if (z6_options.pinned) return;
@@ -19640,11 +19719,45 @@ static int z6_esperti_attivi(const int64_t * conteggi, int n_as, int q, int * at
     return n;
 }
 
+// GGML_Z6_PP_FURTO=1, nei batch con la divisione per righe: finite le parti della coda del proprio socket un thread
+// continua con quelle dell'altro, lette da remoto. Nel prefill il tempo segue il calcolo e non la banda, e in up/gate
+// un socket finisce prima dell'altro (56,8 contro 65,3 ms a livello su GLM) e lo aspetta alla barriera. Le parti e le
+// chiamate restano le stesse, cambia solo chi le esegue: stessi numeri. Serve una coda con più parti dei thread
+// (GGML_Z6_BATCH_CHUNKS), altrimenti non resta niente da rubare.
+static int z6_pp_furto(void) {
+    static int v = -1;
+    if (v < 0) { const char * e = getenv("GGML_Z6_PP_FURTO"); v = e ? atoi(e) > 0 : 0; }
+    return v;
+}
+// GGML_Z6_PP_ORDINE=1, nei batch con la divisione per righe: gli esperti attivi vanno in coda dal più carico di token
+// al meno carico, invece che per indice. Le ultime parti della coda sono così le più corte e l'attesa di fine
+// operazione (un thread ancora dentro una parte lunga mentre gli altri hanno finito) si accorcia. Ogni riga resta
+// calcolata una volta, in segmenti multipli di 16 righe come prima: stessi numeri.
+static int z6_pp_ordine(void) {
+    static int v = -1;
+    if (v < 0) { const char * e = getenv("GGML_Z6_PP_ORDINE"); v = e ? atoi(e) > 0 : 0; }
+    return v;
+}
+static int z6_pp_ordine_cmp(const void * a, const void * b) {
+    const int64_t x = *(const int64_t *) a, y = *(const int64_t *) b;
+    return x < y ? 1 : x > y ? -1 : 0;
+}
+// Stesso ordine per tutti i thread: dipende solo dai conteggi. A parità di token vince l'indice più basso.
+static void z6_pp_ordina(const int64_t * conteggi, int * att, int n) {
+    if (!z6_pp_ordine() || n < 2) return;
+    int64_t chiave[512];
+    for (int i = 0; i < n; ++i) chiave[i] = conteggi[att[i]] * 1024 + (1023 - att[i]);
+    qsort(chiave, n, sizeof(chiave[0]), z6_pp_ordine_cmp);
+    for (int i = 0; i < n; ++i) att[i] = 1023 - (int) (chiave[i] % 1024);
+}
+// parti prese dalla coda dell'altro socket, up/gate (0) e down (1): le stampa GGML_Z6_PP_TEMPI=1
+static atomic_llong z6_pp_rubate[2];
+
 // Divisione per righe: il nodo q calcola le righe [*lo, *hi) di ogni esperto attivo. Il lavoro è
 // in unità da 16 righe (il blocco più grande dei tipi iqk) messe in fila su tutti gli esperti: ogni
 // thread del socket prende con un solo fetch_add una parte uguale, che può attraversare più esperti.
-static int z6_row_range(int64_t rows, int q, int nth, int * lo, int * hi) {
-    const int r = z6_row_split(rows);
+static int z6_row_range(const struct ggml_tensor * t, int64_t rows, int q, int nth, int * lo, int * hi) {
+    const int r = z6_row_split_t(t, rows);
     *lo = q ? r : 0;
     *hi = q ? (int) rows : r;
     return MAX(1, z6_options.chunks > 0 ? z6_options.chunks : nth / 2);
@@ -19654,8 +19767,8 @@ static int z6_row_range(int64_t rows, int q, int nth, int * lo, int * hi) {
 // molti token e il tempo segue il calcolo, non la banda: con la quota scelta per la banda il socket 1
 // finisce prima e aspetta. Qui il nodo 0 calcola solo [0, quota·righe); le righe in più del socket 1
 // restano sul nodo 0 e lui le legge da remoto. Ogni riga resta calcolata da un solo thread, come prima.
-static int z6_row_range_batch(int64_t rows, int q, int nth, int64_t n_tok, int * lo, int * hi) {
-    const int parti = z6_row_range(rows, q, nth, lo, hi);
+static int z6_row_range_batch(const struct ggml_tensor * t, int64_t rows, int q, int nth, int64_t n_tok, int * lo, int * hi) {
+    const int parti = z6_row_range(t, rows, q, nth, lo, hi);
     if (z6_options.pp_split > 0.0f && n_tok >= z6_options.pp_split_min) {
         const int64_t r = MAX(MIN((int64_t) (z6_options.pp_split * rows / 32.0f + 0.5f) * 32, rows - 32), 32);
         *lo = q ? (int) r : 0;
@@ -19855,6 +19968,63 @@ static int z6_principale_libero(int ith) {
     return v && ith == 0;
 }
 
+// GGML_Z6_FREDDI_CODA_RIGHE=<n> (default 1): la coda vale anche per i batch fino a n token, cioè per le verifiche delle
+// bozze (2 token con MTP n_max=1). Sopra un token l'unità resta di 16 righe: ogni segmento è multiplo di 16, quindi
+// l'attivazione passa sempre dal ramo a 512 bit, come senza coda: stessi numeri.
+static int z6_freddi_coda_righe(void) {
+    static int v = -1;
+    if (v < 0) { const char * e = getenv("GGML_Z6_FREDDI_CODA_RIGHE"); v = e ? atoi(e) : 1; if (v < 1) v = 1; }
+    return v;
+}
+// GGML_Z6_FREDDI_CODA_RIF=<r>, con un token e GGML_Z6_FREDDI_CODA multiplo di r: i numeri restano quelli della coda r.
+// In up/gate l'attivazione di un segmento va a 512 bit per i blocchi interi da 16 righe e a 256 bit per le 8 di resto,
+// e i due rami arrotondano l'esponenziale in modo diverso: cambiare le parti cambia quali righe finiscono nel resto,
+// quindi i logit. Qui le parti fini sono tagli delle parti della coda r a blocchi da 16 righe contati dall'inizio di
+// ogni segmento, col resto attaccato all'ultimo blocco: ogni riga passa dallo stesso ramo che avrebbe con la coda r.
+// Il down non ha attivazione: lì ogni riga è già indipendente dalle parti.
+static int z6_freddi_coda_rif(int coda) {
+    static int v = -1;
+    if (v < 0) {
+        const char * e = getenv("GGML_Z6_FREDDI_CODA_RIF");
+        v = e ? atoi(e) : 0;
+        if (v < 0) v = 0;
+        if (v > 0 && (coda <= v || coda % v != 0)) {
+            fprintf(stderr, "z6: GGML_Z6_FREDDI_CODA_RIF=%d ignorata: GGML_Z6_FREDDI_CODA=%d deve esserne un multiplo maggiore\n", v, coda);
+            v = 0;
+        }
+    }
+    return v;
+}
+// GGML_Z6_FREDDI_CODA_FURTO=1, con la coda: finite le parti del proprio socket un thread continua con quelle
+// dell'altro, lette da remoto. Col thread principale libero il socket 0 ha un thread in meno e finisce dopo: senza
+// furto l'altro socket lo aspetta alla barriera. Le parti e le chiamate restano le stesse: stessi numeri.
+static int z6_freddi_coda_furto(void) {
+    static int v = -1;
+    if (v < 0) { const char * e = getenv("GGML_Z6_FREDDI_CODA_FURTO"); v = e ? atoi(e) > 0 : 0; }
+    return v;
+}
+// Parte fine c di n_rif*sub: la parte c/sub della coda di riferimento, tagliata in sub pezzi a blocchi da 16 righe
+static int z6_row_part_rif(const int * att, int n_att, int lo, int hi, int c, int n_rif, int sub, int unit, struct z6_seg * seg) {
+    struct z6_seg rif[512];
+    const int k_rif = z6_row_part(att, n_att, lo, hi, c / sub, n_rif, unit, rif);
+    int blocchi = 0;
+    for (int i = 0; i < k_rif; ++i) blocchi += MAX(1, rif[i].n / 16);
+    const int s = c % sub;
+    const int b0 = (int) ((int64_t) blocchi * s / sub), b1 = (int) ((int64_t) blocchi * (s + 1) / sub);
+    int k = 0, base = 0;
+    for (int i = 0; i < k_rif; ++i) {
+        const int nb = MAX(1, rif[i].n / 16);
+        const int da = MAX(b0, base) - base, a = MIN(b1, base + nb) - base;
+        if (a > da) {
+            // l'ultimo blocco del segmento porta con sé le righe di resto
+            const int fine = a == nb ? rif[i].n : a * 16;
+            seg[k++] = (struct z6_seg) { rif[i].a, rif[i].r + da * 16, fine - da * 16 };
+        }
+        base += nb;
+    }
+    return k;
+}
+
 // Medium prompts use the shared queue, not the <=8-token local path.
 // Flatten all input rows so ne11=1 (up/gate) does not serialize quantization.
 static bool z6_batch_medio(const struct ggml_tensor * ids) {
@@ -19881,7 +20051,7 @@ static void z6_batch_converti(const struct ggml_compute_params * params, const s
 static struct z6_pre_livello {
     const char * base[3];
     size_t passo[3], riga[3];
-    int righe[3], n, att[16];
+    int righe[3], taglio[3], n, att[16];
 } z6_pre[Z6_PRE_LIVELLI];
 static atomic_int z6_pre_gen = 0;  // dispari: prelettura in corso
 static atomic_int z6_pre_liv = 0;
@@ -19922,7 +20092,7 @@ static void * z6_pre_lavoro(void * arg) {
         for (int e = 0; e < l->n; ++e) {
             for (int w = 0; w < 3; ++w) {
                 if (!l->base[w]) continue;
-                const int r = z6_row_split(l->righe[w]);
+                const int r = l->taglio[w];
                 const int lo = q ? r : 0, hi = q ? l->righe[w] : r;
                 const int a = lo + (int) ((int64_t) (hi - lo) * loc / n), b = lo + (int) ((int64_t) (hi - lo) * (loc + 1) / n);
                 const char * p = l->base[w] + l->att[e] * l->passo[w] + a * l->riga[w];
@@ -19967,7 +20137,7 @@ static void z6_pre_su(const struct ggml_tensor * up, const struct ggml_tensor * 
     const struct ggml_tensor * ws[2] = { up, gate };
     for (int w = 0; w < 2; ++w) {
         l->base[w] = ws[w] ? (const char *) ws[w]->data : NULL;
-        if (ws[w]) { l->passo[w] = ws[w]->nb[2]; l->riga[w] = ws[w]->nb[1]; l->righe[w] = (int) ws[w]->ne[1]; }
+        if (ws[w]) { l->passo[w] = ws[w]->nb[2]; l->riga[w] = ws[w]->nb[1]; l->righe[w] = (int) ws[w]->ne[1]; l->taglio[w] = z6_row_split_t(ws[w], ws[w]->ne[1]); }
     }
     int n = 0;
     for (int a = 0; a < n_as && n < 16; ++a) if (cnt[a] > 0) l->att[n++] = a;
@@ -19979,6 +20149,7 @@ static void z6_pre_giu(const struct ggml_tensor * down) {
     if (i < 0) return;
     struct z6_pre_livello * l = &z6_pre[i];
     l->base[2] = (const char *) down->data; l->passo[2] = down->nb[2]; l->riga[2] = down->nb[1]; l->righe[2] = (int) down->ne[1];
+    l->taglio[2] = z6_row_split_t(down, down->ne[1]);
     const int prossimo = i + 1 < Z6_PRE_LIVELLI && z6_pre[i + 1].n > 0 ? i + 1 : 0;
     atomic_store_explicit(&z6_pre_liv, prossimo, memory_order_relaxed);
     if (!(atomic_load_explicit(&z6_pre_gen, memory_order_relaxed) & 1)) atomic_fetch_add(&z6_pre_gen, 1);
@@ -20034,18 +20205,22 @@ static void ggml_compute_forward_mul_mat_id(
             int att[512];
             const int mio = ith >= nth / 2, loc = ith % (nth / 2);
             int lo, hi;
-            z6_row_range(ne01, mio, nth, &lo, &hi);
+            z6_row_range(src0, ne01, mio, nth, &lo, &hi);
             const int n_att = z6_esperti_attivi(cnt, n_as, mio, att);
             struct z6_seg seg[512];
-            const int coda = ids->ne[1] == 1 ? z6_freddi_coda() : 0, parti = coda ? coda * (nth / 2) : nth / 2;
+            const int coda = ids->ne[1] <= z6_freddi_coda_righe() ? z6_freddi_coda() : 0, parti = coda ? coda * (nth / 2) : nth / 2;
             char fatta[512] = {0};
             if (coda && z6_principale_libero(ith)) {
                 if (ids->ne[1] == 1 && z6_pre_thread() > 0) z6_pre_giu(src0);
                 return;
             }
-            for (int c = coda ? atomic_fetch_add_explicit(&params->shared->z6_coda_giu[mio].value, 1, memory_order_relaxed) : loc;
+            // secondo giro (GGML_Z6_FREDDI_CODA_FURTO): le parti rimaste nella coda dell'altro socket
+            for (int giro = 0; giro < (coda && z6_freddi_coda_furto() ? 2 : 1); ++giro) {
+            const int q = giro ? !mio : mio;
+            if (giro) z6_row_range(src0, ne01, q, nth, &lo, &hi);
+            for (int c = coda ? atomic_fetch_add_explicit(&params->shared->z6_coda_giu[q].value, 1, memory_order_relaxed) : loc;
                  c < parti;
-                 c = coda ? atomic_fetch_add_explicit(&params->shared->z6_coda_giu[mio].value, 1, memory_order_relaxed) : parti) {
+                 c = coda ? atomic_fetch_add_explicit(&params->shared->z6_coda_giu[q].value, 1, memory_order_relaxed) : parti) {
             const int k = z6_row_part(att, n_att, lo, hi, c, parti, ids->ne[1] == 1 ? z6_options.unit : 16, seg);
             z6_converti_righe(src1, vec_dot_type, B, cnt, map, seg, k, fatta);
             for (int i = 0; i < k; ++i) {
@@ -20055,6 +20230,7 @@ static void ggml_compute_forward_mul_mat_id(
                             vec_dot_type, B, ggml_row_size(vec_dot_type, ne10),
                             (float *)dst->data + seg[i].r, nb1, nb2,
                             map + cur_a*ne12, 0, 1)) GGML_ABORT("z6: iqk_mul_mat_moe non disponibile");
+            }
             }
             }
             if (ith == 0 && ids->ne[1] == 1 && z6_pre_thread() > 0) z6_pre_giu(src0);
@@ -20158,13 +20334,20 @@ static void ggml_compute_forward_mul_mat_id(
             const int mio = z6_thread_node();
             if (z6_options.rows && ne01 >= 64) {
                 int lo, hi;
-                const int original_parts = z6_row_range_batch(ne01, mio, nth, ids->ne[1], &lo, &hi);
+                const int original_parts = z6_row_range_batch(src0, ne01, mio, nth, ids->ne[1], &lo, &hi);
                 const int parti = z6_options.batch_chunks > 0 && z6_batch_medio(ids) ? z6_options.batch_chunks : original_parts;
                 const int n_att = z6_esperti_attivi(matrix_row_counts, n_as, mio, att);
                 struct z6_seg seg[512];
+                z6_pp_ordina(matrix_row_counts, att, n_att);
+                // secondo giro (GGML_Z6_PP_FURTO): le parti rimaste nella coda dell'altro socket, cioè le righe
+                // dall'altra parte del taglio di questo
+                for (int giro = 0; giro < (z6_pp_furto() ? 2 : 1); ++giro) {
+                const int q = giro ? !mio : mio;
+                if (giro) { const int taglio = mio ? lo : hi; lo = q ? taglio : 0; hi = q ? (int) ne01 : taglio; }
                 for (;;) {
-                    const int c = atomic_fetch_add(z6_queue(params->shared, mio), 1);
+                    const int c = atomic_fetch_add(z6_queue(params->shared, q), 1);
                     if (c >= parti) break;
+                    if (giro && z6_pp_tempi()) atomic_fetch_add_explicit(&z6_pp_rubate[1], 1, memory_order_relaxed);
                     const int k = z6_row_part(att, n_att, lo, hi, c, parti, 16, seg);
                     for (int i = 0; i < k; ++i) {
                         const int cur_a = seg[i].a;
@@ -20175,6 +20358,7 @@ static void ggml_compute_forward_mul_mat_id(
                                     (float *)dst->data + seg[i].r, nb1, nb2,
                                     matrix_rows + cur_a*ne12, 0, 1)) GGML_ABORT("z6: iqk_mul_mat_moe non disponibile");
                     }
+                }
                 }
                 return;
             }
@@ -20496,18 +20680,25 @@ static void ggml_compute_forward_mul_mat_id_up_gate(
             int att[512];
             const int mio = ith >= nth / 2, loc = ith % (nth / 2);
             int lo, hi;
-            z6_row_range(nr0, mio, nth, &lo, &hi);
+            z6_row_range(NULL, nr0, mio, nth, &lo, &hi);
             const int n_att = z6_esperti_attivi(cnt, n_as, mio, att);
             struct z6_seg seg[512];
-            const int coda = ids->ne[1] == 1 ? z6_freddi_coda() : 0, parti = coda ? coda * (nth / 2) : nth / 2;
+            const int coda = ids->ne[1] <= z6_freddi_coda_righe() ? z6_freddi_coda() : 0, parti = coda ? coda * (nth / 2) : nth / 2;
+            // numeri della coda di riferimento (GGML_Z6_FREDDI_CODA_RIF) con le parti fini: solo con un token
+            const int rif = coda && ids->ne[1] == 1 ? z6_freddi_coda_rif(coda) : 0;
             char fatta[512] = {0};
             if (coda && z6_principale_libero(ith)) {
                 return;
             }
-            for (int c = coda ? atomic_fetch_add_explicit(&params->shared->z6_coda_su[mio].value, 1, memory_order_relaxed) : loc;
+            // secondo giro (GGML_Z6_FREDDI_CODA_FURTO): le parti rimaste nella coda dell'altro socket
+            for (int giro = 0; giro < (coda && z6_freddi_coda_furto() ? 2 : 1); ++giro) {
+            const int q = giro ? !mio : mio;
+            if (giro) z6_row_range(NULL, nr0, q, nth, &lo, &hi);
+            for (int c = coda ? atomic_fetch_add_explicit(&params->shared->z6_coda_su[q].value, 1, memory_order_relaxed) : loc;
                  c < parti;
-                 c = coda ? atomic_fetch_add_explicit(&params->shared->z6_coda_su[mio].value, 1, memory_order_relaxed) : parti) {
-            const int k = z6_row_part(att, n_att, lo, hi, c, parti, ids->ne[1] == 1 ? z6_options.unit : 16, seg);
+                 c = coda ? atomic_fetch_add_explicit(&params->shared->z6_coda_su[q].value, 1, memory_order_relaxed) : parti) {
+            const int k = rif ? z6_row_part_rif(att, n_att, lo, hi, c, rif * (nth / 2), coda / rif, z6_options.unit, seg)
+                              : z6_row_part(att, n_att, lo, hi, c, parti, ids->ne[1] == 1 ? z6_options.unit : 16, seg);
             z6_converti_righe(src1, vec_dot_type, B, cnt, map, seg, k, fatta);
             for (int i = 0; i < k; ++i) {
                 const int cur_a = seg[i].a, r = seg[i].r;
@@ -20520,6 +20711,7 @@ static void ggml_compute_forward_mul_mat_id_up_gate(
                                     up_b_cur, gate_b_cur,
                                     (float *)dst->data + r, nb1, nb2,
                                     map + cur_a*ne12, limit, *(const float *)(dst->op_params + 2), *(const float *)(dst->op_params + 3), 0, 1)) GGML_ABORT("fatal error");
+            }
             }
             }
             return;
@@ -20631,13 +20823,20 @@ static void ggml_compute_forward_mul_mat_id_up_gate(
         const int mio = z6_thread_node();
         if (z6_options.rows && src0_2 && nr0_base >= 64) {
             int lo, hi;
-            const int original_parts = z6_row_range_batch(nr0_base, mio, nth, ids->ne[1], &lo, &hi);
+            const int original_parts = z6_row_range_batch(NULL, nr0_base, mio, nth, ids->ne[1], &lo, &hi);
             const int parti = z6_options.batch_chunks > 0 && z6_batch_medio(ids) ? z6_options.batch_chunks : original_parts;
             const int n_att = z6_esperti_attivi(matrix_row_counts, n_as, mio, att);
             struct z6_seg seg[512];
+            z6_pp_ordina(matrix_row_counts, att, n_att);
+            // secondo giro (GGML_Z6_PP_FURTO): le parti rimaste nella coda dell'altro socket, cioè le righe
+            // dall'altra parte del taglio di questo
+            for (int giro = 0; giro < (z6_pp_furto() ? 2 : 1); ++giro) {
+            const int q = giro ? !mio : mio;
+            if (giro) { const int taglio = mio ? lo : hi; lo = q ? taglio : 0; hi = q ? (int) nr0_base : taglio; }
             for (;;) {
-                const int c = atomic_fetch_add(z6_queue(params->shared, mio), 1);
+                const int c = atomic_fetch_add(z6_queue(params->shared, q), 1);
                 if (c >= parti) break;
+                if (giro && z6_pp_tempi()) atomic_fetch_add_explicit(&z6_pp_rubate[0], 1, memory_order_relaxed);
                 const int k = z6_row_part(att, n_att, lo, hi, c, parti, 16, seg);
                 for (int i = 0; i < k; ++i) {
                     const int cur_a = seg[i].a, r = seg[i].r;
@@ -20652,6 +20851,7 @@ static void ggml_compute_forward_mul_mat_id_up_gate(
                                         (float *)dst->data + r, nb1, nb2,
                                         matrix_rows + cur_a*ne12, limit, *(const float *)(dst->op_params + 2), *(const float *)(dst->op_params + 3), 0, 1)) GGML_ABORT("fatal error");
                 }
+            }
             }
             return;
         }
@@ -20790,6 +20990,222 @@ static void ggml_compute_forward_mul_mat_id_up_gate(
 #endif
 #undef MMID_MATRIX_ROW
 }
+
+#if defined GGML_EXPERT_CHUNKING
+// Z6 (GGML_Z6_PP_GEMELLI=1): due nodi consecutivi del grafo CPU che applicano gli stessi esperti a due lotti di token
+// diversi (i pezzi freddi dello stesso livello di due microbatch del prefill) si calcolano insieme: ogni tile di righe
+// di un esperto si converte una volta e si moltiplica per i token dei due lotti. A microbatch 1024 la conversione vale
+// circa metà del tempo CPU degli esperti freddi e ogni microbatch la rifà per quasi tutti gli esperti. La scelta fra
+// kernel diretto e conversione resta presa lotto per lotto, e la conversione è condivisa solo se la fanno tutti e due:
+// i numeri di ogni lotto sono quelli del suo nodo eseguito da solo. Vale solo con la divisione per righe
+// (GGML_Z6_NUMA_EXPERTS e GGML_Z6_NUMA_ROWS) e sopra 32 token per lotto; altrimenti i due nodi restano separati.
+static int z6_pp_gemelli(void) {
+    static int v = -1;
+    if (v < 0) { const char * e = getenv("GGML_Z6_PP_GEMELLI"); v = e ? atoi(e) > 0 : 0; }
+    return v;
+}
+// le stesse opzioni di GGML_Z6_PP_FURTO e GGML_Z6_PP_ORDINE, lette qui perché questa leva non dipenda dall'altra
+static int z6_gemelli_furto(void) {
+    static int v = -1;
+    if (v < 0) { const char * e = getenv("GGML_Z6_PP_FURTO"); v = e ? atoi(e) > 0 : 0; }
+    return v;
+}
+static int z6_gemelli_ordine_cmp(const void * a, const void * b) {
+    const int64_t x = *(const int64_t *) a, y = *(const int64_t *) b;
+    return x < y ? 1 : x > y ? -1 : 0;
+}
+static void z6_gemelli_ordina(const int64_t * conteggi, int * att, int n) {
+    static int v = -1;
+    if (v < 0) { const char * e = getenv("GGML_Z6_PP_ORDINE"); v = e ? atoi(e) > 0 : 0; }
+    if (!v || n < 2) return;
+    int64_t chiave[512];
+    for (int i = 0; i < n; ++i) chiave[i] = conteggi[att[i]] * 1024 + (1023 - att[i]);
+    qsort(chiave, n, sizeof(chiave[0]), z6_gemelli_ordine_cmp);
+    for (int i = 0; i < n; ++i) att[i] = 1023 - (int) (chiave[i] % 1024);
+}
+// coppie di nodi eseguite insieme, esperti convertiti una volta per i due lotti e in tutto: riga ogni 400 coppie
+static atomic_llong z6_gemelli_n, z6_gemelli_esperti[2];
+
+static bool z6_gemelli_validi(const struct ggml_compute_params * params, const struct ggml_tensor * a, const struct ggml_tensor * b) {
+    if (!z6_pp_gemelli() || !z6_numa_experts() || !z6_options.rows) return false;
+    if (a->op != b->op || (a->op != GGML_OP_MOE_FUSED_UP_GATE && a->op != GGML_OP_MUL_MAT_ID)) return false;
+    if (params->shared->cplan && params->shared->cplan->moe_expert_prefetch) return false;
+    const bool ug = a->op == GGML_OP_MOE_FUSED_UP_GATE;
+    const struct ggml_tensor * w  = a->src[0];
+    const struct ggml_tensor * a1 = ug ? a->src[2] : a->src[1], * b1 = ug ? b->src[2] : b->src[1];
+    const struct ggml_tensor * ai = ug ? a->src[3] : a->src[2], * bi = ug ? b->src[3] : b->src[2];
+    if (!w || w != b->src[0] || !a1 || !b1 || !ai || !bi || a1 == b1 || ai == bi || a->data == b->data) return false;
+    if (ug) {
+        // up e gate in due tensori, senza bias: il caso di GLM e di Qwen con i caldi
+        if (!a->src[1] || a->src[1] != b->src[1] || a->src[4] || a->src[5] || b->src[4] || b->src[5]) return false;
+        if (a->src[1]->type != w->type || !ggml_are_same_shape(a->src[1], w)) return false;
+        if (memcmp(a->op_params, b->op_params, sizeof(a->op_params)) != 0) return false;
+    }
+    // il secondo nodo non deve leggere il risultato del primo
+    for (int k = 0; k < GGML_MAX_SRC; ++k) if (b->src[k] == a) return false;
+    if (a->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32) return false;
+    if (w->ne[1] < 64 || w->ne[1] % 32 || w->ne[2] > 512 || w->ne[3] != 1) return false;
+    if (w->nb[0] != ggml_type_size(w->type)) return false;
+    if (ai->type != GGML_TYPE_I32 || bi->type != GGML_TYPE_I32) return false;
+    if (ai->ne[1] <= 32 || bi->ne[1] <= 32 || ai->ne[1] > 2048 || bi->ne[1] > 2048 || ai->ne[0] != bi->ne[0]) return false;
+    if (a1->type != b1->type || a1->ne[0] != b1->ne[0] || a1->ne[1] != b1->ne[1] || a1->ne[3] != 1 || b1->ne[3] != 1) return false;
+    if (a1->nb[0] != ggml_type_size(a1->type) || b1->nb[0] != ggml_type_size(b1->type)) return false;
+    const enum ggml_type vec_dot_type = type_traits[w->type].vec_dot_type;
+    if (a1->type != vec_dot_type && a1->type != GGML_TYPE_F32) return false;
+    if (a1->ne[2] != ai->ne[1] || b1->ne[2] != bi->ne[1]) return false;
+    if (a->ne[0] != b->ne[0] || a->ne[1] != b->ne[1] || a->nb[1] != b->nb[1] || a->nb[2] != b->nb[2]) return false;
+    if (a->ne[2] != ai->ne[1] || b->ne[2] != bi->ne[1] || a->ne[3] != 1 || b->ne[3] != 1) return false;
+    if (a->nb[0] != sizeof(float) || b->nb[0] != sizeof(float)) return false;
+    return true;
+}
+
+static void z6_forward_gemelli(const struct ggml_compute_params * params, struct ggml_tensor * da, struct ggml_tensor * db) {
+    struct ggml_tensor * dd[2] = { da, db };
+    const bool ug = da->op == GGML_OP_MOE_FUSED_UP_GATE;
+    const struct ggml_tensor * w1 = da->src[0];
+    const struct ggml_tensor * w2 = ug ? da->src[1] : NULL;
+    const int ith = params->ith, nth = params->nth;
+    const enum ggml_type type = w1->type;
+    const enum ggml_type vec_dot_type = type_traits[type].vec_dot_type;
+    ggml_from_float_t const from_float = type_traits[vec_dot_type].from_float;
+    const int64_t ne00 = w1->ne[0], ne01 = w1->ne[1];
+    const size_t nb01 = w1->nb[1], nb02 = w1->nb[2];
+    const int n_as = (int) w1->ne[2];
+
+    // buffer di lavoro: per ogni lotto ingresso convertito, conteggi e righe per esperto (ggml_graph_plan lo raddoppia)
+    const struct ggml_tensor * s1[2], * ids[2];
+    char * B[2];
+    int64_t * cnt[2];
+    struct z6_mmid * map[2];
+    char * p = (char *) params->wdata;
+    for (int k = 0; k < 2; ++k) {
+        s1[k]  = ug ? dd[k]->src[2] : dd[k]->src[1];
+        ids[k] = ug ? dd[k]->src[3] : dd[k]->src[2];
+        const size_t nbw1 = ggml_row_size(vec_dot_type, s1[k]->ne[0]);
+        const size_t conv = s1[k]->type == vec_dot_type ? 0 : GGML_PAD(nbw1*s1[k]->ne[1]*s1[k]->ne[2], 64);
+        B[k] = conv ? p : (char *) s1[k]->data;
+        p += conv;
+        cnt[k] = (int64_t *) p;
+        p += GGML_PAD(n_as*sizeof(int64_t), 64);
+        map[k] = (struct z6_mmid *) p;
+        p += GGML_PAD((size_t) n_as*s1[k]->ne[2]*sizeof(struct z6_mmid), 64);
+    }
+    GGML_ASSERT((size_t) (p - (char *) params->wdata) <= params->wsize);
+    const size_t row_size = ggml_row_size(vec_dot_type, s1[0]->ne[0]);
+
+    for (int k = 0; k < 2; ++k) {
+        // ingresso nel tipo del prodotto: righe contigue per thread, una riga dipende solo da sé stessa
+        if (s1[k]->type != vec_dot_type) {
+            const int64_t ne10 = s1[k]->ne[0], ne11 = s1[k]->ne[1], ne12 = s1[k]->ne[2];
+            const int64_t nr1 = ne11*ne12, dr1 = (nr1 + nth - 1)/nth;
+            for (int64_t ir1 = dr1*ith; ir1 < MIN(dr1*ith + dr1, nr1); ++ir1) {
+                const int64_t i12 = ir1/ne11, i11 = ir1 - i12*ne11;
+                from_float((const float *)((const char *) s1[k]->data + i12*s1[k]->nb[2] + i11*s1[k]->nb[1]),
+                           B[k] + ir1*row_size, ne10);
+            }
+        }
+        // SER: righe di esperti non attivati azzerate, come nel nodo da solo
+        const int n_ids = (int) ids[k]->ne[0];
+        for (int64_t iid1 = ith; iid1 < ids[k]->ne[1]; iid1 += nth) {
+            for (int id = 0; id < n_ids; ++id) {
+                const int32_t i02 = *(const int32_t *) ((const char *) ids[k]->data + iid1*ids[k]->nb[1] + id*ids[k]->nb[0]);
+                if (i02 < 0 || i02 >= n_as) memset((char *) dd[k]->data + id*dd[k]->nb[1] + iid1*dd[k]->nb[2], 0, dd[k]->ne[0]*sizeof(float));
+            }
+        }
+    }
+
+    if (ith == 0) {
+        for (int k = 0; k < 2; ++k) {
+            const int n_ids = (int) ids[k]->ne[0];
+            const int64_t ne12 = s1[k]->ne[2];
+            memset(cnt[k], 0, n_as*sizeof(int64_t));
+            for (int64_t iid1 = 0; iid1 < ids[k]->ne[1]; ++iid1) {
+                for (int id = 0; id < n_ids; ++id) {
+                    const int32_t i02 = *(const int32_t *) ((const char *) ids[k]->data + iid1*ids[k]->nb[1] + id*ids[k]->nb[0]);
+                    if (i02 < 0 || i02 >= n_as) continue;
+                    map[k][i02*ne12 + cnt[k][i02]] = (struct z6_mmid) { id, (int32_t) iid1 };
+                    cnt[k][i02] += 1;
+                }
+            }
+            if (ug) z6_conta_esperti(w1, cnt[k], n_as);
+        }
+        z6_place_experts(w1);
+        if (w2) z6_place_experts(w2);
+        atomic_store(z6_queue(params->shared, 0), 0);
+        atomic_store(z6_queue(params->shared, 1), 0);
+        // quanti esperti condividono la conversione: lo stesso criterio dei kernel (iqk_dequant_type per lotto)
+        long long comuni = 0, attivi = 0;
+        for (int a = 0; a < n_as; ++a) {
+            if (cnt[0][a] + cnt[1][a] == 0) continue;
+            ++attivi;
+            comuni += cnt[0][a] > 0 && cnt[1][a] > 0 && iqk_dequant_type(type, (int) cnt[0][a]) != (int) type &&
+                      iqk_dequant_type(type, (int) cnt[0][a]) == iqk_dequant_type(type, (int) cnt[1][a]);
+        }
+        atomic_fetch_add_explicit(&z6_gemelli_esperti[0], comuni, memory_order_relaxed);
+        atomic_fetch_add_explicit(&z6_gemelli_esperti[1], attivi, memory_order_relaxed);
+        if (atomic_fetch_add_explicit(&z6_gemelli_n, 1, memory_order_relaxed) % 400 == 399) {
+            const long long c = atomic_exchange_explicit(&z6_gemelli_esperti[0], 0, memory_order_relaxed);
+            const long long t = atomic_exchange_explicit(&z6_gemelli_esperti[1], 0, memory_order_relaxed);
+            fprintf(stderr, "z6 gemelli: 400 coppie di nodi, esperti attivi %.1f a coppia, conversione condivisa %.1f (%.1f%%)\n",
+                    t / 400.0, c / 400.0, t ? 100.0 * c / t : 0.0);
+        }
+    }
+
+    ggml_barrier(params->shared);
+
+    int64_t somma[512];
+    for (int a = 0; a < n_as; ++a) somma[a] = cnt[0][a] + cnt[1][a];
+    int att[512];
+    const int mio = z6_thread_node();
+    const int64_t n_tok = MAX(ids[0]->ne[1], ids[1]->ne[1]);
+    // il taglio dei batch: GGML_Z6_PP_SPLIT da GGML_Z6_PP_SPLIT_MIN token, altrimenti la quota comune. Il risultato non
+    // dipende dal taglio: decide solo quale socket calcola una riga.
+    const float quota = z6_options.pp_split > 0.0f && n_tok >= z6_options.pp_split_min ? z6_options.pp_split
+                                                                                       : (float) z6_split(1000) / 1000.0f;
+    const int taglio = (int) MAX(MIN((int64_t) (quota * ne01 / 32.0f + 0.5f) * 32, ne01 - 32), 32);
+    int lo = mio ? taglio : 0, hi = mio ? (int) ne01 : taglio;
+    // ogni parte porta il lavoro di due lotti: il doppio delle parti tiene la durata di una parte quella di prima
+    const int parti = z6_options.batch_chunks > 0 ? MIN(4096, 2*z6_options.batch_chunks)
+                                                  : MAX(1, z6_options.chunks > 0 ? z6_options.chunks : nth / 2);
+    const int n_att = z6_esperti_attivi(somma, n_as, mio, att);
+    z6_gemelli_ordina(somma, att, n_att);
+    struct z6_seg seg[512];
+    const float limit = ug ? *(const float *)(da->op_params + 1) : 0.0f;
+    const float situ_beta = ug ? *(const float *)(da->op_params + 2) : 0.0f;
+    const float situ_beta_linear = ug ? *(const float *)(da->op_params + 3) : 0.0f;
+    const int ne11 = (int) s1[0]->ne[1];
+    const int64_t ne12[2] = { s1[0]->ne[2], s1[1]->ne[2] };
+    // secondo giro (GGML_Z6_PP_FURTO): le parti rimaste nella coda dell'altro socket
+    for (int giro = 0; giro < (z6_gemelli_furto() ? 2 : 1); ++giro) {
+        const int q = giro ? !mio : mio;
+        if (giro) { lo = q ? taglio : 0; hi = q ? (int) ne01 : taglio; }
+        for (;;) {
+            const int c = atomic_fetch_add(z6_queue(params->shared, q), 1);
+            if (c >= parti) break;
+            const int k = z6_row_part(att, n_att, lo, hi, c, parti, 16, seg);
+            for (int i = 0; i < k; ++i) {
+                const int a = seg[i].a, r = seg[i].r;
+                for (int b = 0; b < 2; ++b) z6_pp_conta(ug ? 0 : 1, ids[b]->ne[1], seg[i].n, cnt[b][a]);
+                if (ug) {
+                    if (!iqk_moe_fused_up_gate_gemelli(seg[i].n, ne00, ne11, da->op_params[0],
+                                type, (const char *) w1->data + a*nb02 + r*nb01, (const char *) w2->data + a*nb02 + r*nb01, nb01,
+                                vec_dot_type, row_size, NULL, NULL,
+                                cnt[0][a], B[0], (float *) dd[0]->data + r, map[0] + a*ne12[0],
+                                cnt[1][a], B[1], (float *) dd[1]->data + r, map[1] + a*ne12[1],
+                                da->nb[1], da->nb[2], limit, situ_beta, situ_beta_linear)) GGML_ABORT("z6 gemelli: up/gate non disponibile");
+                } else {
+                    if (!iqk_mul_mat_moe_gemelli(seg[i].n, ne00, ne11,
+                                type, (const char *) w1->data + a*nb02 + r*nb01, nb01,
+                                vec_dot_type, row_size,
+                                cnt[0][a], B[0], (float *) dd[0]->data + r, map[0] + a*ne12[0],
+                                cnt[1][a], B[1], (float *) dd[1]->data + r, map[1] + a*ne12[1],
+                                da->nb[1], da->nb[2])) GGML_ABORT("z6 gemelli: mul_mat_moe non disponibile");
+                }
+            }
+        }
+    }
+}
+#endif
 
 static void ggml_compute_forward_mul_mat_up_gate(
         const struct ggml_compute_params * params,
@@ -22844,6 +23260,7 @@ static void ggml_compute_forward_clamp(
         case GGML_TYPE_IQ5_K_R4:
         case GGML_TYPE_IQ6_K:
         case GGML_TYPE_IQ3_S:
+        case GGML_TYPE_IQ3_S_Z6:
         case GGML_TYPE_IQ3_S_R4:
         case GGML_TYPE_IQ2_S:
         case GGML_TYPE_IQ2_S_R4:
@@ -26991,8 +27408,8 @@ static void z6_compute_down_sum(const struct ggml_compute_params * params, struc
     int lo = 0, hi = E, worker = ith, workers = nth;
     if (params->shared->z6_locale) {
         const int node = ith >= nth/2;
-        lo = node ? z6_row_split(E) : 0;
-        hi = node ? E : z6_row_split(E);
+        lo = node ? z6_row_split_t(a, E) : 0;
+        hi = node ? E : z6_row_split_t(a, E);
         worker = ith % (nth/2);
         workers = nth/2;
     }
@@ -31642,6 +32059,9 @@ struct ggml_cplan ggml_graph_plan(const struct ggml_cgraph * cgraph, int n_threa
                     cur += GGML_PAD(cur, sizeof(int64_t));       // align
                     cur += n_as * sizeof(int64_t);               // matrix_row_counts
                     cur += n_as * src1->ne[2] * sizeof(int64_t); // matrix_rows
+#if GGML_USE_IQK_MULMAT && defined GGML_EXPERT_CHUNKING
+                    if (z6_pp_gemelli()) cur = 2*cur + 512;      // Z6: due lotti nello stesso buffer (z6_forward_gemelli)
+#endif
                 } break;
             case GGML_OP_MOE_FUSED_UP_GATE:
                 {
@@ -31656,6 +32076,9 @@ struct ggml_cplan ggml_graph_plan(const struct ggml_cgraph * cgraph, int n_threa
                     cur += GGML_PAD(cur, sizeof(int64_t));       // align
                     cur += n_as * sizeof(int64_t);               // matrix_row_counts
                     cur += n_as * src2->ne[2] * sizeof(int64_t); // matrix_rows
+#if GGML_USE_IQK_MULMAT && defined GGML_EXPERT_CHUNKING
+                    if (z6_pp_gemelli()) cur = 2*cur + 512;      // Z6: due lotti nello stesso buffer (z6_forward_gemelli)
+#endif
                 } break;
             case GGML_OP_FUSED_UP_GATE:
                 {
@@ -31934,6 +32357,11 @@ static void z6_pp_riepilogo(int n_threads) {
         fprintf(stderr, "z6 pp token per esperto, %s: lavoro (chiamate) per fascia%s; %.0f chiamate per grafo\n",
                 q == 0 ? "up/gate" : "down", riga, chiamate / n);
     }
+    if (z6_pp_furto()) {
+        const long long ru = atomic_exchange_explicit(&z6_pp_rubate[0], 0, memory_order_relaxed);
+        const long long rd = atomic_exchange_explicit(&z6_pp_rubate[1], 0, memory_order_relaxed);
+        fprintf(stderr, "z6 pp furto: parti prese all'altro socket per grafo, up/gate %.1f, down %.1f\n", ru / n, rd / n);
+    }
     memset(z6_pp, 0, sizeof(z6_pp));
     memset(z6_pp_op_us, 0, sizeof(z6_pp_op_us));
     memset(z6_pp_op_n, 0, sizeof(z6_pp_op_n));
@@ -31990,6 +32418,13 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         const int64_t z6_a = z6_misura ? ggml_time_us() : 0;
         const int64_t z6_pa = z6_pp_misura ? ggml_time_us() : 0;
         const enum ggml_op z6_pp_op = node->op;
+#if GGML_USE_IQK_MULMAT && defined GGML_EXPERT_CHUNKING
+        // Z6 (GGML_Z6_PP_GEMELLI): questo nodo e il successivo applicano gli stessi esperti a due lotti di token
+        if (node_n + 1 < cgraph->n_nodes && z6_gemelli_validi(&params, node, cgraph->nodes[node_n + 1])) {
+            z6_forward_gemelli(&params, node, cgraph->nodes[node_n + 1]);
+            node_n += 1;
+        } else
+#endif
         node_n = ggml_compute_forward(&params, node, cgraph, node_n);
         const int64_t z6_pb = z6_pp_misura ? ggml_time_us() : 0;
 #if IK_PRINT_TIMING

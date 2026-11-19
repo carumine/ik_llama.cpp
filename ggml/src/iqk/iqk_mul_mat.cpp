@@ -1540,6 +1540,16 @@ void MulMat::silu(int n, const float * x, float * y) {
     int i = 0;
 #if defined __AVX512F__ && defined __AVX512DQ__
     for (; i + 15 < n; i += 16) _mm512_storeu_ps(y + i, v_silu(_mm512_loadu_ps(x + i)));
+    // Z6 (GGML_Z6_SILU_UNICA=1): the rows left over go through the same 512-bit function, behind a mask. The 256-bit
+    // and the scalar exponential round differently from the 512-bit one (about 12% and 27% of the values differ in
+    // the last bit), so which rows fall in the remainder decides the result: it changed with the number of threads,
+    // the NUMA split and the size of the pieces of work. With one function the result no longer depends on them.
+    static const bool z6_unica = [] { const char * e = getenv("GGML_Z6_SILU_UNICA"); return e && atoi(e) > 0; }();
+    if (z6_unica && i < n) {
+        const __mmask16 m = (__mmask16) ((1u << (n - i)) - 1);
+        _mm512_mask_storeu_ps(y + i, m, v_silu(_mm512_maskz_loadu_ps(m, x + i)));
+        return;
+    }
 #endif
 #if defined __AVX2__ && defined __FMA__
     for (; i + 7 < n; i += 8) _mm256_storeu_ps(y + i, v_silu(_mm256_loadu_ps(x + i)));
