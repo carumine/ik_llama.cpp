@@ -12,6 +12,13 @@ static std::pair<ggml_tensor *, ggml_tensor *> build_kda_qkvz(llama_context & lc
     auto q = llm_build_context::llm_build_lora_mm(lctx, ctx0, wq, input);
     auto k = llm_build_context::llm_build_lora_mm(lctx, ctx0, wk, input);
     auto v = llm_build_context::llm_build_lora_mm(lctx, ctx0, wv, input);
+    if (lctx.z6_tp) {
+        // Z6 (GGML_Z6_DENSA_TP=1): q, k and v one after the other in the graph (v came after the first concat), so the
+        // three split matrices share one exchange with the other GPU. Only the order of the nodes changes
+        ggml_build_forward_expand(gf, q);
+        ggml_build_forward_expand(gf, k);
+        ggml_build_forward_expand(gf, v);
+    }
     auto z = ssm_g
         ? llm_build_context::llm_build_lora_mm(lctx, ctx0, ssm_g, input)
         : llm_build_context::llm_build_lora_mm(lctx, ctx0, ssm_g_a, input);

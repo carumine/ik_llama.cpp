@@ -58,6 +58,7 @@ add_library(llama
             llama-z6-caldi.cpp
             llama-z6-testa.h
             llama-z6-testa.cpp
+            llama-z6-tp.cpp
             llama-model.h
             llama-model.cpp
             llama-reload-info.h
