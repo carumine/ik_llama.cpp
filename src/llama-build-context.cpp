@@ -1902,6 +1902,81 @@ llm_expert_gating_func_type   gating_op,
         ggml_build_forward_expand(graph, weights);
     }
 
+    // Z6 (GGML_Z6_FREDDI_SENZA_CALDI=1 or 2): a MoE layer that got no hot experts (the budget ended before it) stayed
+    // out of the parallel plan. Its cold experts ran inside the GPU segment of the previous group, behind input copies
+    // that synchronize the whole stream, and in the MTP pipeline they could not alternate with the other token. Here
+    // the layer becomes a group with zero hot experts: the shared expert is the GPU piece that runs while the CPU does
+    // the cold experts, with the same staging, events and tickets as the other groups. The numbers stay those of the
+    // normal path further down, which this branch replaces only when it would build exactly the same operations:
+    // - CPU: the same ggml_moe_up_gate and ggml_mul_mat_id on the same weights, with selected_experts as IDs (all
+    //   valid, no map) and the same op_params (swiglu_limit(il, false), situ_beta, situ_linear_beta);
+    // - GPU: the same ggml_mul_multi_add as the normal path with fused_mmad, not mul_multi_add_id; there is no hot
+    //   sum, so nothing is added as zero (0 + x would turn -0 into +0);
+    // - then cold sum + shared expert, the same add that build_glm5next does after the normal path.
+    static const int z6_senza_caldi = [] { const char * e = getenv("GGML_Z6_FREDDI_SENZA_CALDI"); return e ? atoi(e) : 0; }();
+    if ((z6_senza_caldi == 1 || z6_senza_caldi == 2) && lctx.z6_caldi && lctx.z6_caldi->parallel() && graph &&
+            lctx.z6_shexp && n_tokens > 0 && n_tokens <= 32 && n_tokens <= lctx.z6_caldi->staging_tokens() &&
+            lctx.z6_caldi->solo_freddi(il) &&
+            ggml_backend_sched_get_n_copies(lctx.sched) == 1 && n_expert_used == lctx.model.hparams.n_expert_used &&
+            !lctx.cparams.split_mode_graph_scheduling && lctx.model.split_mode != LLAMA_SPLIT_MODE_GRAPH &&
+            !weight_before_ffn && !add_input && lctx.lora_adapters.empty() && !lctx.moe_cache && lctx.cparams.fused_mmad &&
+            !up_exps_b && !gate_exps_b && !up_gate_exps_b && !down_exps_b && !down_exps_s &&
+            (type_op == LLM_FFN_SILU || type_op == LLM_FFN_GELU) && lctx.model.hadamard_rotation(down_exps) == nullptr &&
+            // the fused up/gate the normal path builds without cache and biases (else it builds other operations)
+            (up_gate_exps || (lctx.cparams.fused_moe_up_gate && up_exps && gate_exps && up_exps->type == gate_exps->type &&
+                              lctx.model.hadamard_rotation(up_exps) == nullptr &&
+                              lctx.model.hadamard_rotation(gate_exps) == nullptr))) {
+        auto & hot = *lctx.z6_caldi;
+        const auto gpu = hot.backend(il);
+        auto place = [&](ggml_tensor * t, ggml_backend_t b, const char * name) {
+            cb(t, name, il);
+            ggml_backend_sched_set_tensor_backend(lctx.sched, t, b);
+            return t;
+        };
+        // device copies of the inputs the staging reads: they must be contiguous and produced on a GPU. The IDs are
+        // always copied on the group's GPU, also with one token where the view of top_k is already contiguous: then
+        // their producer is this GPU and not wherever argsort runs (z6_caldi_prepare asserts a CUDA producer), as the
+        // get_rows of the branch with hot experts does. An I32 copy, it changes no number.
+        auto ids = place(ggml_cont(ctx, selected_experts), gpu, "z6_freddi_ids");
+        ids = ggml_reshape_2d(ctx, ids, n_expert_used, n_tokens);
+        auto x = ggml_reshape_3d(ctx, cur, n_embd, 1, n_tokens);
+        ggml_build_forward_expand(graph, x);
+        ggml_build_forward_expand(graph, ids);
+        ggml_build_forward_expand(graph, weights);
+        ggml_tensor * cpu_x = nullptr, * cpu_ids = nullptr, * cpu_weights = nullptr;
+        hot.staging(ctx, il, n_tokens, &cpu_x, &cpu_ids, &cpu_weights);
+        // The shared expert depends only on the layer input: it is the GPU piece of the group. Its first non-view node
+        // takes the place of hot_begin (a split starts there, z6_caldi_prepare runs before it) and its output the
+        // place of hot_end.
+        const int n_before = graph->n_nodes;
+        ggml_tensor * shared = lctx.z6_shexp(cur);
+        ggml_build_forward_expand(graph, shared);
+        lctx.z6_shexp_fatto = true;
+        // the scheduler skips these when it looks for the node that starts a split (ggml_is_view_op there)
+        auto is_view = [](const ggml_tensor * t) {
+            return t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_PERMUTE || t->op == GGML_OP_TRANSPOSE;
+        };
+        ggml_tensor * shared_begin = nullptr;
+        for (int i = n_before; i < graph->n_nodes && !shared_begin; ++i) {
+            if (!is_view(graph->nodes[i])) shared_begin = graph->nodes[i];
+        }
+        GGML_ASSERT(shared_begin && !is_view(shared));
+        const auto unary = type_op == LLM_FFN_SILU ? GGML_UNARY_OP_SILU : GGML_UNARY_OP_GELU;
+        auto cold_par = place(ggml_moe_up_gate(ctx, up_gate_exps ? up_gate_exps : up_exps,
+                up_gate_exps ? nullptr : gate_exps, cpu_x, cpu_ids, unary), lctx.backend_cpu, "z6_freddi_up_gate");
+        *(float *)(cold_par->op_params + 1) = lctx.model.swiglu_limit(il, false);
+        *(float *)(cold_par->op_params + 2) = lctx.model.hparams.situ_beta;
+        *(float *)(cold_par->op_params + 3) = lctx.model.hparams.situ_linear_beta;
+        auto cold_down = place(ggml_mul_mat_id(ctx, down_exps, cold_par, cpu_ids), lctx.backend_cpu, "z6_freddi_down");
+        hot.stage_output(cold_down);
+        const ggml_z6_caldi_group group = { shared_begin, shared, cold_par, cold_down,
+                {x, ids, weights}, {cpu_x, cpu_ids, cpu_weights}, il, nullptr, nullptr };
+        ggml_backend_sched_z6_add_group(lctx.sched, &group);
+        auto cold_sum = place(ggml_mul_multi_add(ctx, cold_down, weights), gpu, "z6_freddi_somma");
+        // add_input is excluded above: the normal path adds the input before the shared expert, not after
+        return place(ggml_add(ctx, cold_sum, shared), gpu, "z6_caldi_shexp");
+    }
+
     // GGML_Z6_CALDI_BATCH=<token minimi>: i caldi lavorano anche nei microbatch grandi, in GPU e prima dei freddi
     static const int z6_caldi_batch = [] { const char * e = getenv("GGML_Z6_CALDI_BATCH"); return e ? atoi(e) : 0; }();
     const bool z6_batch = z6_caldi_batch > 0 && n_tokens >= z6_caldi_batch && graph;

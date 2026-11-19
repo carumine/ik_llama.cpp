@@ -634,6 +634,9 @@ llama_z6_caldi::~llama_z6_caldi() = default;
 bool llama_z6_caldi::has_layer(int il) const {
     return il >= 0 && il < (int)pimpl->layers.size() && !pimpl->layers[il].selected.empty();
 }
+bool llama_z6_caldi::solo_freddi(int il) const {
+    return il >= 0 && il < (int)pimpl->layers.size() && !pimpl->layers[il].sources.empty() && pimpl->layers[il].selected.empty();
+}
 ggml_backend_t llama_z6_caldi::backend(int il) const { return pimpl->gpus[pimpl->layer_bank.at(il)].gpu; }
 ggml_tensor * llama_z6_caldi::map(int il, bool hot) const {
     return hot ? pimpl->layers.at(il).hot_map : pimpl->layers.at(il).cold_map;

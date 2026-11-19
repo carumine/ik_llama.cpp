@@ -5919,6 +5919,28 @@ GGML_CALL static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
     GGML_UNUSED(backend);
 }
 
+// Z6 (GGML_Z6_TEMPI=1): host time spent in the pieces of a CUDA graph launch, summed since start. The "avvio GPU" of
+// the MTP pipeline pair is the whole eval of a GPU split; these say whether it is the walk over the nodes, the copy of
+// the CPY destination pointers from pageable memory, cudaGraphLaunch itself (which can block when the GPU queue is
+// full) or a direct evaluation/capture. Read by the scheduler before and after a pair (ggml_backend_cuda_z6_tempi_avvio).
+// Only timer reads and relaxed atomic adds: nothing changes on the device.
+enum {
+    Z6_AV_PROPRIETA, Z6_AV_COMPAT, Z6_AV_CPY, Z6_AV_LANCIO, Z6_AV_DIRETTA, Z6_AV_ISTANZA,
+    Z6_AV_N_LANCI, Z6_AV_N_CPY, Z6_AV_N_DIRETTI, Z6_AV_N_CATTURE, Z6_AV_N
+};
+static std::atomic<int64_t> z6_avvio[Z6_AV_N] = {};
+static bool z6_avvio_attivi() {
+    static const bool v = [] { const char * e = getenv("GGML_Z6_TEMPI"); return e && atoi(e) > 0; }();
+    return v;
+}
+static inline void z6_avvio_somma(int k, int64_t v) { z6_avvio[k].fetch_add(v, std::memory_order_relaxed); }
+
+GGML_CALL int ggml_backend_cuda_z6_tempi_avvio(int64_t * out, int n) {
+    const int m = n < Z6_AV_N ? n : (int) Z6_AV_N;
+    for (int k = 0; k < m; ++k) out[k] = z6_avvio[k].load(std::memory_order_relaxed);
+    return m;
+}
+
 #ifdef USE_CUDA_GRAPH
 
 static inline const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
@@ -6068,7 +6090,9 @@ static bool check_node_graph_compatibility_and_refresh_copy_ops(ggml_cuda_graph 
     if (use_cuda_graph) {
         graph->use_cpy_indirection = true;
         // copy pointers to GPU so they can be accessed via indirection within CUDA graph
+        const int64_t z6_t0 = z6_avvio_attivi() ? ggml_time_us() : 0;
         ggml_cuda_cpy_dest_ptrs_copy(graph, graph->cpy_dest_ptrs.data(), graph->cpy_dest_ptrs.size(), stream);
+        if (z6_avvio_attivi()) { z6_avvio_somma(Z6_AV_CPY, ggml_time_us() - z6_t0); z6_avvio_somma(Z6_AV_N_CPY, 1); }
     } else {
         graph->use_cpy_indirection = false;
     }
@@ -6179,6 +6203,10 @@ static void evaluate_and_capture_cuda_graph(ggml_backend_cuda_context * cuda_ctx
 
 #ifdef USE_CUDA_GRAPH
     auto graph = use_cuda_graph ? ggml_cuda_get_graph(*cuda_ctx, ggml_cuda_graph_get_key(cgraph)) : nullptr;
+    // Z6 (GGML_Z6_TEMPI=1): direct evaluation or capture, instantiate/update and cudaGraphLaunch timed apart
+    const bool z6_t = z6_avvio_attivi();
+    const bool z6_diretta = !use_cuda_graph || cuda_graph_update_required;
+    const int64_t z6_t0 = z6_t ? ggml_time_us() : 0;
 #endif
 
 #if IK_PRINT_TIMING
@@ -6219,16 +6247,27 @@ static void evaluate_and_capture_cuda_graph(ggml_backend_cuda_context * cuda_ctx
             graph_evaluated_or_captured = true; // ggml graph has been directly evaluated
         }
     }
+    if (z6_t && z6_diretta) {
+        z6_avvio_somma(Z6_AV_DIRETTA, ggml_time_us() - z6_t0);
+        z6_avvio_somma(use_cuda_graph ? Z6_AV_N_CATTURE : Z6_AV_N_DIRETTI, 1);
+    }
 
     if (use_cuda_graph) {
+        const int64_t z6_t1 = z6_t ? ggml_time_us() : 0;
         if (graph->instance == nullptr) { // Create executable graph from captured graph.
             CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
         }
         if (cuda_graph_update_required) { // Update graph executable
             update_cuda_graph_executable(graph);
         }
+        const int64_t z6_t2 = z6_t ? ggml_time_us() : 0;
         // Launch graph
         CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));
+        if (z6_t) {
+            z6_avvio_somma(Z6_AV_ISTANZA, z6_t2 - z6_t1);
+            z6_avvio_somma(Z6_AV_LANCIO, ggml_time_us() - z6_t2);
+            z6_avvio_somma(Z6_AV_N_LANCI, 1);
+        }
 #else
         graph_evaluated_or_captured = true;
 #endif  // USE_CUDA_GRAPH
@@ -6384,9 +6423,19 @@ GGML_CALL static enum ggml_status ggml_backend_cuda_graph_compute_impl(ggml_back
     }
 
     if (use_cuda_graph) {
+        // Z6 (GGML_Z6_TEMPI=1): both walks over the nodes are timed; the pointer copy inside the second one is
+        // counted apart (Z6_AV_CPY) and taken out of it
+        const bool z6_t = z6_avvio_attivi();
+        const int64_t z6_t0 = z6_t ? ggml_time_us() : 0;
+        const int64_t z6_cpy0 = z6_t ? z6_avvio[Z6_AV_CPY].load(std::memory_order_relaxed) : 0;
         cuda_graph_update_required = is_cuda_graph_update_required(graph, cgraph);
+        const int64_t z6_t1 = z6_t ? ggml_time_us() : 0;
 
         use_cuda_graph = check_node_graph_compatibility_and_refresh_copy_ops(graph, cgraph, use_cuda_graph, cuda_ctx->stream());
+        if (z6_t) {
+            z6_avvio_somma(Z6_AV_PROPRIETA, z6_t1 - z6_t0);
+            z6_avvio_somma(Z6_AV_COMPAT, ggml_time_us() - z6_t1 - (z6_avvio[Z6_AV_CPY].load(std::memory_order_relaxed) - z6_cpy0));
+        }
 
         // Disable CUDA graphs (from the next token) if the use-case is demanding too many consecutive graph updates.
         if (use_cuda_graph) {

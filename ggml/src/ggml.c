@@ -20048,6 +20048,39 @@ static int z6_principale_libero(int ith) {
     return v && ith == 0;
 }
 
+// Z6 (GGML_Z6_MTP_LANCI_NASCOSTI): see struct ggml_z6_laterale in ggml.h. The MTP pipeline pair (ggml-backend.cpp)
+// hands thread 0 the host work of a GPU segment of the other token: input copies, z6_caldi_prepare, graph launches.
+// Only thread 0 reads this pointer, and thread 0 is the thread that set it.
+static __thread struct ggml_z6_laterale * z6_laterale = NULL;
+
+void ggml_z6_laterale_imposta(struct ggml_z6_laterale * lavoro) {
+    z6_laterale = lavoro;
+}
+
+bool ggml_z6_principale_libero_attivo(void) {
+#if defined GGML_EXPERT_CHUNKING
+    return z6_principale_libero(0) && z6_freddi_coda() > 0;
+#else
+    return false;   // the points where thread 0 is free (z6_laterale_esegui) exist only with expert chunking
+#endif
+}
+
+#if defined GGML_EXPERT_CHUNKING
+// Z6 (GGML_Z6_MTP_LANCI_NASCOSTI): called by thread 0 only, where GGML_Z6_PRINCIPALE_LIBERO makes it skip a cold MoE
+// node of one token: the other threads take every part from the queues coda0/coda1 (one per socket, `parti` each)
+// and thread 0 would only wait at the barrier after the node. Without a work handed over: one thread-local load.
+static void z6_laterale_esegui(atomic_int * coda0, atomic_int * coda1, int parti) {
+    struct ggml_z6_laterale * l = z6_laterale;
+    if (!l) return;
+    z6_laterale = NULL;   // at most once per graph
+    l->fn(l->ud);
+    l->eseguito = 1;
+    // every part already taken: the other threads were on their last parts or at the barrier, waiting for thread 0
+    l->a_parti_esaurite = atomic_load_explicit(coda0, memory_order_relaxed) >= parti &&
+                          atomic_load_explicit(coda1, memory_order_relaxed) >= parti;
+}
+#endif
+
 // GGML_Z6_FREDDI_CODA_RIGHE=<n> (default 1): la coda vale anche per i batch fino a n token, cioè per le verifiche delle
 // bozze (2 token con MTP n_max=1). Sopra un token l'unità resta di 16 righe: ogni segmento è multiplo di 16, quindi
 // l'attivazione passa sempre dal ramo a 512 bit, come senza coda: stessi numeri.
@@ -20292,6 +20325,8 @@ static void ggml_compute_forward_mul_mat_id(
             char fatta[512] = {0};
             if (coda && z6_principale_libero(ith)) {
                 if (ids->ne[1] == 1 && z6_pre_thread() > 0) z6_pre_giu(src0);
+                // Z6 (GGML_Z6_MTP_LANCI_NASCOSTI): free until the barrier, if the up/gate did not take the work
+                z6_laterale_esegui(&params->shared->z6_coda_giu[0].value, &params->shared->z6_coda_giu[1].value, parti);
                 return;
             }
             // secondo giro (GGML_Z6_FREDDI_CODA_FURTO): le parti rimaste nella coda dell'altro socket
@@ -20768,6 +20803,9 @@ static void ggml_compute_forward_mul_mat_id_up_gate(
             const int rif = coda && ids->ne[1] == 1 ? z6_freddi_coda_rif(coda) : 0;
             char fatta[512] = {0};
             if (coda && z6_principale_libero(ith)) {
+                // Z6 (GGML_Z6_MTP_LANCI_NASCOSTI): thread 0 is free until the barrier after this node, while the
+                // others take the parts from the queues: it runs the host work the caller handed over, if any
+                z6_laterale_esegui(&params->shared->z6_coda_su[0].value, &params->shared->z6_coda_su[1].value, parti);
                 return;
             }
             // secondo giro (GGML_Z6_FREDDI_CODA_FURTO): le parti rimaste nella coda dell'altro socket
@@ -31785,6 +31823,52 @@ static void clear_numa_thread_affinity(void) {
     CPU_FREE(cpus);
 }
 
+// Z6 (GGML_Z6_AFFINITA_STABILE): worker 0 is the caller. Without the variable every graph does get + set + restore
+// on its mask, three syscalls per CPU split, i.e. hundreds per token in the MTP pair pipeline, plus a migration
+// back to its CPU whenever the scheduler moved it between splits. With the variable, inside a hold opened by the
+// scheduler (ggml_z6_affinity_hold_begin/end, one per sched compute call), the caller stays on the CPU of worker 0
+// between graphs: the launcher mask is read once, worker 0 is pinned once and the mask is restored once when the
+// outermost hold ends. Only the mask of the calling thread changes, never the graph, the threads or the work split.
+// All state is per thread, so several callers (thread pools) each keep their own.
+static __thread int       z6_t0_cpu     = -1;    // CPU the caller is still pinned to by a previous graph, -1 = launcher mask
+static __thread int       z6_t0_tenuta  = 0;     // depth of the open holds on this thread (0 without the variable)
+static __thread cpu_set_t z6_t0_salvata;         // launcher mask, valid while z6_t0_cpu >= 0
+
+// syscalls of worker 0 avoided (get, set, restore) and executed, reported with GGML_Z6_TEMPI.
+// They count every graph inside a hold, prefill included, so the report divides them by the graphs inside the holds
+// and by the outermost holds, not by the decode graphs that GGML_Z6_TEMPI times.
+static atomic_llong z6_t0_evitate[3];
+static atomic_llong z6_t0_eseguite;
+static atomic_llong z6_t0_grafi;   // graphs computed inside a hold
+static atomic_llong z6_t0_tenute;  // outermost holds opened
+
+static bool z6_affinita_stabile(void) {
+#ifdef GGML_USE_OPENMP
+    static int v = -1;
+    if (v < 0) {
+        const char * e = getenv("GGML_Z6_AFFINITA_STABILE");
+        v = e && atoi(e) > 0;
+    }
+    return v;
+#else
+    // without OpenMP the workers are created by the caller at every graph and would inherit its pinned mask
+    return false;
+#endif
+}
+
+// back to the launcher mask, as the original code does at the end of every graph
+static void z6_t0_rilascia(void) {
+    if (z6_t0_cpu < 0) {
+        return;
+    }
+    z6_t0_cpu = -1;
+    atomic_fetch_add_explicit(&z6_t0_eseguite, 1, memory_order_relaxed);
+    const int rv = pthread_setaffinity_np(pthread_self(), sizeof(z6_t0_salvata), &z6_t0_salvata);
+    if (rv != 0) {
+        fprintf(stderr, "warning: restoring CPU affinity failed: %s\n", strerror(rv));
+    }
+}
+
 // pin worker `thread_n` to its assigned logical CPU (no-op without affinity)
 static void set_cpu_thread_affinity(const struct ggml_cplan * cplan, int thread_n) {
     if (cplan == NULL || cplan->cpu_affinity == NULL || cplan->n_cpu_affinity <= 0) {
@@ -31802,25 +31886,37 @@ static void set_cpu_thread_affinity(const struct ggml_cplan * cplan, int thread_
 
     const int cpu = z6_cpu_del_thread(cplan, thread_n, cplan->n_threads);
     if (cpu < 0 || cpu >= CPU_SETSIZE) {
+        // Z6 (GGML_Z6_AFFINITA_STABILE): this graph does not pin worker 0, so it runs with the launcher mask as before
+        if (thread_n == 0) {
+            z6_t0_rilascia();
+        }
         return;
     }
 
     // Z6 (GGML_Z6_NUMA_AFFINITY): i thread del pool OpenMP restano gli stessi fra le chiamate e
     // nessuno cambia la loro maschera, quindi basta legarli una volta (circa 27 µs per chiamata a
-    // 40 thread). Il thread 0 è il chiamante, che ggml_graph_compute riporta alla maschera iniziale.
-    static __thread int z6_cpu_legata = -1;
-    if (z6_options.affinity && thread_n != 0 && z6_cpu_legata == cpu) {
+    // Z6 (GGML_Z6_AFFINITA_STABILE): inside a hold the caller is already on this CPU since the previous graph.
+    // Requires GGML_Z6_NUMA_AFFINITY, which skips set_numa_thread_affinity for explicit CPU lists: otherwise
+    // worker 0 would have just been widened to the NUMA mask and must be pinned again.
+    const bool z6_tieni = thread_n == 0 && z6_t0_tenuta > 0 && z6_options.affinity;
+    if (z6_tieni && z6_t0_cpu == cpu) {
+        atomic_fetch_add_explicit(&z6_t0_evitate[1], 1, memory_order_relaxed);
         return;
     }
 
     cpu_set_t mask;
     CPU_ZERO(&mask);
     CPU_SET(cpu, &mask);
-    z6_cpu_legata = thread_n != 0 ? cpu : -1;
 
     const int rv = pthread_setaffinity_np(pthread_self(), sizeof(mask), &mask);
     if (rv) {
         fprintf(stderr, "warning: pthread_setaffinity_np() failed: %s\n", strerror(rv));
+    }
+    if (thread_n == 0 && z6_t0_tenuta > 0) {
+        // Z6 (GGML_Z6_AFFINITA_STABILE): remember the pin only when it took effect and the hold applies;
+        // z6_t0_salvata is filled by ggml_graph_compute, which keeps the pin only if it read the launcher mask
+        atomic_fetch_add_explicit(&z6_t0_eseguite, 1, memory_order_relaxed);
+        z6_t0_cpu = z6_tieni && rv == 0 ? cpu : -1;
     }
 }
 #else
@@ -31830,6 +31926,41 @@ static void set_numa_thread_affinity(int thread_n) { UNUSED(thread_n);  }
 static void clear_numa_thread_affinity(void) {}
 static void set_cpu_thread_affinity(const struct ggml_cplan * cplan, int thread_n) { UNUSED(cplan); UNUSED(thread_n); }
 #endif
+
+// Z6 (GGML_Z6_AFFINITA_STABILE): see z6_t0_cpu. No-ops without the variable or outside Linux.
+void ggml_z6_affinity_hold_begin(void) {
+#if defined(__gnu_linux__)
+    if (z6_affinita_stabile()) {
+        if (++z6_t0_tenuta == 1) {
+            atomic_fetch_add_explicit(&z6_t0_tenute, 1, memory_order_relaxed);
+        }
+    }
+#endif
+}
+
+// Z6 (GGML_Z6_AFFINITA_STABILE): true when the holds act, i.e. the variable is set on Linux with OpenMP.
+// Lets tests tell a build where the lever cannot be enabled from a failure.
+bool ggml_z6_affinity_hold_enabled(void) {
+#if defined(__gnu_linux__)
+    return z6_affinita_stabile();
+#else
+    return false;
+#endif
+}
+
+void ggml_z6_affinity_hold_end(void) {
+#if defined(__gnu_linux__)
+    if (z6_t0_tenuta > 0 && --z6_t0_tenuta == 0) {
+        z6_t0_rilascia();
+    }
+#endif
+}
+
+void ggml_z6_affinity_release(void) {
+#if defined(__gnu_linux__)
+    z6_t0_rilascia();
+#endif
+}
 
 static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
     int n_tasks = 0;
@@ -32388,6 +32519,19 @@ static void z6_tempi_riepilogo(int n_threads) {
                 cnt[0] ? af[0] / cnt[0] : 0, cnt[1] ? af[1] / cnt[1] : 0, z6_uscita / n);
         z6_uscita = 0;
     }
+#if defined(__gnu_linux__)
+    if (z6_affinita_stabile()) {
+        // Z6 (GGML_Z6_AFFINITA_STABILE): affinity syscalls of worker 0 inside the holds, since the last report
+        const long long g = atomic_exchange(&z6_t0_evitate[0], 0), s = atomic_exchange(&z6_t0_evitate[1], 0);
+        const long long r = atomic_exchange(&z6_t0_evitate[2], 0), e = atomic_exchange(&z6_t0_eseguite, 0);
+        const long long ng = atomic_exchange(&z6_t0_grafi, 0), nt = atomic_exchange(&z6_t0_tenute, 0);
+        const double dg = ng > 0 ? (double) ng : 1.0, dt = nt > 0 ? (double) nt : 1.0;
+        fprintf(stderr, "z6 affinita stabile: %lld tenute, %lld grafi nelle tenute (prefill compreso); syscall del thread 0 "
+                "evitate %lld (get %lld, set %lld, ripristino %lld), eseguite %lld; per grafo %.2f evitate e %.2f eseguite, "
+                "per tenuta %.2f evitate e %.2f eseguite\n", nt, ng, g + s + r, g, s, r, e,
+                (g + s + r) / dg, e / dg, (g + s + r) / dt, e / dt);
+    }
+#endif
     for (int socket = 0; socket < 2; ++socket) {
         int count = 0;
         double sum = 0, lo = 1e30, hi = 0;
@@ -32596,9 +32740,29 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
     // explicit worker affinity; clearing NUMA affinity must not widen a Z6
     // node-0 process to both sockets between graph executions.
     cpu_set_t saved_affinity;
-    const bool restore_affinity =
-        (ggml_is_numa() || (cplan->cpu_affinity != NULL && cplan->n_cpu_affinity > 0)) &&
-        pthread_getaffinity_np(pthread_self(), sizeof(saved_affinity), &saved_affinity) == 0;
+    // Z6 (GGML_Z6_AFFINITA_STABILE): a graph that would not pin worker 0 through the explicit CPU list runs with
+    // the launcher mask, exactly as without the variable. While the caller is still pinned by a previous graph of
+    // the hold, its current mask is that single CPU: the launcher mask is the one saved by the first graph.
+    const bool z6_tieni = z6_t0_tenuta > 0 && z6_options.affinity && cplan->cpu_affinity != NULL && cplan->n_cpu_affinity > 0;
+    if (z6_t0_tenuta > 0) {
+        atomic_fetch_add_explicit(&z6_t0_grafi, 1, memory_order_relaxed);
+    }
+    if (!z6_tieni) {
+        z6_t0_rilascia();
+    }
+    bool restore_affinity;
+    if (z6_t0_cpu >= 0) {
+        saved_affinity = z6_t0_salvata;
+        restore_affinity = true;
+        atomic_fetch_add_explicit(&z6_t0_evitate[0], 1, memory_order_relaxed);
+    } else {
+        restore_affinity =
+            (ggml_is_numa() || (cplan->cpu_affinity != NULL && cplan->n_cpu_affinity > 0)) &&
+            pthread_getaffinity_np(pthread_self(), sizeof(saved_affinity), &saved_affinity) == 0;
+        if (z6_tieni) {
+            atomic_fetch_add_explicit(&z6_t0_eseguite, 1, memory_order_relaxed);
+        }
+    }
 #endif
 
     const int64_t z6_inizio = (z6_tempi() && cgraph->n_batch <= 32) ? ggml_time_us() : 0;
@@ -32691,12 +32855,20 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
 #endif
 
 #if defined(__gnu_linux__)
-    if (restore_affinity) {
+    if (restore_affinity && z6_t0_cpu >= 0) {
+        // Z6 (GGML_Z6_AFFINITA_STABILE): worker 0 stays pinned until the hold ends (z6_t0_rilascia)
+        z6_t0_salvata = saved_affinity;
+        atomic_fetch_add_explicit(&z6_t0_evitate[2], 1, memory_order_relaxed);
+    } else if (restore_affinity) {
+        if (z6_tieni) {
+            atomic_fetch_add_explicit(&z6_t0_eseguite, 1, memory_order_relaxed);
+        }
         const int rv = pthread_setaffinity_np(pthread_self(), sizeof(saved_affinity), &saved_affinity);
         if (rv != 0) {
             fprintf(stderr, "warning: restoring CPU affinity failed: %s\n", strerror(rv));
         }
-    } else {
+        // Z6 (GGML_Z6_AFFINITA_STABILE): without a saved launcher mask nothing is kept, as before
+        z6_t0_cpu = -1;
         clear_numa_thread_affinity();
     }
 #else

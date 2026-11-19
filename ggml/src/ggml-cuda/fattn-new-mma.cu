@@ -12,6 +12,9 @@
 #include "fattn-common.cuh"
 #include "fattn-new-mma.cuh"
 
+#include <atomic>
+#include <cstdlib>
+
 using namespace ggml_cuda_mma;
 
 typedef void (* fattn_new_mma_kernel_t)(
@@ -1890,6 +1893,55 @@ static __global__ void flash_attn_kv_idx_to_KV_max(
     }
 }
 
+// Z6 (GGML_Z6_FA_MLA_RIUSO=1): the absorbed MLA of GLM-5.3-Flash (build_glm5next.cpp) passes the same latent cache
+// view as K and as V, with head size 512/512. The default MLA flag of ggml_cuda_flash_attn_ext_mma_f16_case only
+// covers 576/512 and 320/256, so for 512/512 the kernel loads every KV tile twice, first as K and then again as V.
+// With the variable set and V the very same view as K, the twin instantiation with mla = true reads V from the K
+// tile already in shared memory. Read once per process, off by default.
+static bool z6_fa_mla_riuso() {
+    static const bool on = [] { const char * e = getenv("GGML_Z6_FA_MLA_RIUSO"); return e && atoi(e) > 0; }();
+    return on;
+}
+
+// Z6 (GGML_Z6_FA_MLA_RIUSO): with mla = true the kernel takes V from the K pointer and the K strides and ignores the
+// V tensor, so the reuse is exact only when V is the same memory as K: same data, type, sizes and strides. Equal
+// head sizes alone are not enough (Gemma 4 has 512/512 with a separate V cache).
+static bool z6_fa_v_is_k(const ggml_tensor * K, const ggml_tensor * V) {
+    if (K->data != V->data || K->type != V->type) {
+        return false;
+    }
+    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+        if (K->ne[i] != V->ne[i] || K->nb[i] != V->nb[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Z6 (GGML_Z6_FA_DECODE_SM=1): stream-K grid sized on the real SM count for head size 512 at decode, see
+// launch_fattn_new_mma. Read once per process, off by default.
+static bool z6_fa_decode_sm() {
+    static const bool on = [] { const char * e = getenv("GGML_Z6_FA_DECODE_SM"); return e && atoi(e) > 0; }();
+    return on;
+}
+
+// Z6: one line in the log the first time a lever is used (per device for GGML_Z6_FA_DECODE_SM, which depends on the
+// SM count), so that a server log or test-z6-fa-mla can tell that it is active.
+static void z6_fa_mla_riuso_detto() {
+    static std::atomic<bool> detto{false};
+    if (!detto.load(std::memory_order_relaxed) && !detto.exchange(true)) {
+        fprintf(stderr, "z6: GGML_Z6_FA_MLA_RIUSO attiva: attenzione 512/512 con V == K, V letta dalla tile di K\n");
+    }
+}
+
+static void z6_fa_decode_sm_detto(const int id, const int nsm_prima, const int nsm_dopo) {
+    static std::atomic<bool> detto[GGML_CUDA_MAX_DEVICES];
+    if (!detto[id].load(std::memory_order_relaxed) && !detto[id].exchange(true)) {
+        fprintf(stderr, "z6: GGML_Z6_FA_DECODE_SM attiva sulla GPU %d: decode a testa 512 su %d SM invece di %d\n",
+                id, nsm_dopo, nsm_prima);
+    }
+}
+
 template <int DV, int ncols1, int ncols2, bool is_mla = false, bool use_sparse = false>
 static void launch_fattn_new_mma(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_new_mma_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
@@ -1928,7 +1980,22 @@ static void launch_fattn_new_mma(
     int nsm = 1; while (nsm*2 <= nsm_actual) nsm *= 2;
     if (cc >= CC_ADA_LOVELACE && Q->ne[1] >= 512 && K->ne[2] == 1) nsm = nsm_actual;
 
-    if (Q->ne[1] ==  1 && n_kv <= 4096 && nsm > 32) nsm /= 2;
+    // Z6 (GGML_Z6_FA_DECODE_SM=1): head size 512 at decode (at most 2 query rows: the absorbed MLA of GLM-5.3-Flash
+    // and its 2-token MTP layer) has very few output tiles (64 heads / 16 = 4), so the stream-K grid alone decides how
+    // many SMs work, and the power of 2 below the SM count leaves part of the GPU idle: on 28 SMs it launches
+    // 2 x 16 = 32 blocks of 2 warps. Use the real SM count of this device instead (2 x 28 = 56 blocks there, 28
+    // instead of 16 for the 2-token instance). This moves the stream-K seams inside the KV range of each tile, so
+    // the partial results are cut and combined by the fixup at other points: the numbers change at rounding level
+    // (KLD check needed). The sparse path never gets here with 2 rows or less (it needs at least 8).
+    // The short-context halving below is still decided on the power-of-2 count: with 33-63 SMs that count is 32 and
+    // is not halved, while the real count would be, and the grid would end up smaller than without the lever.
+    const int z6_nsm_base = nsm;
+    if (z6_fa_decode_sm() && !use_sparse && DV == 512 && Q->ne[0] == 512 && Q->ne[1] <= 2 && nsm != nsm_actual) {
+        z6_fa_decode_sm_detto(id, nsm, nsm_actual);
+        nsm = nsm_actual;
+    }
+
+    if (Q->ne[1] ==  1 && n_kv <= 4096 && z6_nsm_base > 32) nsm /= 2;
     if (Q->ne[1] >= 32 && n_kv >= 4096) nsm *= 2;
 
     ggml_cuda_pool_alloc<half>   K_f16(pool);
@@ -2147,6 +2214,22 @@ static void launch_fattn_new_mma(
 template <int DKQ, int DV, int ncols1, int ncols2, bool use_sparse = false,
           bool is_mla = (DKQ == 576 && DV == 512) || (DKQ == 320 && DV == 256)>
 static void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    // Z6 (GGML_Z6_FA_MLA_RIUSO=1): same ncols1/ncols2 as chosen by the caller, only the mla flag changes, so the
+    // routing stays the one without the variable by construction. Exact: the shared memory size does not depend on
+    // the flag and limits the occupancy of these instances (2 blocks per SM for 16 columns, 1 for 32 on 100 KB per
+    // SM), so grid and stream-K seams do not change. On Ampere and newer nbatch_K2 == nbatch_V2 for 512/512 (256 for
+    // 16 columns, 128 for 32), so stride_tile_V == stride_tile_K and tile_V == tile_K (1 stage) as without the flag:
+    // the V columns reused from the K tile are the bytes the V load would have written at the same shared addresses,
+    // and the VKQ loop and its mma order do not change. Limited to the shapes GLM-5.3-Flash reaches (64 heads on 1 KV
+    // head: ncols2 = 16, ncols1 = 1 for one query row, 2 otherwise) so that no other kernels are compiled.
+    if constexpr (DKQ == 512 && DV == 512 && ncols2 == 16 && ncols1 <= 2 && !use_sparse && !is_mla) {
+        if (z6_fa_mla_riuso() && z6_fa_v_is_k(dst->src[1], dst->src[2])) {
+            z6_fa_mla_riuso_detto();
+            ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, ncols1, ncols2, use_sparse, true>(ctx, dst);
+            return;
+        }
+    }
+
     const ggml_tensor * KQV = dst;
     const int id = ggml_cuda_get_device();
     const int cc = ggml_cuda_info().devices[id].cc;

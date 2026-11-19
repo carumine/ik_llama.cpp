@@ -49,6 +49,72 @@ static bool z6_ckpt_veloce() {
     return attivo;
 }
 
+// Z6 (GGML_Z6_TEMPI=1): B8, a speculative generation step split into the MTP pipeline pair and the work around it.
+// In the arena the time outside the pair was estimated at 7-14 ms a step against 3.2 at the bench, never measured
+// piece by piece. One update_slots() with a draft verified is a step; the gap since the previous step counts too.
+// Only timer reads on the server thread: nothing changes in what is computed or sent.
+struct z6_passo_tempi {
+    int64_t passi = 0, token = 0, passo = 0, tra = 0, bozza = 0, ckpt = 0, decode = 0, coppia = 0, coppie = 0;
+    int64_t accetta = 0, commit = 0, ripristino = 0, mtp = 0, ripristini = 0, emissione = 0, process = 0, fine = 0;
+    bool spec = false;   // speculative_decoding_accept() verified a draft in this update_slots()
+};
+static bool z6_passo_attivi() {
+    static const bool v = [] { const char * e = getenv("GGML_Z6_TEMPI"); return e && atoi(e) > 0; }();
+    return v;
+}
+static z6_passo_tempi z6_pq;               // the step in progress
+static int64_t z6_passo_fine_prec = 0;     // end of the previous update_slots(), when it was a speculative step
+struct z6_passo_cronometro {
+    int64_t * somma;
+    int64_t t0;
+    explicit z6_passo_cronometro(int64_t & s) : somma(z6_passo_attivi() ? &s : nullptr), t0(somma ? ggml_time_us() : 0) {}
+    ~z6_passo_cronometro() { if (somma) *somma += ggml_time_us() - t0; }
+};
+// opened at the start of update_slots(); on every exit it adds the step to the sums if a draft was verified
+struct z6_passo_guardia {
+    bool attivo;
+    int64_t t0 = 0, coppie0 = 0, coppia0 = 0, ripristino0 = 0, mtp0 = 0, ripristini0 = 0;
+    z6_passo_guardia() : attivo(z6_passo_attivi()) {
+        if (!attivo) return;
+        t0 = ggml_time_us();
+        z6_pq = z6_passo_tempi();
+        ggml_backend_sched_z6_pipeline_tempi(&coppie0, &coppia0);
+        common_speculative_z6_tempi(&ripristino0, &mtp0, &ripristini0);
+    }
+    ~z6_passo_guardia() {
+        if (!attivo) return;
+        const int64_t t1 = ggml_time_us();
+        if (!z6_pq.spec) { z6_passo_fine_prec = 0; return; }
+        int64_t coppie1 = 0, coppia1 = 0, ripristino1 = 0, mtp1 = 0, ripristini1 = 0;
+        ggml_backend_sched_z6_pipeline_tempi(&coppie1, &coppia1);
+        common_speculative_z6_tempi(&ripristino1, &mtp1, &ripristini1);
+        static z6_passo_tempi s;
+        static int64_t tot = 0;
+        const int64_t tra = z6_passo_fine_prec > 0 ? t0 - z6_passo_fine_prec : 0;
+        ++s.passi; ++tot;
+        s.token += z6_pq.token; s.passo += t1 - t0 + tra; s.tra += tra;
+        s.bozza += z6_pq.bozza; s.ckpt += z6_pq.ckpt; s.decode += z6_pq.decode;
+        s.coppie += coppie1 - coppie0; s.coppia += coppia1 - coppia0;
+        s.accetta += z6_pq.accetta; s.commit += z6_pq.commit;
+        s.ripristino += ripristino1 - ripristino0; s.mtp += mtp1 - mtp0; s.ripristini += ripristini1 - ripristini0;
+        s.emissione += z6_pq.emissione; s.process += z6_pq.process; s.fine += z6_pq.fine;
+        z6_passo_fine_prec = t1;
+        if (tot == 20 || s.passi == 200) {
+            const double m = 1000.0*s.passi;
+            const double resto = (s.passo - s.decode - s.bozza - s.ckpt - s.accetta - s.commit - s.emissione - s.tra)/m;
+            fprintf(stderr, "z6 passo fuori coppia: %lld passi, %.2f token a passo; passo %.2f ms = coppia %.2f (%.2f coppie a passo) "
+                    "+ fuori coppia %.2f: decode fuori coppia %.2f, bozza %.2f, checkpoint della bozza %.2f, campionamento e "
+                    "accettazione %.2f, commit %.2f (ripristino %.2f, aggiornamento MTP %.2f, ripristini %.2f a passo), "
+                    "emissione dei token %.2f (process_token %.2f), fine richiesta %.2f, tra i passi %.2f, resto %.2f\n",
+                    (long long) tot, double(s.token)/s.passi, s.passo/m, s.coppia/m, double(s.coppie)/s.passi,
+                    (s.passo - s.coppia)/m, (s.decode - s.coppia)/m, s.bozza/m, s.ckpt/m, s.accetta/m, s.commit/m,
+                    s.ripristino/m, s.mtp/m, double(s.ripristini)/s.passi, (s.emissione - s.fine)/m, s.process/m, s.fine/m,
+                    s.tra/m, resto);
+            s = z6_passo_tempi();
+        }
+    }
+};
+
 static std::vector<std::vector<uint8_t>> z6_ckpt_liberi;
 
 static void z6_ckpt_ricicla(std::vector<uint8_t> & data) {
@@ -3839,7 +3905,10 @@ void server_context::add_sampled_tokens() {
 
             auto & params_spec = slot.params.speculative;
             const llama_pos draft_base_pos = slot.uses_mtp() ? slot.cache_tokens.pos_next() : -1;
-            common_speculative_draft_result draft_result = common_speculative_draft_ex(
+            common_speculative_draft_result draft_result;
+            {
+                z6_passo_cronometro z6_c(z6_pq.bozza);
+                draft_result = common_speculative_draft_ex(
                 slot.spec,
                 ctx,
                 params_spec,
@@ -3848,6 +3917,7 @@ void server_context::add_sampled_tokens() {
                 draft_base_pos,
                 slot.id,
                 &slot.sparams);
+            }
             llama_tokens & draft = draft_result.tokens;
             auto & proposal_dists = draft_result.proposal_dists;
             slot.spec_target_only = draft_result.target_only;
@@ -4696,6 +4766,7 @@ void server_context::speculative_decoding_accept() {
 
         const llama_token sampled_before = slot.sampled;
         size_t n_draft = slot.drafted.size();
+        if (z6_passo_attivi()) z6_pq.spec = true;
 
         apply_server_biases(slot);
 
@@ -4725,6 +4796,7 @@ void server_context::speculative_decoding_accept() {
         }
 
         try {
+            z6_passo_cronometro z6_c(z6_pq.accetta);
             ids = slot.draft_proposal_dists.empty()
                 ? common_sampler_sample_and_accept_n(slot.ctx_sampling, ctx, slot.i_batch_dft, slot.drafted, false, ban_set_ptr)
                 : common_sampler_sample_and_accept_n(slot.ctx_sampling, ctx, slot.i_batch_dft, slot.drafted, slot.draft_proposal_dists, false, ban_set_ptr);
@@ -4772,7 +4844,10 @@ void server_context::speculative_decoding_accept() {
         const llama_pos spec_pos_base = slot.cache_tokens.pos_next();
         slot.n_past = slot.cache_tokens.n_tokens();
 
-        if (!common_speculative_commit(
+        bool z6_commit_ok;
+        {
+            z6_passo_cronometro z6_c(z6_pq.commit);
+            z6_commit_ok = common_speculative_commit(
             slot.spec,
             ctx,
             slot.ctx_sampling,
@@ -4781,7 +4856,9 @@ void server_context::speculative_decoding_accept() {
             ids,
             n_draft,
             spec_pos_base,
-            accepted_output_indices)) {
+            accepted_output_indices);
+        }
+        if (!z6_commit_ok) {
             LOG_ERROR("speculative checkpoint restore/commit failed, releasing slot", {
                 {"id_slot", slot.id},
                 {"id_task", slot.id_task},
@@ -4796,6 +4873,8 @@ void server_context::speculative_decoding_accept() {
         }
         slot.spec_target_only = false;
 
+        if (z6_passo_attivi()) z6_pq.token += (int64_t) ids.size();
+        z6_passo_cronometro z6_emissione(z6_pq.emissione);
         bool rewind_failed = false;
         for (size_t i = 0; i < ids.size(); ++i) {
             completion_token_output result;
@@ -4819,8 +4898,14 @@ void server_context::speculative_decoding_accept() {
             slot.ctx_sampling->rewinded_text.clear();
 
             if (slot.n_buffer == 0 || !params_base.can_ban_phrases) {
-                if (!process_token(result, slot)) {
+                bool z6_continua;
+                {
+                    z6_passo_cronometro z6_c(z6_pq.process);
+                    z6_continua = process_token(result, slot);
+                }
+                if (!z6_continua) {
                     // release slot because of stop condition
+                    z6_passo_cronometro z6_c(z6_pq.fine);
                     send_final_response(slot);
                     release_slot_after_final_response(slot);
                     break;
@@ -5224,7 +5309,11 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
             return n;
         };
 
-        const int ret = server_decode(ctx, batch_view);
+        int ret;
+        {
+            z6_passo_cronometro z6_c(z6_pq.decode);
+            ret = server_decode(ctx, batch_view);
+        }
         if (ret != 0) {
             if (n_batch == 1 || ret < 0) {
                 int user_cancel = -3;
@@ -5459,6 +5548,7 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
 }
 
 void server_context::update_slots() {
+    z6_passo_guardia z6_guardia;   // GGML_Z6_TEMPI=1: B8 step timers, inert without the variable
     if (system_need_update) {
         system_prompt_update();
     }
@@ -5580,6 +5670,7 @@ void server_context::update_slots() {
                 llama_rewind_ckpt_discard(slot.ctx, { LLAMA_CHECKPOINT_REWIND, 0,  n <0 ? 0 : n  }, slot.id);
                 create_rewind_checkpoint(slot); // snapshot before speculative decoding
             }
+            z6_passo_cronometro z6_c(z6_pq.ckpt);
             if (common_speculative_before_draft(
                     slot.spec,
                     model,

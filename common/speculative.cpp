@@ -2811,6 +2811,7 @@ bool common_speculative_checkpoint_restore(
         }
 
         if (common_speculative_has_target_features(spec) && !mtp_hidden_state_pre.empty()) {
+            z6_spec_cronometro z6_c(&z6_spec_mtp_us);
             if (!common_speculative_commit_accepted_hidden_rows(
                     spec,
                     spec_type_used,
@@ -2849,7 +2850,11 @@ bool common_speculative_checkpoint_restore(
                 llama_set_embeddings(ctx, true);
             }
 
-            const int ret = llama_decode(ctx, re_batch);
+            int ret;
+            {
+                z6_spec_cronometro z6_c(&z6_spec_ripristino_us);
+                ret = llama_decode(ctx, re_batch);
+            }
             if (ret != 0) {
                 LOG_ERR("%s: seq_id=%d failed to re-decode accepted tokens after checkpoint restore: %d\n",
                         __func__, (int) seq_id, ret);
@@ -2864,6 +2869,7 @@ bool common_speculative_checkpoint_restore(
                     redecoded_indices[j] = j;
                 }
 
+                z6_spec_cronometro z6_c(&z6_spec_mtp_us);
                 if (!common_speculative_commit_accepted_output(
                         spec,
                         ctx,
@@ -2921,6 +2927,7 @@ bool common_speculative_commit(
             any_rejected &&
             ckpt.valid &&
             !accepted_output_indices.empty()) {
+        z6_spec_cronometro z6_c(&z6_spec_mtp_us);
         if (!common_speculative_copy_output_hidden_rows(spec, ctx, accepted_output_indices, mtp_hidden_state_pre)) {
             mtp_hidden_state_pre.clear();
         }
@@ -2943,6 +2950,7 @@ bool common_speculative_commit(
     }
 
     if (common_speculative_has_target_features(spec) && !accepted_output_indices.empty()) {
+        z6_spec_cronometro z6_c(&z6_spec_mtp_us);
         if (!common_speculative_commit_accepted_output(
                 spec,
                 ctx,

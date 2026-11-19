@@ -21,6 +21,9 @@ endforeach()
 # esperti freddi di due microbatch come nodi gemelli (GGML_Z6_PP_GEMELLI): solo CPU, senza modello
 add_executable(test-z6-gemelli test-z6-gemelli.cpp)
 target_link_libraries(test-z6-gemelli PRIVATE ggml)
+# maschera del thread 0 fra i grafi CPU (GGML_Z6_AFFINITA_STABILE): solo CPU, senza modello, due CPU
+add_executable(test-z6-affinita test-z6-affinita.cpp)
+target_link_libraries(test-z6-affinita PRIVATE ggml)
 add_executable(test-z6-glm-pair test-z6-glm-pair.cpp test-z6-glm-layout.cpp)
 target_include_directories(test-z6-glm-pair PRIVATE ../src)
 target_link_libraries(test-z6-glm-pair PRIVATE common)
@@ -56,6 +59,20 @@ if (GGML_CUDA)
     # lista delle celle della DSA di GLM dalle posizioni, senza maschera causale (GGML_Z6_DSA_CAUSALE_COMPATTA): sulla GPU
     add_executable(test-z6-dsa-causale test-z6-dsa-causale.cpp)
     target_link_libraries(test-z6-dsa-causale PRIVATE ggml)
+    # timer dell'host sul lancio dei grafi CUDA (GGML_Z6_TEMPI, B3): uscita identica senza e con la variabile
+    add_executable(test-z6-tempi test-z6-tempi.cpp)
+    target_link_libraries(test-z6-tempi PRIVATE ggml)
+    # livello MoE senza caldi come gruppo con zero caldi (GGML_Z6_FREDDI_SENZA_CALDI) contro il percorso normale
+    add_executable(test-z6-senza-caldi test-z6-senza-caldi.cpp)
+    target_link_libraries(test-z6-senza-caldi PRIVATE ggml)
+    # coppia della pipeline MTP con i lanci nascosti (GGML_Z6_MTP_LANCI_NASCOSTI) contro la coppia di oggi
+    add_executable(test-z6-lanci-nascosti test-z6-lanci-nascosti.cpp)
+    target_link_libraries(test-z6-lanci-nascosti PRIVATE ggml)
+endif()
+# attenzione MLA di GLM-5.3-Flash con K == V (GGML_Z6_FA_MLA_RIUSO, GGML_Z6_FA_DECODE_SM): una GPU, senza modello
+if (GGML_CUDA AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_executable(test-z6-fa-mla test-z6-fa-mla.cpp)
+    target_link_libraries(test-z6-fa-mla PRIVATE ggml)
 endif()
 
 function(llama_build source)
