@@ -243,7 +243,8 @@ static bool common_speculative_checkpoint_save(
     llama_pos n_past,
     llama_token sampled,
     int max_tokens,
-    int ckpt_mode);
+    int ckpt_mode,
+    bool z6_senza_sampler = false);
 
 static std::vector<llama_token> mtp_speculative_gen_draft(
     common_speculative_state_mtp & state,
@@ -2495,6 +2496,17 @@ bool common_speculative_before_draft(
         return false;
     }
 
+    // Z6: IK_Z6_SPEC_CKPT_SENZA_SAMPLER=1 (with IK_Z6_SPEC_KEEP_SAMPLER=1) skips the checkpoint sampler for
+    // self-speculative drafts: the restore reads it only when the sampler is not kept, so building it (grammar,
+    // triggers) and cloning it at every draft is dead work. Off by default.
+    static const bool z6_senza_sampler_on = [] {
+        const char * a = std::getenv("IK_Z6_SPEC_CKPT_SENZA_SAMPLER");
+        const char * b = std::getenv("IK_Z6_SPEC_KEEP_SAMPLER");
+        return a && std::atoi(a) > 0 && b && std::atoi(b) > 0;
+    }();
+    const bool z6_senza_sampler = z6_senza_sampler_on && spec->curr_impl != nullptr &&
+        common_speculative_type_is_self_spec(spec->curr_impl->type);
+
     return common_speculative_checkpoint_save(
         spec->checkpoint,
         model,
@@ -2505,7 +2517,8 @@ bool common_speculative_before_draft(
         n_past,
         sampled,
         max_tokens,
-        ckpt_mode);
+        ckpt_mode,
+        z6_senza_sampler);
 }
 
 int32_t common_speculative_on_target_seq_batch(
@@ -2704,7 +2717,8 @@ static bool common_speculative_checkpoint_save(
         llama_pos n_past,
         llama_token sampled,
         int max_tokens,
-        int ckpt_mode) {
+        int ckpt_mode,
+        bool z6_senza_sampler) {
     ckpt.clear();
     ckpt.n_past = n_past;
     ckpt.sampled = sampled;
@@ -2719,6 +2733,10 @@ static bool common_speculative_checkpoint_save(
     if (!ckpt.valid) {
         llama_spec_ckpt_discard(ctx, spec_ckpt);
         return false;
+    }
+
+    if (z6_senza_sampler) {
+        return true;
     }
 
     ckpt.sampler = common_sampler_init(model, sparams);

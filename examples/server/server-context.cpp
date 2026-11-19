@@ -18,6 +18,59 @@
 #include <regex>
 #include <exception>
 #include <unordered_map>
+#include <cstdlib>
+
+// Z6: IK_Z6_BOZZE_TEMPI=1 (diagnostics, off by default): times of the generation steps outside the graph, by draft
+// length N (0 = single step, "1*" = first single step after a draft). With the variable on, the decode is followed
+// by llama_synchronize so that "decode" holds the whole graph. One line per bucket every <value> drafts (1 = 500).
+namespace {
+struct z6_bozze_tempi_t {
+    bool on = false;
+    long ogni = 500;
+    int cur = -1;            // bucket of the current step: 0..16 = N, 17 = first single step after a draft, -1 = skip
+    bool last_draft = false;
+    int64_t t0 = 0, t_pre0 = 0, t_post0 = 0;
+    int64_t pre = 0, dec = 0, post = 0, camp = 0, acc = 0, comm = 0;
+    double s_tot[18] = {}, s_pre[18] = {}, s_dec[18] = {}, s_post[18] = {}, s_camp[18] = {}, s_acc[18] = {}, s_comm[18] = {};
+    long n[18] = {};
+    long n_bozze = 0;
+    void begin() { t0 = ggml_time_us(); t_pre0 = 0; pre = dec = post = camp = acc = comm = 0; cur = -1; }
+    void end() {
+        if (cur < 0) return;
+        const int64_t tot = ggml_time_us() - t0;
+        const int b = cur;
+        s_tot[b] += tot; s_pre[b] += pre; s_dec[b] += dec; s_post[b] += post; s_camp[b] += camp; s_acc[b] += acc; s_comm[b] += comm;
+        n[b]++;
+        last_draft = b >= 1 && b <= 16;
+        if (last_draft && ++n_bozze % ogni == 0) {
+            for (int i = 0; i < 18; ++i) {
+                if (n[i] == 0) continue;
+                const double k = 1e-3 / n[i];
+                LOG_INF("z6 bozze tempi: N=%s%s passi %ld | totale %.2f ms | checkpoint %.2f | decode %.2f | singolo %.2f "
+                        "(campiona %.2f) | accetta %.2f (campiona %.2f, commit %.2f) | altro %.2f\n",
+                        i == 17 ? "1*" : std::to_string(i).c_str(), i == 0 ? " (singolo)" : "", n[i],
+                        s_tot[i] * k, s_pre[i] * k, s_dec[i] * k, s_post[i] * k,
+                        (i == 0 || i == 17 ? s_camp[i] : 0.0) * k, s_acc[i] * k,
+                        (i == 0 || i == 17 ? 0.0 : s_camp[i]) * k, s_comm[i] * k,
+                        (s_tot[i] - s_pre[i] - s_dec[i] - s_post[i] - s_acc[i]) * k);
+            }
+        }
+    }
+};
+z6_bozze_tempi_t & z6_bt() {
+    static z6_bozze_tempi_t t = [] {
+        z6_bozze_tempi_t x;
+        const char * e = std::getenv("IK_Z6_BOZZE_TEMPI");
+        x.on = e != nullptr && std::atoi(e) > 0;
+        if (x.on && std::atoi(e) > 1) {
+            x.ogni = std::atoi(e);
+        }
+        return x;
+    }();
+    return t;
+}
+} // namespace
+
 // Z6 (IK_Z6_SPEC_MTMD=1): ngram-mod drafts also with a multimodal projector loaded. The draft reads the raw token
 // vector, where every image token is LLAMA_TOKEN_NULL; the n-gram windows that touch one are skipped
 // (common_ngram_mod::add_range) and no draft is made while the lookup window contains one, so a draft is always text.
@@ -4821,6 +4874,7 @@ void server_context::speculative_decoding_accept() {
             ban_set_ptr = &ban_set;
         }
 
+        const int64_t z6_t_camp = z6_bt().on ? ggml_time_us() : 0;
         try {
             z6_passo_cronometro z6_c(z6_pq.accetta);
             ids = slot.draft_proposal_dists.empty()
@@ -4839,6 +4893,10 @@ void server_context::speculative_decoding_accept() {
             slot.drafted.clear();
             slot.draft_proposal_dists.clear();
             continue;
+        }
+
+        if (z6_bt().on) {
+            z6_bt().camp += ggml_time_us() - z6_t_camp;
         }
 
         std::vector<int32_t> accepted_output_indices;
@@ -4870,6 +4928,7 @@ void server_context::speculative_decoding_accept() {
         const llama_pos spec_pos_base = slot.cache_tokens.pos_next();
         slot.n_past = slot.cache_tokens.n_tokens();
 
+        const int64_t z6_t_comm = z6_bt().on ? ggml_time_us() : 0;
         bool z6_commit_ok;
         {
             z6_passo_cronometro z6_c(z6_pq.commit);
@@ -4883,6 +4942,9 @@ void server_context::speculative_decoding_accept() {
             n_draft,
             spec_pos_base,
             accepted_output_indices);
+        }
+        if (z6_bt().on) {
+            z6_bt().comm += ggml_time_us() - z6_t_comm;
         }
         if (!z6_commit_ok) {
             LOG_ERROR("speculative checkpoint restore/commit failed, releasing slot", {
@@ -5335,10 +5397,16 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
             return n;
         };
 
+        const int64_t z6_t_dec = z6_bt().on ? ggml_time_us() : 0;
         int ret;
         {
             z6_passo_cronometro z6_c(z6_pq.decode);
             ret = server_decode(ctx, batch_view);
+        }
+        if (z6_bt().on) {
+            llama_synchronize(ctx);
+            z6_bt().dec += ggml_time_us() - z6_t_dec;
+            z6_bt().t_post0 = ggml_time_us();
         }
         if (ret != 0) {
             if (n_batch == 1 || ret < 0) {
@@ -5492,8 +5560,12 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
 
             llama_token id;
             try {
+                const int64_t z6_t_camp = z6_bt().on ? ggml_time_us() : 0;
                 id = common_sampler_sample(slot.ctx_sampling, ctx, tok_idx);
                 common_sampler_accept(slot.ctx_sampling, ctx, id, true);
+                if (z6_bt().on) {
+                    z6_bt().camp += ggml_time_us() - z6_t_camp;
+                }
             } catch (const std::exception & e) {
                 LOG_ERROR("sampling failed, releasing slot", {
                     {"id_slot", slot.id},
@@ -5565,7 +5637,14 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
             slot.i_batch = -1;
         }
         // speculative decoding - main model sample and accept
+        const int64_t z6_t_acc = z6_bt().on ? ggml_time_us() : 0;
+        if (z6_bt().on && z6_bt().t_post0 != 0) {
+            z6_bt().post += z6_t_acc - z6_bt().t_post0;
+        }
         speculative_decoding_accept();
+        if (z6_bt().on) {
+            z6_bt().acc += ggml_time_us() - z6_t_acc;
+        }
 
         if (finish_prompt_warmup_batch) {
             llama_finish_dflash_capture_batch(ctx, true);
@@ -5584,6 +5663,9 @@ void server_context::update_slots() {
     // check if all slots are idle
     if (slots_idle()) {
         return;
+    }
+    if (z6_bt().on) {
+        z6_bt().begin();
     }
 
     {
@@ -5684,6 +5766,9 @@ void server_context::update_slots() {
             SLT_WRN(slot, "%s", "spec checkpoint unavailable; removed draft rows and continuing root-only\n");
         };
 
+        if (z6_bt().on) {
+            z6_bt().t_pre0 = ggml_time_us();
+        }
         for (auto & slot : slots) {
             if (slot.state != SLOT_STATE_PROCESSING || slot.i_batch_dft.empty()) {
                 continue;
@@ -5721,8 +5806,34 @@ void server_context::update_slots() {
         }
     }
 
+    if (z6_bt().on) {
+        auto & z6t = z6_bt();
+        if (z6t.t_pre0 != 0) {
+            z6t.pre += ggml_time_us() - z6t.t_pre0;
+        }
+        // single generating slot: N+1 rows with a draft, 1 row without; anything else (prompt) is not counted
+        z6t.cur = -1;
+        for (auto & slot : slots) {
+            if (slot.state != SLOT_STATE_PROCESSING) {
+                continue;
+            }
+            if (!slot.i_batch_dft.empty()) {
+                const int nd = (int) slot.drafted.size();
+                if (batch.n_tokens == nd + 1 && nd >= 1 && nd <= 16) {
+                    z6t.cur = nd;
+                }
+            } else if (batch.n_tokens == 1 && slot.i_batch >= 0) {
+                z6t.cur = z6t.last_draft ? 17 : 0;
+            }
+        }
+    }
+
     // process the created batch of tokens
     process_batch_tokens(n_batch); // Decode with batch
+
+    if (z6_bt().on) {
+        z6_bt().end();
+    }
 
     LOG_VERBOSE("run slots completed", {});
 }
