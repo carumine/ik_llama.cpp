@@ -23,7 +23,11 @@ static void ggml_cuda_op_mul_mat_vec_q_impl(ggml_backend_cuda_context & ctx, ggm
     // nrows_dst == nrows of the matrix that the kernel writes into
     const int64_t nrows_dst = id == ctx.device ? ne0 : row_diff;
 
-    if (src1_ncols > MMVQ_MAX_NCOLS_PASCAL) {
+    // Z6 (GGML_Z6_MMVQ_COLONNE): fuori da sm_60 i kernel a 9-12 colonne non esistono, quindi sopra 8 colonne si va a
+    // lanci da 8. Senza la variabile qui non arrivano mai più di 8 colonne.
+    const int z6_cc = ggml_cuda_info().devices[id].cc;
+    const bool z6_pascal = z6_cc == CC_PASCAL && ggml_cuda_highest_compiled_arch(z6_cc) == CC_PASCAL;
+    if (src1_ncols > MMVQ_MAX_NCOLS_PASCAL || (!z6_pascal && src1_ncols > MMVQ_MAX_BATCH_SIZE)) {
         const int64_t src1_col_size = src1_padded_row_size/QK8_1*sizeof(block_q8_1);
         for (int64_t i = 0; i < src1_ncols; i += MMVQ_MAX_BATCH_SIZE) {
             ggml_cuda_op_mul_mat_vec_q_impl(ctx, type, ne00, ne0, ne2, nb02, nb12, nb2, ids_nb0, bias_nb1,
