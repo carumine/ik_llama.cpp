@@ -1978,6 +1978,13 @@ static std::map<uintptr_t, z6_numa_vma> z6_read_numa_maps() {
     return result;
 }
 
+// Z6 (GGML_Z6_PIN_RIPROVA=1): a failed locked-slice mbind skips that allocation for the round instead of aborting the
+// load; the 8 rounds of the NUMA verification retry it. Unset: abort at the first failure, as before.
+static bool z6_pin_riprova() {
+    static const bool v = [] { const char * e = getenv("GGML_Z6_PIN_RIPROVA"); return e && atoi(e) > 0; }();
+    return v;
+}
+
 GGML_CALL bool ggml_backend_cuda_host_register_pending(void) {
     std::lock_guard<std::mutex> lock(z6_host_mutex);
     const auto policies = z6_read_numa_maps();
@@ -1986,6 +1993,8 @@ GGML_CALL bool ggml_backend_cuda_host_register_pending(void) {
     for (const auto & item : z6_host_ranges) if (!item.second.registered) pending.push_back(item.first);
     z6_pin_policy binding;
     for (int round = 0; round < 8; ++round) {
+        bool any_failed = false;
+        if (round > 0 && z6_pin_riprova()) usleep(2000000);
         for (void * allocation : pending) {
             auto & range = z6_host_ranges.at(allocation);
             if (range.registered) continue;
@@ -1995,6 +2004,7 @@ GGML_CALL bool ggml_backend_cuda_host_register_pending(void) {
             --policy;
             bool z6_owned = false;
             for (auto p = policy; p != policies.end() && p->first < end; ++p) z6_owned |= p->second.owner >= 0;
+            bool slice_failed = false;
             if (z6_numa_rows() && z6_owned) {
                 // Righe alternate fra i nodi: migliaia di VMA per tensore. Una sola registrazione
                 // dopo mlock e mbind di ogni VMA, invece di una per VMA.
@@ -2009,10 +2019,22 @@ GGML_CALL bool ggml_backend_cuda_host_register_pending(void) {
                     const uintptr_t b = next == policies.end() ? end : std::min(end, next->first);
                     unsigned long mask = 1UL << policy->second.owner;
                     if (b > a && syscall(SYS_mbind, (void *) a, b - a, 2, &mask, 64, 3) != 0) {
+                        const int err_mbind = errno;
                         munlock(allocation, range.size);
-                        GGML_CUDA_LOG_WARN("z6 pinned: locked-slice mbind failed\n");
-                        return false;
+                        GGML_CUDA_LOG_WARN("z6 pinned: locked-slice mbind failed (%s) at %p, %.2f MiB to node %d, pages N0=%zu N1=%zu\n",
+                                strerror(err_mbind), (void *) a, (b - a) / (1024.*1024.), policy->second.owner,
+                                policy->second.pages[0], policy->second.pages[1]);
+                        if (!z6_pin_riprova()) return false;
+                        slice_failed = true;
+                        break;
                     }
+                }
+                if (slice_failed) {
+                    // Z6 (GGML_Z6_PIN_RIPROVA=1): leave this allocation unregistered for this round; the
+                    // verification below marks the round as failed and the next round retries it, after
+                    // the other allocations have been moved and the kernel had time to free pages.
+                    any_failed = true;
+                    continue;
                 }
                 const auto err = cudaHostRegister(allocation, range.size, cudaHostRegisterPortable);
                 GGML_CUDA_LOG_INFO("z6 pin attempt: %p rows round=%d: %s\n", allocation, round + 1, cudaGetErrorString(err));
@@ -2061,10 +2083,13 @@ GGML_CALL bool ggml_backend_cuda_host_register_pending(void) {
         // One complete page-table walk per round, not one per slice.
         const auto actual = z6_read_numa_maps();
         if (actual.empty()) return false;
-        bool all_local = true;
+        bool all_local = !any_failed;
+        std::vector<std::pair<void *, size_t>> z6_bad;   // allocation, foreign pages (SIZE_MAX: a slice with none resident)
         for (void * allocation : pending) {
             auto & range = z6_host_ranges.at(allocation);
+            if (!range.registered) { all_local = false; continue; }
             bool bad = false;
+            size_t range_foreign = 0;
             for (size_t i = 0; i < range.registrations.size(); ++i) {
                 const uintptr_t begin = (uintptr_t) range.registrations[i];
                 const uintptr_t end = i + 1 < range.registrations.size() ?
@@ -2087,14 +2112,35 @@ GGML_CALL bool ggml_backend_cuda_host_register_pending(void) {
                     GGML_CUDA_LOG_INFO("z6 pin retry: %p node=%d round=%d foreign_pages=%zu resident=%zu\n",
                             (void *) begin, owner, round + 1, foreign, resident);
                     bad = true;
+                    range_foreign = !resident || range_foreign == SIZE_MAX ? SIZE_MAX : range_foreign + foreign;
                 }
             }
-            if (bad) {
-                for (void * ptr : range.registrations) CUDA_CHECK(cudaHostUnregister(ptr));
-                range.registrations.clear();
-                range.registered = false;
-                all_local = false;
+            if (bad) z6_bad.emplace_back(allocation, range_foreign);
+        }
+        // Z6 (GGML_Z6_PIN_TOLLERANZA_MIB=<N>): from the second round on, accept up to N MiB of pages on the other node in
+        // all, instead of unregistering and retrying. The numbers do not change (those pages are only read from the
+        // remote node); without it a load can fail for 111 pages after 8 rounds. Slices with no page resident are never
+        // accepted. Unset or 0: every foreign page is retried, as before.
+        static const size_t z6_tolleranza = [] {
+            const char * e = getenv("GGML_Z6_PIN_TOLLERANZA_MIB");
+            return e && atoi(e) > 0 ? (size_t) atoi(e) << 20 : (size_t) 0;
+        }();
+        if (z6_tolleranza && round > 0 && !z6_bad.empty()) {
+            size_t foreign = 0;
+            for (const auto & b : z6_bad) foreign = b.second == SIZE_MAX || foreign == SIZE_MAX ? SIZE_MAX : foreign + b.second;
+            const size_t page = (size_t) sysconf(_SC_PAGESIZE);
+            if (foreign != SIZE_MAX && foreign * page <= z6_tolleranza) {
+                GGML_CUDA_LOG_WARN("z6 pinned: round %d accepted %zu pages (%.2f MiB) on the other node in %zu ranges "
+                        "(GGML_Z6_PIN_TOLLERANZA_MIB)\n", round + 1, foreign, foreign * page / (1024.*1024.), z6_bad.size());
+                z6_bad.clear();
             }
+        }
+        for (const auto & b : z6_bad) {
+            auto & range = z6_host_ranges.at(b.first);
+            for (void * ptr : range.registrations) CUDA_CHECK(cudaHostUnregister(ptr));
+            range.registrations.clear();
+            range.registered = false;
+            all_local = false;
         }
         if (all_local) {
             for (void * allocation : pending) {

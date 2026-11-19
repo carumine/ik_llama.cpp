@@ -1690,6 +1690,12 @@ bool llama_model_loader::load_all_data(
         }
     };
 #endif
+    // Z6 (GGML_Z6_NUMA_PRIMA=1): with --no-mmap the owned host copies are written below without a policy, so the pages
+    // are born on the node of the worker and moved after the load (llama.cpp, before the CUDA registration), and the
+    // page cache of the file pushes them to the other node when a node is full. Binding the empty range first makes
+    // every page born on its node; the placement after the load becomes a check. The host buffers are deferred
+    // (ggml_cuda_host_malloc), so the range has no pages yet and the mbind moves nothing. Unset: as before.
+    static const bool z6_numa_prima = [] { const char * e = getenv("GGML_Z6_NUMA_PRIMA"); return e && atoi(e) > 0; }();
 
     // Load model weights into a backing buffer:
     // * mmap:               host page cache        Serial
@@ -1836,6 +1842,9 @@ bool llama_model_loader::load_all_data(
 
         // host. Parallel.
         if (ggml_backend_buffer_is_host(cur->buffer)) {
+#ifdef GGML_USE_CUDA
+            if (z6_numa_prima) z6_bind_owned(cur);
+#endif
             // Z6 (GGML_Z6_IQ3S_LUT=1): the file holds IQ3_S and the tensor was created with the reordered type
             // (create_tensors_helper::create_tensor). Read and convert in pieces through the worker's buffer: the
             // weights never exist twice in RAM. Progress counts the bytes of the file, as for every other tensor.

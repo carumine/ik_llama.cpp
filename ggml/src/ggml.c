@@ -19662,6 +19662,24 @@ bool ggml_z6_numa_place_tensor(const struct ggml_tensor * t) {
     return true;
 }
 
+// Same arithmetic as ggml_z6_numa_place_tensor, without the page rounding (at most one page per cut). Two nodes, as the
+// placement itself (listed in piu-gpu.md, «Codice a N GPU»).
+int ggml_z6_numa_bytes_per_node(const struct ggml_tensor * t, size_t * out, int n) {
+    if (!t || !out || n < 2 || !z6_numa_experts() || t->ne[2] < 2) return 0;
+    z6_options_init();
+    const int64_t n_as = t->ne[2];
+    if (z6_options.rows && t->ne[1] >= 64) {
+        const int64_t r = z6_row_split_t(t, t->ne[1]);
+        out[0] += (size_t) n_as * (size_t) r * t->nb[1];
+        out[1] += (size_t) n_as * (t->nb[2] - (size_t) r * t->nb[1]);
+    } else {
+        const int k = z6_split((int) n_as);
+        out[0] += (size_t) k * t->nb[2];
+        out[1] += (size_t) (n_as - k) * t->nb[2];
+    }
+    return 2;
+}
+
 // Z6 (GGML_Z6_IQ3S_LUT=1): the IQ3_S experts that stay in RAM are stored as GGML_TYPE_IQ3_S_Z6, 4 bits per weight
 // (134 bytes per block of 256 weights instead of 110). The single-column kernel of generation then decodes 64 weights
 // with one load and two vpshufb instead of 16 gathered grid entries. Magnitudes, signs, scales and summation order
@@ -19686,7 +19704,49 @@ bool ggml_z6_iq3s_lut_requested(void) {
     return v;
 }
 
+// Z6 (GGML_Z6_IQ3S_LUT_LIVELLI=<list>): reorder only the experts of these layers, so that the larger block fits in the
+// memory left on each node. List of numbers and ranges, "3-10,13,21,25-29"; spaces ignored. Unset or empty: every
 // layer, as with GGML_Z6_IQ3S_LUT=1 alone. Up, gate and down of a layer share the choice. A malformed list selects
+// nothing (and says so) rather than everything.
+bool ggml_z6_layer_in_list(const char * list, int il) {
+    if (!list) return true;
+    const char * p = list;
+    while (*p == ' ') ++p;
+    if (!*p) return true;
+    while (*p) {
+        char * end = NULL;
+        long a = strtol(p, &end, 10);
+        if (end == p) return false;
+        long b = a;
+        p = end;
+        while (*p == ' ') ++p;
+        if (*p == '-') {
+            ++p;
+            b = strtol(p, &end, 10);
+            if (end == p) return false;
+            p = end;
+            while (*p == ' ') ++p;
+        }
+        if (a <= il && il <= b) return true;
+        if (*p == ',') { ++p; while (*p == ' ') ++p; continue; }
+        if (*p) return false;
+    }
+    return false;
+}
+
+bool ggml_z6_iq3s_lut_layer(int il) {
+    static const char * list = NULL;
+    static int init = 0;
+    if (!init) {
+        list = getenv("GGML_Z6_IQ3S_LUT_LIVELLI");
+        init = 1;
+        if (list && strspn(list, "0123456789-, ") != strlen(list)) {
+            fprintf(stderr, "z6: GGML_Z6_IQ3S_LUT_LIVELLI='%s' is malformed: no layer reordered\n", list);
+        }
+    }
+    return ggml_z6_layer_in_list(list, il);
+}
+
 // Before allocation only: the block grows from 110 to 134 bytes, so the strides and the buffer size change.
 bool ggml_z6_iq3s_lut_retype(struct ggml_tensor * t) {
     if (!t || t->type != GGML_TYPE_IQ3_S || t->data || t->buffer || t->view_src || t->ne[0] % QK_K != 0) return false;
