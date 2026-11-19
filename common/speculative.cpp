@@ -2252,6 +2252,18 @@ bool common_speculative_prepare_mtp_runtime(
     params.cparams_dft.mtp_op_type = MTP_OP_WARMUP;
     params.cparams_dft.embeddings  = true;
 
+    // Z6 (IK_Z6_MTP_UBATCH=<n>): microbatch of the MTP context only. Its compute buffer is reserved for the microbatch
+    // of the target (432 MiB on CUDA1 with 1024 on GLM-5.3-Flash), but the context runs one layer: the warmup of a
+    // prompt in smaller pieces costs little and the buffer shrinks with n. The batch size stays as it is, so the
+    // server keeps passing the same batches and llama_decode cuts them.
+    if (const char * e = getenv("IK_Z6_MTP_UBATCH")) {
+        const int n = atoi(e);
+        if (n >= 32 && (uint32_t) n < params.cparams_dft.n_ubatch) {
+            LOG_INF("%s: z6 MTP context n_ubatch %u -> %d\n", __func__, params.cparams_dft.n_ubatch, n);
+            params.cparams_dft.n_ubatch = (uint32_t) n;
+        }
+    }
+
     return true;
 }
 

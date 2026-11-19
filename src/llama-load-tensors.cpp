@@ -300,6 +300,13 @@ create_tensors_helper::create_tensors_helper(llama_model_loader & _ml, llama_mod
         if (model.split_mode == LLAMA_SPLIT_MODE_GRAPH || ml.ncmoe >= n_layer || model.devices.size() < 2) {
             const auto tn = LLM_TN(model.arch);
             int last_layer = n_layer - model.hparams.nextn_predict_layers;
+            // Z6 (GGML_Z6_MTP_ESPERTI_CPU=1): --cpu-moe leaves the experts of the MTP (nextn) layers on the GPU, on the
+            // last device: on GLM-5.3-Flash that is 3276 MiB of CUDA1 for one layer that runs once or twice per draft.
+            // With the variable they stay in RAM like the experts of the trunk and take the same CPU path.
+            static const bool z6_mtp_cpu = [] { const char * e = getenv("GGML_Z6_MTP_ESPERTI_CPU"); return e && atoi(e) > 0; }();
+            if (z6_mtp_cpu && ml.ncmoe >= n_layer) {
+                last_layer = n_layer;
+            }
             int ndone = 0;
             for (int i = last_layer-1; i >= 0; --i) {
                 auto d_name = tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i);
