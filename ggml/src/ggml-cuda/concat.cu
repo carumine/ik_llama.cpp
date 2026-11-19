@@ -7,6 +7,14 @@
 
 #include "concat.cuh"
 
+// One thread per value for the narrow decode PLE concatenation.
+static __global__ void z6_concat_ple_flat(const uint32_t * x, const uint32_t * y, uint32_t * dst, int nx) {
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= 10*10240) return;
+    const int row = i/10, col = i%10;
+    dst[i] = col < nx ? x[row*nx+col] : y[row*(10-nx)+col-nx];
+}
+
 // contiguous kernels
 static __global__ void concat_f32_dim0(const float * x, const float * y, float * dst, const int64_t ne0, const int64_t ne00) {
     int nidx = threadIdx.x + blockIdx.x * blockDim.x;
@@ -257,6 +265,17 @@ void ggml_cuda_op_concat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     cudaStream_t stream = ctx.stream();
 
     const int32_t dim = ((int32_t *) dst->op_params)[0];
+
+    static const bool z6_flat = [] {
+        const char * e = getenv("GGML_Z6_CONCAT_PIATTA"); return e && atoi(e) > 0;
+    }();
+    if (z6_flat && dim == 0 && dst->type == GGML_TYPE_F32 &&
+        dst->ne[0] == 10 && dst->ne[1] == 10240 && dst->ne[2] == 1 && dst->ne[3] == 1 &&
+        ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst)) {
+        z6_concat_ple_flat<<<400, 256, 0, stream>>>((const uint32_t *)src0->data,
+            (const uint32_t *)src1->data, (uint32_t *)dst->data, src0->ne[0]);
+        return;
+    }
 
     if (ggml_is_contiguous(src0) && ggml_is_contiguous(src1) &&
         (dim == 3 || (dim == 2 && dst->ne[3] == 1) || (dim == 1 && dst->ne[2]*dst->ne[3] == 1))) {

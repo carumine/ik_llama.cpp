@@ -49,6 +49,9 @@ struct ggml_cuda_graph {
     std::vector<char *> cpy_dest_ptrs;
     char ** dest_ptrs_d = nullptr;
     int dest_ptrs_size = 0;
+    // Z6 (GGML_Z6_LANCIO_LEGGERO=1): the destination table last copied to dest_ptrs_d. When the new table is equal
+    // the device already holds it and the per-launch host-to-device copy from pageable memory is skipped
+    std::vector<char *> z6_dest_ptrs_copiati;
     // Index to allow each cpy kernel to be aware of it's position within the graph
     // relative to other cpy nodes.
     int graph_cpynode_index = -1;

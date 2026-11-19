@@ -1,4 +1,6 @@
 #include "cpy.cuh"
+#include <atomic>
+#include <cstring>
 #include "dequantize.cuh"
 #include "graph.cuh"
 #include "cpy-utils.cuh"
@@ -168,6 +170,13 @@ static __global__ void cpy_q_f32(const char * cx, char * cdst_direct, const int 
 
 void ggml_cuda_cpy_dest_ptrs_copy(ggml_cuda_graph * cuda_graph, char ** host_dest_ptrs, const int host_dest_ptrs_size, cudaStream_t stream) {
 #if defined(GGML_CUDA_USE_GRAPHS) || defined(GGML_HIP_GRAPHS) || defined(GGML_MUSA_GRAPHS)
+    // Z6 (GGML_Z6_LANCIO_LEGGERO=1): skip the copy when dest_ptrs_d already holds this exact table. The device table
+    // belongs to this cuda_graph only and is written only here, so an equal table means equal device contents.
+    // In Qwen's 36 delta-net layers the copy destinations (the recurrent state) never move from token to token.
+    static const bool z6_leggero = [] { const char * e = getenv("GGML_Z6_LANCIO_LEGGERO"); return e && atoi(e) > 0; }();
+    static const bool z6_conta = [] { const char * e = getenv("GGML_Z6_TEMPI"); return e && atoi(e) > 0; }();
+    static std::atomic<int64_t> z6_copiate{0}, z6_saltate{0};
+    bool z6_salta = false;
     if (cuda_graph->dest_ptrs_size < host_dest_ptrs_size) { // (re-)allocate GPU memory for destination pointers
         CUDA_CHECK(cudaStreamSynchronize(stream));
         if (cuda_graph->dest_ptrs_d != nullptr) {
@@ -175,9 +184,22 @@ void ggml_cuda_cpy_dest_ptrs_copy(ggml_cuda_graph * cuda_graph, char ** host_des
         }
         CUDA_CHECK(cudaMalloc(&cuda_graph->dest_ptrs_d, host_dest_ptrs_size*sizeof(char *)));
         cuda_graph->dest_ptrs_size = host_dest_ptrs_size;
+        cuda_graph->z6_dest_ptrs_copiati.clear();
+    } else if (z6_leggero && host_dest_ptrs_size > 0 &&
+               cuda_graph->z6_dest_ptrs_copiati.size() == (size_t) host_dest_ptrs_size &&
+               memcmp(cuda_graph->z6_dest_ptrs_copiati.data(), host_dest_ptrs, host_dest_ptrs_size*sizeof(char *)) == 0) {
+        z6_salta = true;
     }
-    // copy destination pointers to GPU
-    CUDA_CHECK(cudaMemcpyAsync(cuda_graph->dest_ptrs_d, host_dest_ptrs, host_dest_ptrs_size*sizeof(char *), cudaMemcpyHostToDevice, stream));
+    if (!z6_salta) {
+        // copy destination pointers to GPU
+        CUDA_CHECK(cudaMemcpyAsync(cuda_graph->dest_ptrs_d, host_dest_ptrs, host_dest_ptrs_size*sizeof(char *), cudaMemcpyHostToDevice, stream));
+        if (z6_leggero) cuda_graph->z6_dest_ptrs_copiati.assign(host_dest_ptrs, host_dest_ptrs + host_dest_ptrs_size);
+    }
+    if (z6_leggero && z6_conta) {
+        const int64_t n = (z6_salta ? ++z6_saltate : ++z6_copiate) + (z6_salta ? z6_copiate.load() : z6_saltate.load());
+        if (n % 20000 == 0) fprintf(stderr, "z6 lancio leggero: tabelle dei puntatori copiate %lld, saltate %lld\n",
+                (long long) z6_copiate.load(), (long long) z6_saltate.load());
+    }
     cuda_graph->graph_cpynode_index = 0; // reset index
 #else
     GGML_UNUSED(cuda_graph); GGML_UNUSED(host_dest_ptrs);

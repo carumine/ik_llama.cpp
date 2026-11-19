@@ -5541,8 +5541,13 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                     cgraph->nodes[i+5]->op == GGML_OP_RESHAPE  &&
                     cgraph->nodes[i+6]->op == GGML_OP_SUM_ROWS &&
                     cgraph->nodes[i+7]->op == GGML_OP_DIV) {
-                    ggml_cuda_op_topk_moe(ctx, cgraph->nodes[i], cgraph->nodes[i+7], cgraph->nodes[i+3]);
-                    i += 7;
+                    ggml_tensor * maps[2] = {};
+                    const int last = ggml_cuda_z6_topk_maps(cgraph, i+7, cgraph->nodes[i+3], cgraph->nodes[i+7], maps);
+                    const bool mapped = last > i+7 && dst->ne[0] == 512 && dst->ne[1] == 1 &&
+                        ops_are_same_device(cgraph, i, last);
+                    ggml_cuda_op_topk_moe(ctx, cgraph->nodes[i], cgraph->nodes[i+7], cgraph->nodes[i+3], nullptr,
+                                         mapped ? maps[0] : nullptr, mapped ? maps[1] : nullptr);
+                    i = mapped ? last : i+7;
                 } else {
                     ggml_cuda_op_topk_moe(ctx, cgraph->nodes[i], cgraph->nodes[i+4], cgraph->nodes[i+3]);
                     i += 4;

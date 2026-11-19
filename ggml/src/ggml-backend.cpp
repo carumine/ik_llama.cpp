@@ -2574,9 +2574,44 @@ static bool ggml_backend_sched_copy_inputs(ggml_backend_sched_t sched, ggml_back
     std::set<ggml_backend_t> backends_to_sync;
     bool synced_on_input = false;
     const int n_input_passes = sched->callback_copy ? 2 : 1;
+#ifdef GGML_USE_CUDA
+    // Z6 (GGML_Z6_D2H_PREFISSO=1): a CPU split fed by several GPUs (the join of Qwen's head, split across the cards)
+    // used to wait for each GPU in turn and then copy its result synchronously. Here every GPU-to-CPU copy is queued
+    // first on its producer's stream, behind the work that writes it, into the pinned CPU compute buffer; then each
+    // producer is waited for once. Same bytes, same order on each stream.
+    static const bool z6_d2h = [] { const char * e = getenv("GGML_Z6_D2H_PREFISSO"); return e && atoi(e) > 0; }();
+    uint64_t z6_d2h_fatti = 0; // bit j: input j already copied here
+    if (z6_d2h && !sched->callback_copy && ggml_backend_is_cpu(split_backend) && split->n_inputs <= 64) {
+        std::array<bool, GGML_SCHED_MAX_BACKENDS> z6_attendi = {};
+        for (int j = 0; j < split->n_inputs; ++j) {
+            ggml_tensor * input = split->inputs[j];
+            ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, input);
+            ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
+            const int b = input_backend ? ggml_backend_sched_backend_id(sched, input_backend) : -1;
+            if (b < 0 || (input->flags & GGML_TENSOR_FLAG_INPUT) || !ggml_backend_is_cuda(input_backend) ||
+                    !input_cpy->buffer || !ggml_backend_buffer_is_host(input_cpy->buffer) ||
+                    !ggml_is_contiguous(input) || !ggml_is_contiguous(input_cpy) || ggml_nbytes(input) != ggml_nbytes(input_cpy)) continue;
+            if (needs_sync[split_backend_id]) {
+                if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+                    ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
+                } else {
+                    ggml_backend_synchronize(split_backend);
+                }
+                needs_sync[split_backend_id] = k_set_sync;
+            }
+            ggml_backend_tensor_get_async(input_backend, input, input_cpy->data, 0, ggml_nbytes(input));
+            z6_attendi[b] = true;
+            z6_d2h_fatti |= uint64_t(1) << j;
+        }
+        for (int b = 0; b < sched->n_backends; ++b) if (z6_attendi[b]) ggml_backend_synchronize(sched->backends[b]);
+    }
+#else
+    const uint64_t z6_d2h_fatti = 0;
+#endif
     for (int pass_input = 0; pass_input < n_input_passes*split->n_inputs; ++pass_input) {
         const bool callback_copy_pass = pass_input >= split->n_inputs;
         const int j = pass_input % split->n_inputs;
+        if (z6_d2h_fatti & (uint64_t(1) << j)) continue;
         ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[j]);
         struct ggml_tensor * input = split->inputs[j];
         struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);

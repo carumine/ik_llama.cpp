@@ -216,7 +216,9 @@ void ggml_cuda_op_topk_moe(ggml_backend_cuda_context & ctx,
                            const ggml_tensor *         logits,
                            ggml_tensor *               weights,
                            ggml_tensor *               ids,
-                           ggml_tensor *               bias) {
+                           ggml_tensor *               bias,
+                           ggml_tensor *               map0,
+                           ggml_tensor *               map1) {
     GGML_ASSERT(logits->type == GGML_TYPE_F32);
     GGML_ASSERT(weights->type == GGML_TYPE_F32);
     GGML_ASSERT(ids->type == GGML_TYPE_I32);
@@ -258,7 +260,13 @@ void ggml_cuda_op_topk_moe(ggml_backend_cuda_context & ctx,
     if (normalize) {
         static const bool z6 = [] { const char * e = getenv("GGML_Z6_TOPK_MOE"); return e && atoi(e) > 0; }();
         if (z6 && n_rows == 1 && n_experts == 512 && n_expert_used == 10 && !bias) {
-            z6_topk_moe_cuda<true><<<1, WARP_SIZE, 0, stream>>>(logits_d, weights_d, ids_d);
+            if (map0 && map1) {
+                z6_topk_moe_cuda<true, true><<<1, WARP_SIZE, 0, stream>>>(logits_d, weights_d, ids_d,
+                    (const int32_t *)map0->src[0]->data, (const int32_t *)map1->src[0]->data,
+                    (int32_t *)map0->data, (int32_t *)map1->data);
+            } else {
+                z6_topk_moe_cuda<true><<<1, WARP_SIZE, 0, stream>>>(logits_d, weights_d, ids_d);
+            }
             return;
         }
         launch_topk_moe_cuda<true >(ctx, logits_d, weights_d, ids_d, bias_d, n_rows, n_experts, n_expert_used);
@@ -294,4 +302,41 @@ bool ggml_cuda_should_use_topk_moe(const ggml_tensor * softmax, const ggml_tenso
     }
 
     return true;
+}
+
+// Decode-only fusion. Views have no device work. Stop at every other operation;
+// preserve the original outputs and reject allocator aliases between them.
+int ggml_cuda_z6_topk_maps(const ggml_cgraph * graph, int start,
+                          const ggml_tensor * ids, const ggml_tensor * weights, ggml_tensor ** maps) {
+    static const bool enabled = [] {
+        const char * a = getenv("GGML_Z6_TOPK_MAPPE");
+        const char * b = getenv("GGML_Z6_TOPK_MOE");
+        return a && atoi(a) > 0 && b && atoi(b) > 0;
+    }();
+    if (!enabled || ids->type != GGML_TYPE_I32 || ggml_nelements(ids) != 10 ||
+        weights->op != GGML_OP_DIV || ggml_nelements(weights) != 10) return start;
+    int found = 0, last = start;
+    for (int j = start+1; j < graph->n_nodes && j <= start+16 && found < 2; ++j) {
+        auto t = graph->nodes[j];
+        if (t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE) continue;
+        if (t->op != GGML_OP_GET_ROWS || t->op_params[0] != 0 || !t->src[0] || !t->src[1]) return start;
+        auto m = t->src[0]; auto idx = t->src[1];
+        if (t->type != GGML_TYPE_I32 || m->type != GGML_TYPE_I32 || idx->type != GGML_TYPE_I32 ||
+            !ggml_is_contiguous(t) || !ggml_is_contiguous(m) || !ggml_is_contiguous(idx) ||
+            ggml_nelements(t) != 10 || ggml_nelements(idx) != 10 ||
+            m->ne[0] != 1 || m->ne[1] != 512 || ggml_nelements(m) != 512 ||
+            idx->data != ids->data || m->op != GGML_OP_NONE) return start;
+        maps[found++] = t; last = j;
+    }
+    if (found != 2) return start;
+    auto overlap = [](const ggml_tensor * a, const ggml_tensor * b) {
+        uintptr_t x = (uintptr_t)a->data, y = (uintptr_t)b->data;
+        return x < y+ggml_nbytes(b) && y < x+ggml_nbytes(a);
+    };
+    const ggml_tensor * outputs[] = {ids, weights, maps[0], maps[1]};
+    for (int a = 0; a < 4; ++a) {
+        for (int b = a+1; b < 4; ++b) if (overlap(outputs[a],outputs[b])) return start;
+        for (int b = 0; b < 2; ++b) if (overlap(outputs[a],maps[b]->src[0])) return start;
+    }
+    return last;
 }

@@ -2,8 +2,10 @@
 
 // One warp per token, register-only selection. Keep the reference softmax and
 // normalization order; avoid the dynamically indexed wt[] store in topk_moe_cuda.
-template <bool normalize>
-static __global__ void z6_topk_moe_cuda(const float * logits, float * weights, int32_t * ids) {
+template <bool normalize, bool maps = false>
+static __global__ void z6_topk_moe_cuda(const float * logits, float * weights, int32_t * ids,
+        const int32_t * map0 = nullptr, const int32_t * map1 = nullptr,
+        int32_t * mapped0 = nullptr, int32_t * mapped1 = nullptr) {
     const int lane = threadIdx.x;
     float w[16];
     float maxv = -INFINITY;
@@ -57,6 +59,10 @@ static __global__ void z6_topk_moe_cuda(const float * logits, float * weights, i
 #endif
         if (lane == k) {
             ids[k] = chosen;
+            if constexpr (maps) {
+                mapped0[k] = map0[chosen];
+                mapped1[k] = map1[chosen];
+            }
         }
 #pragma unroll
         for (int j = 0; j < 16; ++j) {
