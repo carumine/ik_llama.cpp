@@ -91,6 +91,15 @@ static clip_flash_attn_type mtmd_get_clip_flash_attn_type(enum llama_flash_attn_
     return CLIP_FLASH_ATTN_TYPE_AUTO;
 }
 
+// Z6 (19/11/2026, Fable 28): upstream keeps flash attention off in the image encoder (#993). On the CPU the
+// non-flash path walks the 16 heads one at a time with a 4160x4160 KQ matrix each, bound by RAM bandwidth.
+// IK_Z6_MTMD_FA=1 lets clip pick flash attention when the backend supports it (AUTO, with clip's own fallback);
+// unset or 0 keeps today's behaviour. The embeddings change in the last bits: validate the answers after an image.
+static clip_flash_attn_type z6_mtmd_flash_attn_type() {
+    const char * v = std::getenv("IK_Z6_MTMD_FA");
+    return (v && std::atoi(v) > 0) ? CLIP_FLASH_ATTN_TYPE_AUTO : CLIP_FLASH_ATTN_TYPE_DISABLED;
+}
+
 mtmd_context_params mtmd_context_params_default() {
     mtmd_context_params params {
         /* use_gpu           */ true,
@@ -168,7 +177,7 @@ struct mtmd_context {
         clip_context_params ctx_clip_params {
             /* use_gpu           */ ctx_params.use_gpu,
             /* verbosity         */ ctx_params.verbosity,
-            /* flash_attn_type   */ CLIP_FLASH_ATTN_TYPE_DISABLED,
+            /* flash_attn_type   */ z6_mtmd_flash_attn_type(),
             /* image_min_tokens  */ ctx_params.image_min_tokens,
             /* image_max_tokens  */ ctx_params.image_max_tokens,
             /* kq_type           */ ctx_params.kq_type,

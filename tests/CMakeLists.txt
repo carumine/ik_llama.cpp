@@ -30,6 +30,9 @@ target_link_libraries(test-z6-glm-pair PRIVATE common)
 # logica della cache dei pool DSA di GLM (GGML_Z6_DSA_POOL_CACHE): solo CPU, senza modello
 add_executable(test-z6-kpool test-z6-kpool.cpp)
 target_include_directories(test-z6-kpool PRIVATE ../src)
+# speculative drafts with images (IK_Z6_SPEC_MTMD): no model
+add_executable(test-z6-bozze-mtmd test-z6-bozze-mtmd.cpp)
+target_link_libraries(test-z6-bozze-mtmd PRIVATE common)
 # bias dei pool della DSA di GLM in F16 (GGML_Z6_DSA_BIAS_F16): somma e top-k identici, sulla GPU, senza modello
 if (GGML_CUDA)
     add_executable(test-z6-dsa-bias test-z6-dsa-bias.cpp)

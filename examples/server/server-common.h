@@ -437,6 +437,8 @@ public:
 
     // for compatibility with speculative decoding, ctx shift, slot save/load
     const std::vector<llama_token>& get_text_tokens() const;
+    // Z6: the token vector also with mtmd, image tokens as LLAMA_TOKEN_NULL (for the ngram drafts, IK_Z6_SPEC_MTMD)
+    const std::vector<llama_token>& get_tokens_raw() const { return tokens; }
 
     // for compatibility with speculative decoding
     void set_token(llama_pos pos, llama_token id);
@@ -494,7 +496,7 @@ public:
 // Computes FNV-1a hash of the data
 std::string fnv_hash(const uint8_t* data, size_t len);
 
-server_tokens process_mtmd_prompt(mtmd_context* mctx, std::string prompt, std::vector<raw_buffer> files);
+server_tokens process_mtmd_prompt(mtmd_context* mctx, std::string prompt, std::vector<raw_buffer> files, const llama_vocab * vocab = nullptr);
 
 /**
  * break the input "prompt" object into multiple prompt if needed, then tokenize them

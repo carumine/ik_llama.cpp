@@ -32,6 +32,37 @@ void common_ngram_mod::add(const entry_t * tokens) {
     entries[i] = tokens[n];
 }
 
+void common_ngram_mod::add_range(const entry_t * tokens, size_t i0, size_t i1, entry_t skip) {
+    if (i0 >= i1) {
+        return;
+    }
+    // last index holding `skip` among the tokens read so far; window i is clean when it is < i
+    ptrdiff_t last = -1;
+    for (size_t j = i0; j < i0 + n; ++j) {
+        if (tokens[j] == skip) {
+            last = (ptrdiff_t) j;
+        }
+    }
+    for (size_t i = i0; i < i1; ++i) {
+        if (tokens[i + n] == skip) {
+            last = (ptrdiff_t) (i + n);
+        }
+        if (last >= (ptrdiff_t) i) {
+            continue;
+        }
+        add(tokens + i);
+    }
+}
+
+bool common_ngram_mod::has(const entry_t * tokens, entry_t skip) const {
+    for (size_t i = 0; i < n; ++i) {
+        if (tokens[i] == skip) {
+            return true;
+        }
+    }
+    return false;
+}
+
 common_ngram_mod::entry_t common_ngram_mod::get(const entry_t * tokens) const {
     const size_t i = idx(tokens);
 

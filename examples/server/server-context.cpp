@@ -18,6 +18,20 @@
 #include <regex>
 #include <exception>
 #include <unordered_map>
+// Z6 (IK_Z6_SPEC_MTMD=1): ngram-mod drafts also with a multimodal projector loaded. The draft reads the raw token
+// vector, where every image token is LLAMA_TOKEN_NULL; the n-gram windows that touch one are skipped
+// (common_ngram_mod::add_range) and no draft is made while the lookup window contains one, so a draft is always text.
+// Verification, rollback and checkpoints already take their positions from server_tokens::pos_next(), which knows
+// the images (M-RoPE: n_pos != n_tokens). Off: ngram drafts are disabled with mtmd as before.
+static bool z6_spec_mtmd() {
+    static const bool v = [] { const char * e = getenv("IK_Z6_SPEC_MTMD"); return e && atoi(e) > 0; }();
+    return v;
+}
+
+// token history for the draft stages: with mtmd and IK_Z6_SPEC_MTMD the raw vector (image tokens are -1)
+static const llama_tokens & z6_spec_tokens(const server_tokens & t) {
+    return t.has_mtmd && z6_spec_mtmd() ? t.get_tokens_raw() : t.get_text_tokens();
+}
 
 // DFlash/DSpark (draft model family) and MTP stages work with multimodal
 static bool server_speculative_multimodal_supported(const common_params_speculative & params) {
@@ -27,7 +41,8 @@ static bool server_speculative_multimodal_supported(const common_params_speculat
     }
     for (const auto & stage : stages) {
         if (stage.type != COMMON_SPECULATIVE_TYPE_MTP &&
-                !common_speculative_type_is_dflash_family(stage.type)) {
+                !common_speculative_type_is_dflash_family(stage.type) &&
+                !(z6_spec_mtmd() && stage.type == COMMON_SPECULATIVE_TYPE_NGRAM_MOD)) {
             return false;
         }
     }
@@ -3772,7 +3787,7 @@ static void z6_registro_scrivi(const server_slot & slot) {
     if (f == nullptr) {
         return;
     }
-    const std::vector<llama_token> & toks = slot.cache_tokens.get_text_tokens();
+    const std::vector<llama_token> & toks = z6_spec_tokens(slot.cache_tokens);
     const int32_t testa[4] = { 0x5A365247, slot.n_prompt_tokens, (int32_t) toks.size(), slot.sampled };
     fwrite(testa, sizeof(testa), 1, f);
     fwrite(toks.data(), sizeof(llama_token), toks.size(), f);
@@ -3901,7 +3916,7 @@ void server_context::add_sampled_tokens() {
                 ? empty_prompt
                 : slot.uses_mtp() && !slot.params.speculative.has_composite_stage_chain()
                     ? empty_prompt
-                    : slot.cache_tokens.get_text_tokens();
+                    : z6_spec_tokens(slot.cache_tokens);
 
             auto & params_spec = slot.params.speculative;
             const llama_pos draft_base_pos = slot.uses_mtp() ? slot.cache_tokens.pos_next() : -1;
@@ -4615,6 +4630,17 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
                     slot.n_past_prompt += n_tokens_out;
                     slot.n_prompt_tokens_processed += n_tokens_out;
                     slot.image_just_processed = true; // do not checkpoint right after an image chunk
+                    // Z6 (IK_Z6_CKPT_DOPO_IMMAGINE=1): with a recurrent (hybrid) model the server can only resume from a
+                    // checkpoint, and none is ever taken at the end of an image: the -ctx-ckpt-t one falls inside the
+                    // image when the text after it is short, so every later request re-encodes the whole image (16/11:
+                    // ~17 s per screenshot per request, 85-90 s with 5 in the history). A checkpoint here sits exactly at
+                    // the end of the image chunk (positions from pos_next(), as apply_checkpoint expects).
+                    static const bool z6_ckpt_img = [] { const char * e = getenv("IK_Z6_CKPT_DOPO_IMMAGINE"); return e && atoi(e) > 0; }();
+                    if (z6_ckpt_img && params_base.do_checkpoint && llama_model_has_recurrent(model)) {
+                        slot.image_just_processed = false;
+                        create_checkpoint(slot);
+                        slot.image_just_processed = true;
+                    }
                 }
 
 
@@ -5430,7 +5456,7 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
                     ? empty_prompt
                     : slot.uses_mtp() && !slot.params.speculative.has_composite_stage_chain()
                         ? empty_prompt
-                        : slot.cache_tokens.get_text_tokens();
+                        : z6_spec_tokens(slot.cache_tokens);
                 common_speculative_begin(slot.spec, spec_prompt);
             }
 

@@ -1,4 +1,5 @@
 #include "server-common.h"
+#include "z6-media-pos.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -1264,6 +1265,18 @@ server_tokens::server_tokens(mtmd::input_chunks& mtmd_chunks, bool has_mtmd) : h
 
 server_tokens::server_tokens(const llama_tokens& tokens, bool has_mtmd) : has_mtmd(has_mtmd), tokens(tokens) {}
 
+// Z6 (IK_Z6_MTMD_VELOCE=1): costs of a loaded mmproj, same results. Positions from the media map (z6-media-pos.h)
+// and, for chat requests without images, the tokenizer cache of IK_Z6_TOKEN_CACHE instead of mtmd_tokenize.
+static bool z6_mtmd_veloce() {
+    static const bool v = [] { const char * e = getenv("IK_Z6_MTMD_VELOCE"); return e && atoi(e) > 0; }();
+    return v;
+}
+
+static void z6_chunk_info(const mtmd::input_chunk_ptr & chunk, size_t & n_tok, int64_t & n_pos) {
+    n_tok = mtmd_input_chunk_get_n_tokens(chunk.get());
+    n_pos = mtmd_input_chunk_get_n_pos(chunk.get());
+}
+
 llama_pos server_tokens::pos_next(int64_t n_tokens) const {
     if (!has_mtmd) {
         if (n_tokens < 0) {
@@ -1271,6 +1284,11 @@ llama_pos server_tokens::pos_next(int64_t n_tokens) const {
         }
 
         return n_tokens;
+    }
+
+    if (z6_mtmd_veloce() && n_tokens >= 0) {
+        GGML_ASSERT(n_tokens <= (int64_t)tokens.size());
+        return (llama_pos) z6_media_pos_next(map_idx_to_media, n_tokens, z6_chunk_info);
     }
 
     if (n_tokens < 0) {
@@ -1311,6 +1329,10 @@ llama_pos server_tokens::pos_next(int64_t n_tokens) const {
 size_t server_tokens::size_up_to_pos(llama_pos max_pos) const {
     if (!has_mtmd) {
         return std::min((size_t)max_pos, tokens.size());
+    }
+
+    if (z6_mtmd_veloce()) {
+        return z6_media_size_up_to_pos(map_idx_to_media, tokens.size(), max_pos, z6_chunk_info);
     }
 
     size_t idx = 0;
@@ -1486,6 +1508,11 @@ bool server_tokens::empty() const {
 
 void server_tokens::clear() {
     tokens.clear();
+    // Z6 (IK_Z6_MTMD_VELOCE): the media map is emptied too, otherwise pos_next(n) from the map would count chunks of
+    // the previous content (Fable 15, V6). Without the variable the map is kept as before.
+    if (z6_mtmd_veloce()) {
+        map_idx_to_media.clear();
+    }
 }
 
 void server_tokens::keep_first(size_t n) {
@@ -1959,7 +1986,28 @@ std::string fnv_hash(const uint8_t* data, size_t len) {
     return std::to_string(hash);
 }
 
-server_tokens process_mtmd_prompt(mtmd_context* mctx, std::string prompt, std::vector<raw_buffer> files) {
+server_tokens process_mtmd_prompt(mtmd_context* mctx, std::string prompt, std::vector<raw_buffer> files, const llama_vocab * vocab) {
+    // Z6 (IK_Z6_MTMD_VELOCE=1 with IK_Z6_TOKEN_CACHE): a chat without images and without media markers is plain
+    // text for mtmd_tokenize too (one text chunk, BOS/EOS as the vocabulary says), so the tokenizer cache can serve
+    // it. With IK_Z6_TOKEN_CACHE=2 the result is checked against mtmd_tokenize and that one is used if different.
+    if (vocab != nullptr && files.empty() && z6_mtmd_veloce() && z6_token_cache_modo() > 0 && prompt.size() >= 4096 &&
+            prompt.find(mtmd_default_marker()) == std::string::npos &&
+            prompt.find(MTMD_DEFAULT_IMAGE_MARKER) == std::string::npos &&
+            prompt.find(get_media_marker()) == std::string::npos) {
+        std::vector<llama_token> tmp = z6_tokenize_cache(vocab, prompt, true);
+        if (z6_token_cache_modo() < 2) {
+            return server_tokens(tmp, true);
+        }
+        mtmd_input_text inp = { prompt.c_str(), prompt.size(), /* add_special */ true, /* parse_special */ true };
+        mtmd::input_chunks ch(mtmd_input_chunks_init());
+        if (mtmd_tokenize(mctx, ch.ptr.get(), &inp, nullptr, 0) == 0) {
+            server_tokens ref(ch, true);
+            const bool uguale = ref.size() == tmp.size() && !ref.has_mtmd_data() &&
+                                std::equal(tmp.begin(), tmp.end(), ref.get_tokens_raw().begin());
+            LOG_INF("z6 token cache mtmd: %zu token, %s\n", tmp.size(), uguale ? "uguale a mtmd_tokenize" : "DIVERSA da mtmd_tokenize");
+            return uguale ? server_tokens(tmp, true) : std::move(ref);
+        }
+    }
     mtmd::bitmaps bitmaps;
     for (auto& file : files) {
         mtmd::bitmap bmp(mtmd_helper_bitmap_init_from_buf(mctx, file.data(), file.size()));
@@ -2028,7 +2076,7 @@ server_tokens tokenize_input_subprompt(const llama_vocab* vocab, mtmd_context* m
             for (const auto& entry : json_prompt.at(JSON_MTMD_DATA_KEY)) {
                 files.push_back(base64_decode(entry));
             }
-            return process_mtmd_prompt(mctx, json_prompt.at(JSON_STRING_PROMPT_KEY), files);
+            return process_mtmd_prompt(mctx, json_prompt.at(JSON_STRING_PROMPT_KEY), files, vocab);
         }
         else {
             // Not multimodal, but contains a subobject.

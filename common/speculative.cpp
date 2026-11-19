@@ -802,9 +802,9 @@ struct common_speculative_state_ngram_mod : public common_speculative_state {
             return;
         }
 
-        for (size_t i = 0; i < prompt.size() - n; ++i) {
-            mod.add(prompt.data() + i);
-        }
+        // Z6: windows over image tokens (LLAMA_TOKEN_NULL with mtmd and IK_Z6_SPEC_MTMD) are skipped; without them
+        // this is the add() of every window as before
+        mod.add_range(prompt.data(), 0, prompt.size() - n, LLAMA_TOKEN_NULL);
 
         i_last = prompt.size() - n;
 
@@ -837,9 +837,7 @@ struct common_speculative_state_ngram_mod : public common_speculative_state {
 
         // add new ngrams in chunks
         if (i_last + 32 < cur_len) {
-            for (size_t i = i_last; i < cur_len - n; ++i) {
-                mod.add(prompt_tgt.data() + i);
-            }
+            mod.add_range(prompt_tgt.data(), i_last, cur_len - n, LLAMA_TOKEN_NULL);
 
             i_last = cur_len - n;
         }
@@ -857,6 +855,12 @@ struct common_speculative_state_ngram_mod : public common_speculative_state {
             result[i] = prompt_tgt[cur_len - n + 1 + i];
         }
         result[n - 1] = id_last;
+
+        // Z6: no draft while the lookup window still reaches into an image (only with mtmd and IK_Z6_SPEC_MTMD)
+        if (mod.has(result.data(), LLAMA_TOKEN_NULL)) {
+            result.clear();
+            return;
+        }
 
         for (int i = 0; i < n_max; ++i) {
             const llama_token token = mod.get(result.data() + i);

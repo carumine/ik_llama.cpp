@@ -1214,7 +1214,7 @@ int main(int argc, char ** argv) {
 
                 if (oaicompat && ctx_server.mctx != nullptr) {
                     // This is the case used by OAI compatible chat path with MTMD. TODO It can be moved to the path below.
-                    inputs.push_back(process_mtmd_prompt(ctx_server.mctx, prompt.get<std::string>(), files));
+                    inputs.push_back(process_mtmd_prompt(ctx_server.mctx, prompt.get<std::string>(), files, llama_get_vocab(ctx_server.ctx)));
                 }
                 else {
                     // Everything else, including multimodal completions.
