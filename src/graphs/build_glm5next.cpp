@@ -53,6 +53,7 @@ static ggml_tensor * glm5next_build_hc_pre(
     return llm.build_mhc_weighted_sum(x, pre, n_embd, hc);
 }
 
+// The fused branch (GGML_Z6_DSA_TOPK_FUSO) still casts the whole bias: there the lever saves nothing.
 // DSA k-pool indexer: scores k-pools of kpool tokens (a pool key is a learned convex mix of
 // the member keys) and returns top-k cell indices [n_sel*kpool, n_tokens] into the KV cache,
 // or nullptr for the dense fallback. The kr_l cache holds [key; gate] per token (2*d wide).
@@ -124,6 +125,7 @@ static ggml_tensor * build_glm5next_dsa_top_k(
     auto all = ggml_view_2d(ctx0, kv_self.kr_l[il], 2 * d, n_kv, kr_row, 0);
     cb(all, "dsa_cached_all", il);
 
+    // Z6 (GGML_Z6_DSA_POOL_CACHE=1): pool only the window of pools this ubatch can have changed and read the rest
     // from kp_l. Same operators, row by row, on the same member rows: the cached keys are the ones recomputed today
     ggml_tensor * kp_cache = il < (int) kv_self.kp_l.size() ? kv_self.kp_l[il] : nullptr;
     const bool z6_win = kp_cache && lctx.inp_kpool_win_cells && lctx.inp_kpool_win_pools;
@@ -169,6 +171,7 @@ static ggml_tensor * build_glm5next_dsa_top_k(
     // relu(x*s) == s*relu(x) for s > 0, so both positive scalars fold into the weights
     auto wts = ggml_mul_mat(ctx0, layer.indexer_proj, cur);  // [nh, n_tok]
     wts = ggml_scale(ctx0, wts, 1.0f / sqrtf(float(d * nh)));
+    ggml_tensor * wts_2d = wts;                              // [nh, n_tok], what the fused op takes
     wts = ggml_reshape_3d(ctx0, wts, nh, 1, n_tok);
     cb(wts, "dsa_indexer_weights", il);
 
@@ -186,9 +189,25 @@ static ggml_tensor * build_glm5next_dsa_top_k(
     // chunk the score over the query dim to bound the [n_pool, nh, Tc] tensor
     // (mirrors OPENPANGU_IDX_SCORE_CHUNK); pooled/q/wts are built whole, sel concatenates the
     // per-chunk top-k results along the token dim
-    const bool chunk_scores = GLM5NEXT_IDX_SCORE_CHUNK > 0 && n_tok > GLM5NEXT_IDX_SCORE_CHUNK;
+    // Z6 (GGML_Z6_DSA_SCORE_CHUNK=<16..256>): query tokens per score chunk, default 256 as before. The chunk holds
+    // [n_pool, nh, chunk] F32 twice (the product and its permuted copy): at 131K of context and 256 tokens that is
+    // 2 x 1024 MiB of compute buffer per GPU, reserved also while generating. Every query token is scored and cut
+    // on its own, so the chunk size only moves where the batch is cut.
+    static const int64_t z6_chunk = [] {
+        const char * e = getenv("GGML_Z6_DSA_SCORE_CHUNK");
+        const int64_t v = e ? atoll(e) : 0;
+        return v >= 16 && v <= GLM5NEXT_IDX_SCORE_CHUNK ? v : GLM5NEXT_IDX_SCORE_CHUNK;
+    }();
+    // Z6 (GGML_Z6_DSA_TOPK_FUSO=1): score and cut in the fused indexer op that deepseek2, openpangu and qwen4exp
+    // already use: relu, head weights, sum over heads, bias and top-k without the [n_pool, nh, n_tok] tensors in
+    // the graph (the op works in bounded pool buffers). Same formula; the sum over the heads is contracted
+    // differently, so a score can differ in its last bit and two pools tied at the cut can swap: KLD is the gate.
+    static const bool z6_fuso = [] { const char * e = getenv("GGML_Z6_DSA_TOPK_FUSO"); return e && atoi(e) > 0; }();
+    const bool chunk_scores = n_tok > z6_chunk;
     ggml_tensor * sel = nullptr;
-    if (!chunk_scores) {
+    if (z6_fuso && lctx.cparams.fused_idx_topk && n_pool > n_sel) {
+        cb(sel, "dsa_top_k_pools", il);
+    } else if (!chunk_scores) {
         // small batch (decode or short prefill): no chunking needed
         auto score = ggml_mul_mat(ctx0, pooled, q);                  // [n_pool, nh, n_tok]
         score = ggml_relu(ctx0, score);
@@ -200,8 +219,8 @@ static ggml_tensor * build_glm5next_dsa_top_k(
         sel = ggml_cont(ctx0, ggml_top_k(ctx0, score, n_sel));       // [n_sel, n_tok]
         cb(sel, "dsa_top_k_pools", il);
     } else {
-        for (int64_t c0 = 0; c0 < n_tok; c0 += GLM5NEXT_IDX_SCORE_CHUNK) {
-            const int64_t tc = std::min<int64_t>(GLM5NEXT_IDX_SCORE_CHUNK, n_tok - c0);
+        for (int64_t c0 = 0; c0 < n_tok; c0 += z6_chunk) {
+            const int64_t tc = std::min<int64_t>(z6_chunk, n_tok - c0);
             // view q [d, nh, T] → [d, nh, tc] at token offset c0
             auto q_c = ggml_cont(ctx0, ggml_view_3d(ctx0, q, d, nh, tc,
                     q->nb[1], q->nb[2], (size_t) c0 * q->nb[2]));
@@ -593,6 +612,7 @@ ggml_cgraph * llm_build_context::build_glm5next() {
                 ggml_set_input(tail_cells);
                 lctx.inp_kpool_tail = tail_cells;
             }
+            // Z6 (GGML_Z6_DSA_POOL_CACHE=1): kp_l exists only with the variable; n_tokens consecutive positions span
             // n_tokens/r pools, plus one when the run straddles a boundary
             if (!lctx.kv_self.kp_l.empty()) {
                 const int64_t n_win_stretta = std::min<int64_t>(n_pool, (n_tokens + r - 1) / r + 1);
