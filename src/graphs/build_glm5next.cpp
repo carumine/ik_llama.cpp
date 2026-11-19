@@ -53,7 +53,17 @@ static ggml_tensor * glm5next_build_hc_pre(
     return llm.build_mhc_weighted_sum(x, pre, n_embd, hc);
 }
 
+// Z6 (GGML_Z6_DSA_BIAS_F16=1): the pool bias input [n_pool, n_tokens] holds only 0 and -inf, both exact in F16. As F16
+// it is half the size in the host compute buffer and in the copies the scheduler makes on each GPU of every chunk's
+// view (32 views of [n_pool, 32] per MLA layer at a microbatch of 1024 and chunk 32, allocated at the start of the
+// layer's split and freed one by one after their cast): 128 instead of 256 MiB while the first chunk is scored, at
+// 262144 cells. Each score chunk converts its own columns to the F32 the sum takes, so the sum adds the same values.
 // The fused branch (GGML_Z6_DSA_TOPK_FUSO) still casts the whole bias: there the lever saves nothing.
+static ggml_type glm5next_z6_tipo_bias() {
+    static const bool z6_f16 = [] { const char * e = getenv("GGML_Z6_DSA_BIAS_F16"); return e && atoi(e) > 0; }();
+    return z6_f16 ? GGML_TYPE_F16 : GGML_TYPE_F32;
+}
+
 // DSA k-pool indexer: scores k-pools of kpool tokens (a pool key is a learned convex mix of
 // the member keys) and returns top-k cell indices [n_sel*kpool, n_tokens] into the KV cache,
 // or nullptr for the dense fallback. The kr_l cache holds [key; gate] per token (2*d wide).
@@ -71,13 +81,82 @@ static ggml_tensor * glm5next_concat_i32(ggml_context * ctx0, ggml_tensor * a, g
     return ggml_reshape_4d_ext(ctx0, cf, GGML_TYPE_I32, cf->ne[0], cf->ne[1], cf->ne[2], cf->ne[3]);
 }
 
+// Z6 (GGML_Z6_DSA_CAUSALE_COMPATTA=1): with --dsa and the list of the selected cells, the [n_kv, n_tokens] causal mask
+// has one use left: telling which cells of the top-k the query cannot see. A cell is open when it belongs to the
+// sequence and its position is not after the query, so two vectors say the same: the position of each cell and the
+// position of each query (ggml_z6_indexer_pos_to_index). The graph then has no causal mask: at 262144 cells and a
+// microbatch of 1024 that is 512 MiB of compute buffer less per GPU and per scheduler, and of host buffer; nothing of
+// that size is filled or uploaded at each ubatch. Same list, so same attention.
+// True when every MLA layer in [il_first, il_last] is sure to take the list: flash attention, indexer and key cache
+// present, f16 latent cache on a device, list shorter than the cache, one sequence in the ubatch, no alibi.
+static bool glm5next_z6_causale_compatta(llm_build_context & llm, int il_first, int il_last) {
+    static const bool z6_on = [] { const char * e = getenv("GGML_Z6_DSA_CAUSALE_COMPATTA"); return e && atoi(e) > 0; }();
+    if (!z6_on) return false;
+    auto & lctx    = llm.lctx;
+    auto & hparams = llm.hparams;
+    auto & kv_self = lctx.kv_self;
+    // the reservation has no batch to look at: without the mask only where an ubatch of more sequences cannot exist,
+    // so the reserved graph stays an upper bound of every real one
+    if (lctx.cparams.n_seq_max > 1) return false;
+    if (!lctx.cparams.dsa || !lctx.cparams.flash_attn || !lctx.cparams.causal_attn || lctx.is_encoding) return false;
+    if (hparams.use_alibi || hparams.f_max_alibi_bias != 0.0f) return false;
+    if (hparams.indexer_head_size <= 0 || hparams.indexer_block_size <= 0) return false;
+    const int64_t r      = hparams.indexer_block_size;
+    const int64_t n_kv   = llm.n_kv;
+    const int64_t n_pool = n_kv / r;
+    if (n_pool == 0) return false;
+    // as build_glm5next_dsa_top_k and build_glm5next_mla_attention size the selection
+    const int64_t tail_cnt = r > 1 ? r - 1 : 0;
+    const int64_t n_sel = std::min<int64_t>({n_pool, (int64_t) hparams.indexer_top_k / r, (n_kv - tail_cnt) / r});
+    if (n_sel < 1) return false;
+    const int64_t n_selected_padded = GGML_PAD(r * n_sel + tail_cnt, 256);
+    if (n_selected_padded >= n_kv || n_selected_padded > 8192) return false;   // 8192: keys of one block of the list kernel
+    bool una = false;
+    for (int il = il_first; il <= il_last; ++il) {
+        if (hparams.is_recurrent(il)) continue;
+        const auto & layer = llm.model.layers[il];
+        if (!layer.indexer_attn_q_b || (size_t) il >= kv_self.kr_l.size() || !kv_self.kr_l[il]) return false;
+        if ((size_t) il >= kv_self.k_l.size() || !kv_self.k_l[il]) return false;
+        const ggml_tensor * k = kv_self.k_l[il];
+        if (k->type != GGML_TYPE_F16 || k->extra || !k->buffer || ggml_backend_buffer_is_host(k->buffer)) return false;
+        una = true;
+    }
+    if (!una) return false;
+    // one sequence: the mask is per query, the vector of the cells is per ubatch. The graph for the reservation has
+    // no batch to look at and is sized for the common case; an ubatch of more sequences builds the graph with the mask
+    const auto & batch = llm.batch;
+    if (!llm.worst_case && batch.seq_id && batch.n_seq_id) {
+        for (int32_t j = 0; j < batch.n_tokens; ++j) {
+            if (batch.n_seq_id[j] != 1 || !batch.seq_id[j] || batch.seq_id[j][0] != batch.seq_id[0][0]) return false;
+        }
+    } else if (!llm.worst_case) {
+        return false;
+    }
+    if (!llm.worst_case) {
+        static bool z6_detto = false;
+        if (!z6_detto) { z6_detto = true; LLAMA_LOG_INFO("z6 dsa causale compatta: grafo senza maschera causale, n_kv = %lld\n", (long long) n_kv); }
+    }
+    return true;
+}
+
+// The inputs of the graph without the causal mask
+static void glm5next_z6_inp_pos_celle(llm_build_context & llm) {
+    auto & lctx = llm.lctx;
+    lctx.inp_z6_cell_pos = ggml_new_tensor_1d(llm.ctx0, GGML_TYPE_I32, llm.n_kv);
+    lctx.inp_z6_q_pos    = ggml_new_tensor_1d(llm.ctx0, GGML_TYPE_I32, GGML_PAD(llm.n_tokens, GGML_KQ_MASK_PAD));
+    ggml_set_input(lctx.inp_z6_cell_pos);
+    ggml_set_input(lctx.inp_z6_q_pos);
+    llm.cb(lctx.inp_z6_cell_pos, "inp_z6_cell_pos", -1);
+    llm.cb(lctx.inp_z6_q_pos,    "inp_z6_q_pos",    -1);
+}
+
 static ggml_tensor * build_glm5next_dsa_top_k(
         llm_build_context & llm,
         ggml_cgraph * gf, int il,
         ggml_tensor * cur,            // [n_embd, n_tokens] — pre-norm input to the attention block
         ggml_tensor * qr,             // [q_lora_rank, n_tokens] — q_lora latent (post wq_a + norm)
         ggml_tensor * pool_cells,     // I32 [kpool*n_pool]   — cell index of each pool member
-        ggml_tensor * pool_bias,      // F32 [n_pool, n_tokens] — 0 if pool visible, else -inf
+        ggml_tensor * pool_bias,      // F32 [n_pool, n_tokens] — 0 if pool visible, else -inf (F16 with GGML_Z6_DSA_BIAS_F16)
         ggml_tensor * tail_cells,     // I32 [kpool-1, n_tokens, 1, 1] or null — trailing incomplete pool
         ggml_tensor * ape_slots) {    // I32 [kpool]          — identity [0..kpool-1]
     auto & lctx    = llm.lctx;
@@ -204,8 +283,12 @@ static ggml_tensor * build_glm5next_dsa_top_k(
     // differently, so a score can differ in its last bit and two pools tied at the cut can swap: KLD is the gate.
     static const bool z6_fuso = [] { const char * e = getenv("GGML_Z6_DSA_TOPK_FUSO"); return e && atoi(e) > 0; }();
     const bool chunk_scores = n_tok > z6_chunk;
+    // Z6 (GGML_Z6_DSA_BIAS_F16=1): the input is F16, the sum takes F32
+    const bool z6_bias_f16 = pool_bias->type == GGML_TYPE_F16;
     ggml_tensor * sel = nullptr;
     if (z6_fuso && lctx.cparams.fused_idx_topk && n_pool > n_sel) {
+        if (z6_bias_f16) pool_bias = ggml_cast(ctx0, pool_bias, GGML_TYPE_F32);
+        sel = ggml_indexer_topk(ctx0, pooled, q, wts_2d, pool_bias, nullptr, GGML_UNARY_OP_RELU, (int) n_sel, 0, false, nullptr);
         cb(sel, "dsa_top_k_pools", il);
     } else if (!chunk_scores) {
         // small batch (decode or short prefill): no chunking needed
@@ -214,7 +297,7 @@ static ggml_tensor * build_glm5next_dsa_top_k(
         score = ggml_cont(ctx0, ggml_permute(ctx0, score, 1, 0, 2, 3));  // [nh, n_pool, n_tok]
         score = ggml_sum_rows(ctx0, ggml_mul(ctx0, score, wts));     // [1, n_pool, n_tok]
         score = ggml_reshape_2d(ctx0, score, n_pool, n_tok);         // [n_pool, n_tok]
-        score = ggml_add(ctx0, score, pool_bias);
+        score = ggml_add(ctx0, score, z6_bias_f16 ? ggml_cast(ctx0, pool_bias, GGML_TYPE_F32) : pool_bias);
         cb(score, "dsa_indexer_score", il);
         sel = ggml_cont(ctx0, ggml_top_k(ctx0, score, n_sel));       // [n_sel, n_tok]
         cb(sel, "dsa_top_k_pools", il);
@@ -228,8 +311,9 @@ static ggml_tensor * build_glm5next_dsa_top_k(
             auto wts_c = ggml_view_3d(ctx0, wts, nh, 1, tc,
                     wts->nb[1], wts->nb[2], (size_t) c0 * wts->nb[2]);
             // view pool_bias [n_pool, T] → [n_pool, tc] at token offset c0
-            auto pb_c = ggml_cont(ctx0, ggml_view_2d(ctx0, pool_bias, n_pool, tc,
-                    pool_bias->nb[1], (size_t) c0 * pool_bias->nb[1]));
+            auto pb_v = ggml_view_2d(ctx0, pool_bias, n_pool, tc,
+                    pool_bias->nb[1], (size_t) c0 * pool_bias->nb[1]);
+            auto pb_c = z6_bias_f16 ? ggml_cast(ctx0, pb_v, GGML_TYPE_F32) : ggml_cont(ctx0, pb_v);
 
             auto sc = ggml_mul_mat(ctx0, pooled, q_c);               // [n_pool, nh, tc]
             sc = ggml_relu(ctx0, sc);
@@ -311,6 +395,15 @@ static ggml_tensor * build_glm5next_mla_attention(
     ggml_tensor * top_k = nullptr;
     if (lctx.cparams.dsa && layer.indexer_attn_q_b && hparams.indexer_block_size > 0 && pool_cells) {
         top_k = build_glm5next_dsa_top_k(llm, gf, il, cur, qr, pool_cells, pool_bias, tail_cells, ape_slots);
+        // Z6 (GGML_Z6_DSA_INDICE_PRIMA=1): the scores and the top-k enter the graph before q and Qcur. Flash attention
+        // visits Qcur first (src[0]), so today Qcur ([kv_lora_rank, n_tokens, n_head] F32, 128 MiB at a microbatch of
+        // 1024) is alive while the scores run, which is where the compute buffer peaks with --dsa at long context.
+        // Same nodes in another order: kr_cpy is already in the graph before the read of kr_l, top_k reads neither
+        // k_l nor the mask, so the numbers are the same
+        static const bool z6_indice_prima = [] { const char * e = getenv("GGML_Z6_DSA_INDICE_PRIMA"); return e && atoi(e) > 0; }();
+        if (top_k && z6_indice_prima) {
+            ggml_build_forward_expand(gf, top_k);
+        }
     }
 
     auto q = ggml_mul_mat(ctx0, layer.wq_b, qr);
@@ -343,10 +436,37 @@ static ggml_tensor * build_glm5next_mla_attention(
     // Build the sparse attention mask when the indexer returned top_k cell indices.
     // ggml_indexer_mask takes the dense KQ_mask + I32 cell-index topk and unmask only those
     // cells (keeping future/padding masked via the base causal mask). Same op deepseek2 uses.
+    // Z6 (GGML_Z6_DSA_IDX_DIRETTO=1): the list of selected cells that flash attention gathers is made straight from
+    // top_k (a block sorts about 2K keys) instead of writing the sparse mask over the whole cache and scanning it back:
+    // two kernels per MLA layer whose cost grows with n_kv, the second with one warp per row. Same cells in the same
+    // order (column % 32, then column; a cell listed twice counts once), so the sums of the attention are the same.
+    // The attention then gets the causal mask, which at the listed cells equals the sparse one. Only where the list
+    // is used today: flash attention, list shorter than the cache, f16 or q8_0 cache on a device.
+    static const bool z6_idx_diretto = [] { const char * e = getenv("GGML_Z6_DSA_IDX_DIRETTO"); return e && atoi(e) > 0; }();
     ggml_tensor * attn_mask = KQ_mask;
+    ggml_tensor * z6_selected = nullptr;
+    // Z6 (GGML_Z6_DSA_CAUSALE_COMPATTA=1): the graph was built without the causal mask (glm5next_z6_causale_compatta
+    // answered for every MLA layer), the list comes from the positions
+    const bool z6_senza_maschera = KQ_mask == nullptr;
+    GGML_ASSERT(!z6_senza_maschera || (top_k && lctx.inp_z6_cell_pos && lctx.inp_z6_q_pos && lctx.cparams.flash_attn));
     if (top_k) {
-        attn_mask = ggml_indexer_mask(ctx0, KQ_mask, top_k);
-        cb(attn_mask, "dsa_sparse_mask", il);
+        const int64_t n_selected_padded = GGML_PAD(top_k->ne[0], 256);
+        const ggml_type k_type = kv_self.k_l[il]->type;
+        if (z6_senza_maschera) {
+            GGML_ASSERT(n_selected_padded < llm.n_kv);
+            z6_selected = ggml_z6_indexer_pos_to_index(ctx0, lctx.inp_z6_cell_pos, lctx.inp_z6_q_pos, top_k, (int) n_selected_padded);
+            cb(z6_selected, "mask_to_idx", il);
+        } else if (z6_idx_diretto && lctx.cparams.flash_attn && KQ_mask->type == GGML_TYPE_F16 &&
+                n_selected_padded < KQ_mask->ne[0] && n_selected_padded <= 8192 && ggml_is_matrix(KQ_mask) && ggml_is_matrix(top_k) &&
+                (k_type == GGML_TYPE_F16 || k_type == GGML_TYPE_Q8_0) &&
+                kv_self.k_l[il]->buffer && !ggml_backend_buffer_is_host(kv_self.k_l[il]->buffer)) {
+            z6_selected = ggml_indexer_mask_to_index(ctx0, KQ_mask, top_k, (int) n_selected_padded);
+            z6_selected->op_params[0] = 1;  // each cell once
+            cb(z6_selected, "mask_to_idx", il);
+        } else {
+            attn_mask = ggml_indexer_mask(ctx0, KQ_mask, top_k);
+            cb(attn_mask, "dsa_sparse_mask", il);
+        }
     }
 
     // Attention: flash (fused, avoids materializing [n_kv, n_tokens, n_head]) vs. soft_max path.
@@ -357,7 +477,11 @@ static ggml_tensor * build_glm5next_mla_attention(
     if (lctx.cparams.flash_attn) {
         kqv_cmpr = ggml_flash_attn_ext(ctx0, Qcur, K_cache, K_cache, attn_mask,
                 kq_scale, hparams.f_max_alibi_bias, 0.f);
-        if (top_k) {
+        if (z6_selected) {
+            kqv_cmpr->src[5] = z6_selected;
+            // 1: src[3] is the causal mask, src[5] the selection; 2: no mask, src[5] lists only cells open for the row
+            kqv_cmpr->op_params[5] = z6_senza_maschera ? 2 : 1;
+        } else if (top_k) {
             int n_selected_padded = GGML_PAD(top_k->ne[0], 256);
             if (n_selected_padded < attn_mask->ne[0]) {
                 auto selected = ggml_mask_to_index(ctx0, attn_mask, n_selected_padded);
@@ -458,7 +582,14 @@ ggml_cgraph * llm_build_context::build_glm5next_mtp() {
     }
     token_emb = ggml_mul(ctx0, token_emb, pos_mask);
     cb(token_emb, "mtp_token_embd_pos_masked", -1);
-    auto KQ_mask = build_inp_KQ_mask();
+    // Z6 (GGML_Z6_DSA_CAUSALE_COMPATTA=1): no causal mask when the NextN layer takes the list of the selected cells
+    ggml_tensor * KQ_mask = nullptr;
+    if (glm5next_z6_causale_compatta(*this, hparams.n_layer - hparams.nextn_predict_layers,
+                hparams.n_layer - hparams.nextn_predict_layers)) {
+        glm5next_z6_inp_pos_celle(*this);
+    } else {
+        KQ_mask = build_inp_KQ_mask();
+    }
     auto inp_out_ids = n_tokens > 1 ? build_inp_out_ids() : nullptr;
 
     // Build DSA selection for the NextN MLA layer when --dsa is enabled.
@@ -477,7 +608,7 @@ ggml_cgraph * llm_build_context::build_glm5next_mtp() {
         const int64_t n_pool = n_kv / r;
         if (n_pool > 0) {
             pool_cells = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, r * n_pool);
-            pool_bias  = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_pool, n_tokens);
+            pool_bias  = ggml_new_tensor_2d(ctx0, glm5next_z6_tipo_bias(), n_pool, n_tokens);
             ape_slots  = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, r);
             ggml_set_input(pool_cells);
             ggml_set_input(pool_bias);
@@ -574,7 +705,13 @@ ggml_cgraph * llm_build_context::build_glm5next() {
     delta_net delta(lctx, batch);
 
     auto inpL = llm_build_inp_embd(ctx0, lctx, hparams, batch, model.tok_embd, cb);
-    auto KQ_mask = build_inp_KQ_mask();
+    // Z6 (GGML_Z6_DSA_CAUSALE_COMPATTA=1): no causal mask when every MLA layer takes the list of the selected cells
+    ggml_tensor * KQ_mask = nullptr;
+    if (!lctx.kv_self.kr_l.empty() && glm5next_z6_causale_compatta(*this, 0, (int) hparams.n_layer_kv_from_start - 1)) {
+        glm5next_z6_inp_pos_celle(*this);
+    } else {
+        KQ_mask = build_inp_KQ_mask();
+    }
     auto inp_out_ids = (!lctx.cparams.mtp || n_outputs > 0) ? build_inp_out_ids() : nullptr;
 
     // KDA recurrent state slot routing
@@ -598,7 +735,7 @@ ggml_cgraph * llm_build_context::build_glm5next() {
         const int64_t n_pool = n_kv / r;
         if (n_pool > 0) {
             pool_cells = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, r * n_pool);
-            pool_bias  = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_pool, n_tokens);
+            pool_bias  = ggml_new_tensor_2d(ctx0, glm5next_z6_tipo_bias(), n_pool, n_tokens);
             ape_slots  = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, r);
             ggml_set_input(pool_cells);
             ggml_set_input(pool_bias);

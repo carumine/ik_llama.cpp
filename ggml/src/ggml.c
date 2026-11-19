@@ -11327,6 +11327,26 @@ struct ggml_tensor * ggml_indexer_mask_to_index(
     return result;
 }
 
+// Z6 (GGML_Z6_DSA_CAUSALE_COMPATTA): the same node with src[0] of type I32, which is how the backends tell the two apart
+struct ggml_tensor * ggml_z6_indexer_pos_to_index(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * cell_pos,
+            struct ggml_tensor  * q_pos,
+            struct ggml_tensor  * topk,
+            int                   max_row_size) {
+    GGML_ASSERT(cell_pos->type == GGML_TYPE_I32 && q_pos->type == GGML_TYPE_I32 && topk->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_vector(cell_pos) && ggml_is_vector(q_pos) && ggml_is_matrix(topk));
+    GGML_ASSERT(topk->ne[1] <= q_pos->ne[0]);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, MIN(cell_pos->ne[0], max_row_size), q_pos->ne[0]);
+    result->src[0] = cell_pos;
+    result->src[1] = topk;
+    result->src[2] = q_pos;
+    result->op = GGML_OP_MASK_TO_IDX;
+
+    return result;
+}
+
 struct ggml_tensor * ggml_ds4_comp(
             struct ggml_context * ctx,
             struct ggml_tensor  * state,
@@ -25677,8 +25697,9 @@ static void ggml_compute_forward_flash_attn_ext_f16(
         }
 
         const ggml_fp16_t * mp = mask ? (ggml_fp16_t *)((char *) mask->data + iq1*mask->nb[1]) : NULL;
-        // without a mask, src[5] lists the K rows of this query
-        const int32_t * kv_idx = !mask && dst->src[5] ? (const int32_t *)((char *) dst->src[5]->data + iq1*dst->src[5]->nb[1]) : NULL;
+        // without a mask, src[5] lists the K rows of this query. Z6 (op_params[5] = 1, GGML_Z6_DSA_IDX_DIRETTO): the mask
+        // is the causal one and src[5] still lists the K rows; the mask is read only at the listed rows
+        const int32_t * kv_idx = (!mask || dst->op_params[5] == 1) && dst->src[5] ? (const int32_t *)((char *) dst->src[5]->data + iq1*dst->src[5]->nb[1]) : NULL;
         const int64_t n_kv = kv_idx ? dst->src[5]->ne[0] : nek1;
 
         // k indices
@@ -27631,6 +27652,27 @@ static void ggml_compute_forward_mask_topk_to_idx(const struct ggml_compute_para
 
     int32_t * cols = (int32_t *) params->wdata + ith*ntopk;
 
+    if (src->type == GGML_TYPE_I32) {
+        // Z6 (ggml_z6_indexer_pos_to_index): src[0] holds the position of each cell, src[2] the position of each row
+        const int32_t * cell_pos = (const int32_t *) src->data;
+        const int32_t * q_pos    = (const int32_t *) vis->data;
+        for (int i1 = first; i1 < last; ++i1) {
+            int32_t * y = (int32_t *)((char *)dst->data + i1*dst->nb[1]);
+            for (int j = 0; j < ne0; ++j) y[j] = -1;
+            if (i1 >= topk->ne[1]) {
+                continue;
+            }
+            const int32_t * t = (const int32_t *)((const char *)topk->data + i1*topk->nb[1]);
+            int nc = 0;
+            for (int j = 0; j < ntopk; ++j) if (cell_pos[t[j]] <= q_pos[i1]) cols[nc++] = t[j];
+            qsort(cols, nc, sizeof(int32_t), ggml_compare_i32);
+            int nu = 0;
+            for (int j = 0; j < nc; ++j) if (j == 0 || cols[j] != cols[j-1]) cols[nu++] = cols[j];
+            for (int j = 0; j < nu && j < ne0; ++j) y[j] = cols[j];
+        }
+        return;
+    }
+
     for (int i1 = first; i1 < last; ++i1) {
         int32_t * y = (int32_t *)((char *)dst->data + i1*dst->nb[1]);
         for (int j = 0; j < ne0; ++j) y[j] = -1;
@@ -27649,6 +27691,12 @@ static void ggml_compute_forward_mask_topk_to_idx(const struct ggml_compute_para
                 for (int j = 0; j < ntopk; ++j) if (x[t[j]] == 0.0f) cols[nc++] = t[j];
             }
             qsort(cols, nc, sizeof(int32_t), ggml_compare_i32);
+            if (dst->op_params[0] == 1) {
+                // Z6 (GGML_Z6_DSA_IDX_DIRETTO): each column once, as the mask built from topk would list it
+                int nu = 0;
+                for (int j = 0; j < nc; ++j) if (j == 0 || cols[j] != cols[j-1]) cols[nu++] = cols[j];
+                nc = nu;
+            }
             for (int j = 0; j < nc; ++j) y[j] = cols[j];
             continue;
         }

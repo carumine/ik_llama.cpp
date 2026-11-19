@@ -27,6 +27,11 @@ target_link_libraries(test-z6-glm-pair PRIVATE common)
 # logica della cache dei pool DSA di GLM (GGML_Z6_DSA_POOL_CACHE): solo CPU, senza modello
 add_executable(test-z6-kpool test-z6-kpool.cpp)
 target_include_directories(test-z6-kpool PRIVATE ../src)
+# bias dei pool della DSA di GLM in F16 (GGML_Z6_DSA_BIAS_F16): somma e top-k identici, sulla GPU, senza modello
+if (GGML_CUDA)
+    add_executable(test-z6-dsa-bias test-z6-dsa-bias.cpp)
+    target_link_libraries(test-z6-dsa-bias PRIVATE ggml)
+endif()
 # riordino IQ3_S a 4 bit (GGML_Z6_IQ3S_LUT): kernel a 1-8 colonne, conversione Q8 e inverso, bit per bit; solo CPU.
 # Include i sorgenti dei kernel: stessi flag di architettura della libreria.
 add_executable(test-z6-iq3s-lut test-z6-iq3s-lut.cpp)
@@ -45,6 +50,12 @@ if (GGML_CUDA)
     target_link_libraries(test-z6-grafi-epoca PRIVATE ggml)
     add_executable(test-z6-grafi-tp test-z6-grafi-tp.cpp)
     target_link_libraries(test-z6-grafi-tp PRIVATE ggml)
+    # lista delle celle della DSA di GLM dal top-k (GGML_Z6_DSA_IDX_DIRETTO): identità con la strada della maschera, sulla GPU
+    add_executable(test-z6-dsa-indice test-z6-dsa-indice.cpp)
+    target_link_libraries(test-z6-dsa-indice PRIVATE ggml)
+    # lista delle celle della DSA di GLM dalle posizioni, senza maschera causale (GGML_Z6_DSA_CAUSALE_COMPATTA): sulla GPU
+    add_executable(test-z6-dsa-causale test-z6-dsa-causale.cpp)
+    target_link_libraries(test-z6-dsa-causale PRIVATE ggml)
 endif()
 
 function(llama_build source)

@@ -1115,12 +1115,16 @@ static __global__ void k_mask_to_index(int ne00, [[maybe_unused]] int ne0,
 }
 
 // the list of k_mask_to_index for the mask concat(mask, visible top-k columns), in its order: column % WARP_SIZE, then column
+// Z6 (unici = 1, GGML_Z6_DSA_IDX_DIRETTO): a column listed more than once in topk is kept once, as the mask built from
+// topk would list it. GLM lists cell 0 for every missing member of the tail pool and of an incomplete pool.
 template <typename mask_t>
 static __global__ void k_mask_topk_to_index(int ne00, int ne0, int ntopk, int ntok, int P,
         size_t nb01, size_t nb11, size_t nb21, size_t nb1,
-        const mask_t * __restrict__ mask, const int * __restrict__ topk, const char * __restrict__ n_visible, int * __restrict__ idx) {
+        const mask_t * __restrict__ mask, const int * __restrict__ topk, const char * __restrict__ n_visible, int * __restrict__ idx,
+        const int unici = 0) {
     extern __shared__ uint32_t keys[];
     __shared__ int n_on;
+    __shared__ int n_doppi;
 
     const int row = blockIdx.x;
     const mask_t * mask_r = (const mask_t *)((const char *)mask + row*nb01);
@@ -1157,18 +1161,93 @@ static __global__ void k_mask_topk_to_index(int ne00, int ne0, int ntopk, int nt
         }
     }
 
-    for (int size = 2; size <= P; size *= 2) {
-        for (int stride = size/2; stride > 0; stride /= 2) {
-            __syncthreads();
-            for (int i = threadIdx.x; i < P/2; i += blockDim.x) {
-                const int lo = 2*i - (i & (stride - 1));
-                const int hi = lo + stride;
-                const uint32_t a = keys[lo], b = keys[hi];
-                if ((a > b) == ((lo & size) == 0)) { keys[lo] = b; keys[hi] = a; }
+    for (int giro = 0; giro < 2; ++giro) {
+        for (int size = 2; size <= P; size *= 2) {
+            for (int stride = size/2; stride > 0; stride /= 2) {
+                __syncthreads();
+                for (int i = threadIdx.x; i < P/2; i += blockDim.x) {
+                    const int lo = 2*i - (i & (stride - 1));
+                    const int hi = lo + stride;
+                    const uint32_t a = keys[lo], b = keys[hi];
+                    if ((a > b) == ((lo & size) == 0)) { keys[lo] = b; keys[hi] = a; }
+                }
+            }
+        }
+        __syncthreads();
+        if (!unici || giro == 1) break;
+        // equal keys are adjacent now: every copy after the first becomes an empty slot, and a second sort moves the
+        // empty slots to the end. A thread owns at most P/blockDim.x <= 32 slots: one bit each
+        if (threadIdx.x == 0) n_doppi = 0;
+        uint32_t doppi = 0;
+        for (int i = threadIdx.x, b = 0; i < P; i += blockDim.x, ++b) {
+            if (i > 0 && keys[i] != 0xffffffff && keys[i] == keys[i - 1]) doppi |= 1u << b;
+        }
+        __syncthreads();
+        for (int i = threadIdx.x, b = 0; i < P; i += blockDim.x, ++b) {
+            if ((doppi >> b) & 1u) keys[i] = 0xffffffff;
+        }
+        if (doppi) atomicAdd(&n_doppi, 1);
+        __syncthreads();
+        if (n_doppi == 0) break;
+    }
+    for (int j = threadIdx.x; j < ne0; j += blockDim.x) idx_r[j] = keys[j] == 0xffffffff ? -1 : int((keys[j] & 0x3ffffff)*WARP_SIZE + (keys[j] >> 26));
+}
+
+// Z6 (ggml_z6_indexer_pos_to_index, GGML_Z6_DSA_CAUSALE_COMPATTA): k_mask_topk_to_index with unici = 1 for a causal mask
+// that is never built. Column c is open for a row when cell_pos[c] <= q_pos[row]; same keys, same sorts, same list.
+static __global__ void k_pos_topk_to_index(int ne0, int ntopk, int ntok, int P, size_t nb11, size_t nb1,
+        const int * __restrict__ cell_pos, const int * __restrict__ q_pos, const int * __restrict__ topk, int * __restrict__ idx) {
+    extern __shared__ uint32_t keys[];
+    __shared__ int n_on;
+    __shared__ int n_doppi;
+
+    const int row = blockIdx.x;
+    int * idx_r = (int *)((char *)idx + row*nb1);
+
+    if (threadIdx.x == 0) n_on = 0;
+    for (int i = threadIdx.x; i < P; i += blockDim.x) keys[i] = 0xffffffff;
+    __syncthreads();
+
+    if (row < ntok) {
+        const int * t = (const int *)((const char *)topk + row*nb11);
+        const int q = q_pos[row];
+        for (int j = threadIdx.x; j < ntopk; j += blockDim.x) {
+            const int c = t[j];
+            if (cell_pos[c] <= q) {
+                const int s = atomicAdd(&n_on, 1);
+                if (s < P) keys[s] = (uint32_t(c % WARP_SIZE) << 26) | uint32_t(c / WARP_SIZE);
             }
         }
     }
-    __syncthreads();
+
+    for (int giro = 0; giro < 2; ++giro) {
+        for (int size = 2; size <= P; size *= 2) {
+            for (int stride = size/2; stride > 0; stride /= 2) {
+                __syncthreads();
+                for (int i = threadIdx.x; i < P/2; i += blockDim.x) {
+                    const int lo = 2*i - (i & (stride - 1));
+                    const int hi = lo + stride;
+                    const uint32_t a = keys[lo], b = keys[hi];
+                    if ((a > b) == ((lo & size) == 0)) { keys[lo] = b; keys[hi] = a; }
+                }
+            }
+        }
+        __syncthreads();
+        if (giro == 1) break;
+        // as in k_mask_topk_to_index: every copy after the first becomes an empty slot, a second sort moves them to the end
+        if (threadIdx.x == 0) n_doppi = 0;
+        uint32_t doppi = 0;
+        for (int i = threadIdx.x, b = 0; i < P; i += blockDim.x, ++b) {
+            if (i > 0 && keys[i] != 0xffffffff && keys[i] == keys[i - 1]) doppi |= 1u << b;
+        }
+        __syncthreads();
+        for (int i = threadIdx.x, b = 0; i < P; i += blockDim.x, ++b) {
+            if ((doppi >> b) & 1u) keys[i] = 0xffffffff;
+        }
+        if (doppi) atomicAdd(&n_doppi, 1);
+        __syncthreads();
+        if (n_doppi == 0) break;
+    }
     for (int j = threadIdx.x; j < ne0; j += blockDim.x) idx_r[j] = keys[j] == 0xffffffff ? -1 : int((keys[j] & 0x3ffffff)*WARP_SIZE + (keys[j] >> 26));
 }
 
@@ -1186,6 +1265,21 @@ static void mask_topk_to_index_dense(ggml_backend_cuda_context & ctx, const ggml
 void ggml_cuda_op_mask_to_index(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     auto src = dst->src[0];
     GGML_ASSERT(dst->type == GGML_TYPE_I32);
+    if (src->type == GGML_TYPE_I32) {
+        // Z6 (ggml_z6_indexer_pos_to_index): src[0] = position of each cell, src[2] = position of each row
+        auto topk  = dst->src[1];
+        auto q_pos = dst->src[2];
+        GGML_ASSERT(topk && q_pos && topk->type == GGML_TYPE_I32 && q_pos->type == GGML_TYPE_I32);
+        GGML_ASSERT(q_pos->ne[0] == dst->ne[1] && topk->ne[1] <= dst->ne[1]);
+        int P = 1;
+        while (P < dst->ne[0]) P *= 2;
+        // P*4 bytes of shared memory, and a thread of the block marks at most 32 slots
+        GGML_ASSERT(P <= 8192 && topk->ne[0] <= P);
+        k_pos_topk_to_index<<<dst->ne[1], 256, P*sizeof(uint32_t), ctx.stream()>>>(dst->ne[0], topk->ne[0], topk->ne[1], P,
+                topk->nb[1], dst->nb[1],
+                (const int *)src->data, (const int *)q_pos->data, (const int *)topk->data, (int *)dst->data);
+        return;
+    }
     GGML_ASSERT(src->type == GGML_TYPE_F32 || src->type == GGML_TYPE_F16);
     if (auto topk = dst->src[1]) {
         auto vis = dst->src[2];
@@ -1202,14 +1296,17 @@ void ggml_cuda_op_mask_to_index(ggml_backend_cuda_context & ctx, ggml_tensor * d
             }
             return;
         }
+        // Z6: op_params[0] = 1 asks for each column once (set by GLM with GGML_Z6_DSA_IDX_DIRETTO); the dense fallback
+        // above goes through the mask and is unique by construction
+        const int unici = !vis && dst->op_params[0] == 1 ? 1 : 0;
         if (src->type == GGML_TYPE_F16) {
             k_mask_topk_to_index<<<dst->ne[1], 256, P*sizeof(uint32_t), ctx.stream()>>>(src->ne[0], dst->ne[0], topk->ne[0], topk->ne[1], P,
                     src->nb[1], topk->nb[1], nb21, dst->nb[1],
-                    (const half *)src->data, (const int *)topk->data, vis_data, (int *)dst->data);
+                    (const half *)src->data, (const int *)topk->data, vis_data, (int *)dst->data, unici);
         } else {
             k_mask_topk_to_index<<<dst->ne[1], 256, P*sizeof(uint32_t), ctx.stream()>>>(src->ne[0], dst->ne[0], topk->ne[0], topk->ne[1], P,
                     src->nb[1], topk->nb[1], nb21, dst->nb[1],
-                    (const float *)src->data, (const int *)topk->data, vis_data, (int *)dst->data);
+                    (const float *)src->data, (const int *)topk->data, vis_data, (int *)dst->data, unici);
         }
         return;
     }

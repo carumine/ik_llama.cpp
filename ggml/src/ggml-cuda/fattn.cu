@@ -64,7 +64,20 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         if (ggml_cuda_flash_attn_ext_mma_new_sparse(ctx, dst)) {
             return;
         }
-        if (!mask) {
+        // Z6 (op_params[5] = 1, set by GLM with GGML_Z6_DSA_IDX_DIRETTO): src[3] is the causal mask, not the mask of the
+        // selection; the selection is the list in src[5], whose cells are all open in the causal mask. The kernels
+        // above and ggml_cuda_dsa_attn_ext read the mask only at the listed cells, where the two masks hold the same
+        // values. Any other kernel reads whole rows: for those the mask of the selection is built from the list
+        const bool z6_maschera_causale = mask && KQV->op_params[5] == 1;
+        if (z6_maschera_causale && ggml_cuda_dsa_attn_ext(ctx, dst)) {
+            return;
+        }
+        // Z6 (op_params[5] = 2, set by GLM with GGML_Z6_DSA_CAUSALE_COMPATTA): there is no mask; the list in src[5] holds
+        // only cells open for their row, so the mask ggml_cuda_dsa_attn_ext would read is 0 at every listed cell
+        if (!mask && KQV->op_params[5] == 2 && ggml_cuda_dsa_attn_ext(ctx, dst)) {
+            return;
+        }
+        if (!mask || z6_maschera_causale) {
             const ggml_tensor * kv_idx = dst->src[5];
             Mi = *kv_idx;
             Mi.type  = GGML_TYPE_F16;
