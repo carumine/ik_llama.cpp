@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <cstring>
 #include <cstdio>
+#include <cstdlib>
 
 
 // ------------------------------------------------------------------
@@ -169,6 +170,11 @@ static const char * hotswap_unsupported_reason(const llama_model & model, const 
         // wv_b/wk_b_pp in place and the graph permanently skips the runtime
         // un-Hadamard; raw file bytes would produce garbage attention output
         return "the Hadamard transform was folded into the MLA weights at load time (khad)";
+    }
+    if (tensor->type == GGML_TYPE_BF16 && n.size() > 19 && n.compare(n.size() - 19, 19, "ffn_gate_inp.weight") == 0) {
+        // Z6 (GGML_Z6_ROUTER_BF16): the loader holds the F32 router of the file as BF16, half the bytes of the file
+        const char * e = getenv("GGML_Z6_ROUTER_BF16");
+        if (e && atoi(e) > 0) return "it is held as BF16 while the file stores F32 (GGML_Z6_ROUTER_BF16)";
     }
     if (n.find(".ffn_gate_inp_s.") != std::string::npos) {
         // llm_scale_gate_inp_s scales this tensor in place at load time

@@ -541,10 +541,33 @@ ggml_tensor * create_tensors_helper::create_tensor(ggml_context * ctx, const std
             !(flags & llama_model_loader::TENSOR_DUPLICATED) && name.find("_exps.weight") != std::string::npos &&
             ggml_z6_iq3s_lut_requested() && ggml_z6_iq3s_lut_layer(z6_layer_of(name))) {
         bool host = false;
+        for (auto & it : ctx_map) {
+            if (it.second == ctx) host = ggml_backend_buft_is_host(it.first);
+        }
         const size_t before = ggml_nbytes(tensor);
         if (host && ggml_z6_iq3s_lut_retype(tensor)) {
             LLAMA_LOG_INFO("z6 iq3s lut: %s in RAM as %s, %.2f -> %.2f MiB\n", name.c_str(), ggml_type_name(tensor->type),
                     before/1024./1024., ggml_nbytes(tensor)/1024./1024.);
+        }
+    }
+    // Z6 (GGML_Z6_ROUTER_BF16=1, 19/11/2026, sciame dei motori S6): the MoE router stored as F32 in the file is held
+    // as BF16 on the GPU. Only exact: the loader checks that every value has its low 16 bits at zero (a BF16 weight
+    // promoted to F32, as in Qwen3.8-Flash-Next) and stops otherwise. Half the bytes read per token; decode uses a
+    // BF16 x F32 GEMV with F32 accumulation, larger batches go back to F32 and the cuBLAS path of today.
+    if (tensor && tensor->type == GGML_TYPE_F32 && tensor->ne[2] == 1 && tensor->ne[0] % 256 == 0 && !ml.use_mmap &&
+            !(flags & llama_model_loader::TENSOR_DUPLICATED) && name.size() > 19 &&
+            name.compare(name.size() - 19, 19, "ffn_gate_inp.weight") == 0) {
+        static const bool z6_router_bf16 = [] { const char * e = getenv("GGML_Z6_ROUTER_BF16"); return e && atoi(e) > 0; }();
+        bool host = true;
+        for (auto & it : ctx_map) {
+            if (it.second == ctx) host = ggml_backend_buft_is_host(it.first);
+        }
+        if (z6_router_bf16 && !host && ctx != split_ctx && !tensor->data && !tensor->buffer && !tensor->view_src) {
+            tensor->type  = GGML_TYPE_BF16;
+            tensor->nb[0] = ggml_type_size(tensor->type);
+            tensor->nb[1] = ggml_row_size(tensor->type, tensor->ne[0]);
+            for (int i = 2; i < GGML_MAX_DIMS; i++) tensor->nb[i] = tensor->nb[i - 1]*tensor->ne[i - 1];
+            LLAMA_LOG_INFO("z6 router bf16: %s on the GPU as bf16, %.2f MiB\n", name.c_str(), ggml_nbytes(tensor)/1024./1024.);
         }
     }
     if (tensor && ctx == split_ctx) {

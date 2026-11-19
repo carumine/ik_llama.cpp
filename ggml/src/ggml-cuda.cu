@@ -2549,6 +2549,8 @@ static cudaError_t ggml_cuda_cpy_tensor_2d(
     }
 }
 
+static bool ggml_cuda_z6_router_bf16(const ggml_tensor * t);   // Z6 GGML_Z6_ROUTER_BF16, defined before ggml_cuda_mul_mat
+
 void ggml_cuda_op_mul_mat_cublas(
     ggml_backend_cuda_context & ctx,
     const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,
@@ -2574,7 +2576,10 @@ void ggml_cuda_op_mul_mat_cublas(
 
     const int compute_capability = ggml_cuda_info().devices[id].cc;
 
-    if (src0->type == GGML_TYPE_BF16 && ggml_is_contiguous(src0) && row_diff == src0->ne[1]) {
+    // Z6: the bf16 router (GGML_Z6_ROUTER_BF16) takes the F32 SGEMM below, as when its weights were F32.
+    const bool z6_router_f32 = ggml_cuda_z6_router_bf16(src0);
+
+    if (src0->type == GGML_TYPE_BF16 && !z6_router_f32 && ggml_is_contiguous(src0) && row_diff == src0->ne[1]) {
 
         ggml_cuda_pool_alloc<nv_bfloat16> src1_as_bf16(ctx.pool(id));
         if (src1->type != GGML_TYPE_BF16) {
@@ -2646,7 +2651,7 @@ void ggml_cuda_op_mul_mat_cublas(
     }
 #endif
 
-    if (compute_capability >= CC_VOLTA && (src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16 || ggml_is_quantized(src0->type)) && ggml_is_contiguous(src0) && row_diff == src0->ne[1] && dst->op_params[0] == GGML_PREC_DEFAULT) {
+    if (!z6_router_f32 && compute_capability >= CC_VOLTA && (src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16 || ggml_is_quantized(src0->type)) && ggml_is_contiguous(src0) && row_diff == src0->ne[1] && dst->op_params[0] == GGML_PREC_DEFAULT) {
         // convert src0 and src1 to fp16, multiply as fp16, convert dst to fp32
         ggml_cuda_pool_alloc<half> src0_as_f16(ctx.pool(id));
         if (src0->type != GGML_TYPE_F16) {
@@ -3599,11 +3604,73 @@ static int ggml_cuda_z6_mmvq_colonne(int cc) {
     return std::max(v, ggml_cuda_mmvq_max_batch_size(cc));
 }
 
+// Z6 (GGML_Z6_ROUTER_BF16=1, 19/11/2026, sciame dei motori S6): the MoE router weights are held as BF16 (the loader
+// checks they are BF16 promoted to F32, so no weight changes). Up to 16 columns a GEMV reads every weight once and
+// accumulates in F32 (one warp per row, 8 BF16 per load); above that the cuBLAS path converts the weights back to F32
+// (exact) and runs the same SGEMM as the F32 router, so the prefill numbers stay those of today.
+static bool ggml_cuda_z6_router_bf16(const ggml_tensor * t) {
+    static const bool on = [] { const char * e = getenv("GGML_Z6_ROUTER_BF16"); return e && atoi(e) > 0; }();
+    return on && t->type == GGML_TYPE_BF16 && strstr(t->name, "ffn_gate_inp.weight") != nullptr;
+}
+
+static __global__ void k_z6_router_bf16(const nv_bfloat16 * __restrict__ w, const float * __restrict__ x, float * __restrict__ y,
+        int ne00, int nrows, int ncols, int64_t s01, int64_t s11, int64_t s1) {
+    const int row  = blockIdx.x*(blockDim.x/WARP_SIZE) + threadIdx.x/WARP_SIZE;
+    const int lane = threadIdx.x % WARP_SIZE;
+    if (row >= nrows) return;
+    const nv_bfloat16 * wr = w + row*s01;
+    float acc[16];
+#pragma unroll
+    for (int c = 0; c < 16; ++c) acc[c] = 0.0f;
+    for (int k = lane*8; k < ne00; k += WARP_SIZE*8) {
+        const uint4 q = *(const uint4 *)(wr + k);
+        const uint32_t p[4] = {q.x, q.y, q.z, q.w};
+        float wf[8];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            wf[2*j + 0] = __uint_as_float(p[j] << 16);
+            wf[2*j + 1] = __uint_as_float(p[j] & 0xffff0000u);
+        }
+#pragma unroll
+        for (int c = 0; c < 16; ++c) {
+            if (c < ncols) {
+                const float4 a = *(const float4 *)(x + c*s11 + k);
+                const float4 b = *(const float4 *)(x + c*s11 + k + 4);
+                acc[c] += wf[0]*a.x + wf[1]*a.y + wf[2]*a.z + wf[3]*a.w + wf[4]*b.x + wf[5]*b.y + wf[6]*b.z + wf[7]*b.w;
+            }
+        }
+    }
+#pragma unroll
+    for (int c = 0; c < 16; ++c) {
+        if (c < ncols) {
+            float v = acc[c];
+#pragma unroll
+            for (int o = WARP_SIZE/2; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffff, v, o, WARP_SIZE);
+            if (lane == 0) y[c*s1 + row] = v;
+        }
+    }
+}
+
 static int ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
         const ggml_cgraph * cgraph, int node_n) {
 
     if (src0->type == GGML_TYPE_F8_E4M3_KS || src0->type == GGML_TYPE_F8_E4M3_B128) {
         return ggml_cuda_mul_mat_f8(ctx, src0, src1, dst, cgraph, node_n);
+    }
+
+    if (ggml_cuda_z6_router_bf16(src0) && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+        src1->ne[1] <= 16 && src0->ne[2]*src0->ne[3] == 1 && src1->ne[2]*src1->ne[3] == 1 &&
+        src0->ne[0] % 256 == 0 && ggml_is_contiguous(src0) && src1->nb[0] == sizeof(float) &&
+        src1->nb[1] % 16 == 0 && dst->nb[0] == sizeof(float) && ((uintptr_t) src1->data) % 16 == 0 &&
+        ((uintptr_t) src0->data) % 16 == 0 && src1->ne[0] == src0->ne[0]) {
+        const int nrows = (int) src0->ne[1];
+        const int warps = 4;
+        k_z6_router_bf16<<<(nrows + warps - 1)/warps, warps*WARP_SIZE, 0, ctx.stream()>>>(
+            (const nv_bfloat16 *) src0->data, (const float *) src1->data, (float *) dst->data,
+            (int) src0->ne[0], nrows, (int) src1->ne[1], src0->nb[1]/sizeof(nv_bfloat16),
+            src1->nb[1]/sizeof(float), dst->nb[1]/sizeof(float));
+        CUDA_CHECK(cudaGetLastError());
+        return node_n;
     }
 
     if ((src0->type == GGML_TYPE_F32 || ((src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16) && src0->ne[0] % 2 == 0)) &&

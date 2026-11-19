@@ -1710,6 +1710,33 @@ bool llama_model_loader::load_all_data(
         const size_t n_size = ggml_nbytes(cur);
         const auto file = files.at(weight->idx)->clone();
 
+        // Z6 (GGML_Z6_ROUTER_BF16=1): the router was created as BF16 while the file holds F32
+        // (create_tensors_helper::create_tensor). Exact only: every F32 value must have its low 16 bits at zero.
+        // Progress counts the bytes of the file, as for the IQ3_S reordering.
+        if (cur->type == GGML_TYPE_BF16 && weight->tensor->type == GGML_TYPE_F32) {
+            const size_t n_file = ggml_nbytes(weight->tensor);
+            const int64_t n = ggml_nelements(cur);
+            if (n_file != (size_t) n*sizeof(float) || n_size != (size_t) n*sizeof(uint16_t)) {
+                throw std::runtime_error(format("tensor '%s': unexpected size for the bf16 router", ggml_get_name(cur)));
+            }
+            std::vector<uint32_t> f32((size_t) n);
+            std::vector<uint16_t> b16((size_t) n);
+            file->seek(weight->offs, SEEK_SET);
+            file->read_raw(f32.data(), n_file);
+            for (int64_t j = 0; j < n; ++j) {
+                if (f32[j] & 0xffffu) {
+                    throw std::runtime_error(format("tensor '%s': value %lld is not a BF16 promoted to F32, the bf16 router "
+                            "would lose precision: unset GGML_Z6_ROUTER_BF16", ggml_get_name(cur), (long long) j));
+                }
+                b16[j] = (uint16_t) (f32[j] >> 16);
+            }
+            {
+                std::lock_guard<std::mutex> lock(load_mutex);
+                ggml_backend_tensor_set(cur, b16.data(), 0, n_size);
+            }
+            return n_file;
+        }
+
         if (!weight->f8_scale.empty() || !weight->nvfp4_scale.empty() || weight->mxfp4_repack) {
             load_nvfp4_tensor(cur, buffer_size, *weight, *file, read_bufs[thread_idx], model, load_mutex, check_tensors);
             return n_size;
@@ -1859,6 +1886,7 @@ bool llama_model_loader::load_all_data(
                 constexpr size_t piece = 32768;   // blocks per piece: 3.4 MiB read, 4.2 MiB written
                 auto & read_buf = read_bufs[thread_idx];
                 read_buf.resize(piece*in_block);
+                file->seek(weight->offs, SEEK_SET);
                 for (size_t done = 0; done < n_blocks; done += piece) {
                     const size_t n = std::min(piece, n_blocks - done);
                     file->read_raw(read_buf.data(), n*in_block);
