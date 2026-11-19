@@ -270,6 +270,8 @@ struct common_sampler {
 
     std::mt19937 rng;
     uint64_t z6_estrazioni = 0; // campionamenti fatti con rng; segue rng anche nelle copie
+    std::vector<llama_token_data> z6_sovrascritti; // IK_Z6_CAMPIONA_VELOCE: id penalizzati col valore finale
+    std::vector<float> z6_mucchio;                   // IK_Z6_CAMPIONA_VELOCE: i k valori più alti
     uint32_t speculative_seed = LLAMA_DEFAULT_SEED;
     std::mt19937 speculative_rng;
 

@@ -10,6 +10,7 @@ struct llama_model;
 class llama_moe_cache;
 class llama_z6_caldi;
 class llama_z6_testa;
+class llama_z6_tp;
 
 #include <vector>
 #include <map>
@@ -320,6 +321,8 @@ struct llama_kv_cache {
     // Per-step checkpoint: allocate, restore step k's full state (SSM + conv) to cache
     bool per_step_alloc(const llama_model & model, int max_tokens);
     bool per_step_restore(ggml_backend_sched_t sched, llama_ckpt_data ckpt_type, int step, uint32_t slot);
+    // Z6 (GGML_Z6_MTP_PIPELINE): row 0 of the per-step checkpoint from the live state of layers (from, to]
+    bool z6_per_step_capture(ggml_backend_sched_t sched, llama_ckpt_data ckpt_type, int from, int to, uint32_t slot);
 
     ~llama_kv_cache() {
         for (struct ggml_context * ctx : ctxs) {
@@ -411,6 +414,7 @@ struct llama_context {
     std::unique_ptr<llama_moe_cache> moe_cache;
     std::unique_ptr<llama_z6_caldi> z6_caldi;
     std::unique_ptr<llama_z6_testa> z6_testa;
+    std::unique_ptr<llama_z6_tp> z6_tp;
     // Z6 (GGML_Z6_SHEXP_PARALLELO=1): costruttore dello shared expert, chiamato dal gruppo parallelo
     // dei caldi perché giri sulla GPU mentre la CPU calcola gli esperti freddi
     std::function<ggml_tensor * (ggml_tensor *)> z6_shexp;
@@ -745,6 +749,17 @@ struct llama_context {
     struct ggml_tensor * inp_kpool_ape_slots = nullptr; // I32 [kpool] identity [0..kpool-1], gathers the ape rows in order
     struct ggml_tensor * inp_msa_cells       = nullptr; // I32 [n_kv] identity, MiniMax-M3 expands selected blocks to cells with it
     struct ggml_tensor * inp_msa_bias        = nullptr; // F32 [n_blocks, 1, n_tokens] forces each query's own block into the selection
+    // Z6 (GGML_Z6_DSA_POOL_CACHE=1): pool keys cached in kv_self.kp_l, only the pools this ubatch writes are pooled again
+    struct ggml_tensor * inp_kpool_win_cells = nullptr; // I32 [kpool*n_win] member cells of the rebuilt pools
+    struct ggml_tensor * inp_kpool_win_pools = nullptr; // I32 [n_win] which pool each window entry rebuilds
+    // Z6 (GGML_Z6_DSA_CAUSALE_COMPATTA=1): what the GLM5NEXT graph gets instead of the [n_kv, n_tokens] causal mask
+    struct ggml_tensor * inp_z6_cell_pos = nullptr; // I32 [n_kv] position of the cell, INT32_MAX when not of the sequence
+    struct ggml_tensor * inp_z6_q_pos    = nullptr; // I32 [n_tokens padded] position of the query, -1 for padding rows
+    // host record of the cells each cached key was pooled from, and what the next graph pools again (llama-z6-kpool.h)
+    std::vector<int32_t> z6_kpool_ombra;
+    std::vector<int32_t> z6_kpool_da_fare;
+    // the last trunk graph pools every pool: it must not be reused for the following ubatches
+    bool z6_kpool_win_piena = false;
 
     // Qwen sparse attention: everything that depends on cache layout is computed on the host,
     // so the graph only gathers, pools and scores. One entry per distinct compress ratio.
@@ -815,6 +830,8 @@ struct llama_context {
 
     struct Z6Pair;
     std::unique_ptr<Z6Pair> z6_pair_slot;
+    // GGML_Z6_PP_QUARTETTO: third and fourth slot of the prefill, created at the first quartet
+    std::unique_ptr<Z6Pair> z6_quartetto[2];
 
     struct Prev;
     std::unique_ptr<Prev> prev;

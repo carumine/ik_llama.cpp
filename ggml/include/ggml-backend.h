@@ -218,6 +218,9 @@ extern "C" {
         struct ggml_tensor * device_inputs[3]; // activation, cold IDs, router weights
         struct ggml_tensor * host_inputs[3];
         int layer;
+        // Optional ClassLRU observation, one token only. Context-owned pinned memory.
+        struct ggml_tensor * usage_slots;
+        int32_t * usage_host;
     };
     GGML_API void ggml_backend_sched_z6_begin_graph(ggml_backend_sched_t sched);
     GGML_API void ggml_backend_sched_z6_add_group(ggml_backend_sched_t sched, const struct ggml_z6_caldi_group * group);
@@ -225,6 +228,22 @@ extern "C" {
     GGML_API ggml_backend_sched_t ggml_backend_sched_z6_pair_slot(ggml_backend_sched_t source, size_t graph_size);
     GGML_API void ggml_backend_sched_z6_pair_trim(ggml_backend_sched_t sched);
     GGML_API enum ggml_status ggml_backend_sched_z6_pair_compute(ggml_backend_sched_t first, ggml_backend_sched_t second);
+    // Z6 (GGML_Z6_PP_QUARTETTO): four prepared ubatches in token order; the cold experts of the first two and of the
+    // last two run as twin CPU nodes (GGML_Z6_PP_GEMELLI) while the GPU works on the other two. Fails without side
+    // effects on the graphs when the four schedulers are not eligible: the caller falls back to pairs.
+    GGML_API enum ggml_status ggml_backend_sched_z6_quartet_compute(ggml_backend_sched_t * slots);
+    // Z6 (GGML_Z6_MTP_PIPELINE=1): the same schedule for two one-token graphs of the same sequence (the sampled token
+    // and its draft). `between` runs before every piece of the second graph is queued, with the range of layers
+    // (from, to] whose attention that piece contains: the caller saves there the recurrent state the first graph left.
+    typedef void (*ggml_backend_sched_z6_between)(int layer_from, int layer_to, void * user_data);
+    GGML_API enum ggml_status ggml_backend_sched_z6_pair_compute_pipeline(ggml_backend_sched_t first, ggml_backend_sched_t second,
+            ggml_backend_sched_z6_between between, void * user_data);
+    // Z6 (GGML_Z6_TEMPI=1): pairs of the MTP pipeline completed and their time in microseconds, summed since start;
+    // both stay zero without the variable. Lets the caller tell the pair from the rest of a generation step.
+    GGML_API void ggml_backend_sched_z6_pipeline_tempi(int64_t * coppie, int64_t * us);
+    // Z6 (GGML_Z6_MTP_LANCI_NASCOSTI=1): GPU segments of the pipeline pairs whose host work thread 0 ran inside the
+    // cold experts of the other token, and segments run in series as before, summed since start; zero without it
+    GGML_API void ggml_backend_sched_z6_lanci_nascosti(int64_t * nascosti, int64_t * in_serie);
     // Counts are collected with GGML_Z6_TEMPI=1.
     GGML_API void ggml_backend_sched_z6_stats(ggml_backend_sched_t sched, int64_t * groups, int64_t * overlapping);
 

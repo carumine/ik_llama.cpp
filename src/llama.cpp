@@ -28,6 +28,8 @@
 #include "llama-moe-cache-policy.h"
 #include "llama-z6-caldi.h"
 #include "llama-z6-testa.h"
+#include "llama-z6-tp.h"
+#include "llama-z6-kpool.h"
 #include "llama-spec-features.h"
 #include "llama-dflash.h"
 #include "llama-dsv4.h"
@@ -656,9 +658,18 @@ struct llama_context::Z6Pair {
     decltype(llama_context::inp_kpool_bias) inp_kpool_bias{};
     decltype(llama_context::inp_kpool_tail) inp_kpool_tail{};
     decltype(llama_context::inp_kpool_ape_slots) inp_kpool_ape_slots{};
+    decltype(llama_context::inp_kpool_win_cells) inp_kpool_win_cells{};
+    decltype(llama_context::inp_kpool_win_pools) inp_kpool_win_pools{};
+    decltype(llama_context::inp_z6_cell_pos) inp_z6_cell_pos{};
+    decltype(llama_context::inp_z6_q_pos) inp_z6_q_pos{};
     decltype(llama_context::inp_qsa) inp_qsa{};
     // GGML_Z6_PP_SOVRAPPOSTO_MAX_KV: arena of slot 0/1 already reserved for the limit.
     bool reserved[2] = {false, false};
+    // Z6 (GGML_Z6_MTP_PIPELINE_DSA=1): the full pooling window belongs to the graph of a slot, not to the context. In
+    // the pipeline the graph of x can be built at the full window (pool keys stale) and the one of d at the narrow
+    // one: without the swap the flag of d would let x reuse its full-window graph for up to 256 tokens (same text,
+    // all pools rebuilt at every token). Inert without --dsa: the flag only changes with kp_l
+    bool z6_kpool_win_piena = false;
     void exchange(llama_context & ctx) {
         using std::swap;
         swap(buf_compute_meta, ctx.buf_compute_meta);
@@ -700,7 +711,12 @@ struct llama_context::Z6Pair {
         swap(inp_kpool_bias, ctx.inp_kpool_bias);
         swap(inp_kpool_tail, ctx.inp_kpool_tail);
         swap(inp_kpool_ape_slots, ctx.inp_kpool_ape_slots);
+        swap(inp_kpool_win_cells, ctx.inp_kpool_win_cells);
+        swap(inp_kpool_win_pools, ctx.inp_kpool_win_pools);
+        swap(inp_z6_cell_pos, ctx.inp_z6_cell_pos);
+        swap(inp_z6_q_pos, ctx.inp_z6_q_pos);
         swap(inp_qsa, ctx.inp_qsa);
+        swap(z6_kpool_win_piena, ctx.z6_kpool_win_piena);
     }
     ~Z6Pair() { if (sched) ggml_backend_sched_free(sched); }
 };
@@ -800,6 +816,8 @@ static void why_not_reuse_previous(const llama_batch & u_batch, const llama_cont
 bool llama_context::can_reuse_graph(const llama_batch & u_batch, uint64_t seq_fingerprint, uint64_t model_state_hash) {
     if (!cparams.graph_reuse) return false;
     if (qsa_pooled_stale) return false; // the rebuild needs a graph with the full pooling window
+    // Z6 (GGML_Z6_DSA_POOL_CACHE=1): and that graph pools every pool at each token, so it serves once
+    if (z6_kpool_win_piena && cparams.mtp_op_type == MTP_OP_NONE) return false;
     auto the_prev = cparams.mtp_op_type == MTP_OP_NONE ? prev.get() : prev_mtp.get();
     if (!the_prev || !the_prev->graph) return false;
     if (u_batch.embd) return false;
@@ -997,6 +1015,8 @@ void llama_context::set_mtp_n_heads(int32_t value) {
 
 llama_context::~llama_context() {
     z6_pair_slot.reset();
+    z6_quartetto[0].reset();
+    z6_quartetto[1].reset();
     if (dflash.kv.cache_sched != nullptr) {
         ggml_backend_sched_free(dflash.kv.cache_sched);
     }
@@ -1011,6 +1031,7 @@ llama_context::~llama_context() {
     moe_cache.reset();
     z6_caldi.reset();
     z6_testa.reset();
+    z6_tp.reset();
 
     for (ggml_backend_t backend : backends) {
         ggml_backend_free(backend);
@@ -1553,7 +1574,12 @@ static bool llama_kv_cache_init(
     if (has_glm_dsa_indexer || has_openpangu_dsa_indexer || has_qwen4exp_indexer || has_minimax_m3_indexer) {
         cache.kr_l.resize(n_layer, nullptr);
     }
-    if (has_qwen4exp_indexer) {
+    // Z6 (GGML_Z6_DSA_POOL_CACHE=1): GLM5NEXT keeps one F32 key per k-pool, like qwen4exp's kp_l. F32 so the cached
+    // value is the one the graph computed, bit for bit
+    static const bool z6_dsa_pool_cache = [] { const char * e = getenv("GGML_Z6_DSA_POOL_CACHE"); return e && atoi(e) > 0; }();
+    const bool z6_glm_kp = z6_dsa_pool_cache && model.arch == LLM_ARCH_GLM5NEXT && cparams.dsa &&
+            hparams.indexer_head_size > 0 && hparams.indexer_block_size > 0;
+    if (has_qwen4exp_indexer || z6_glm_kp) {
         cache.kp_l.resize(n_layer, nullptr);
     }
 
@@ -1676,13 +1702,23 @@ static bool llama_kv_cache_init(
             // indexer keys in F16 so a decoded token can score against ALL past keys.
             // GLM5NEXT's k-pool indexer packs [key; gate] per token (gate depends on the hidden
             // state and cannot be recomputed from the cache), so its row is 2*indexer_head_size.
-            if (has_glm_dsa_indexer && model.layers[i].indexer_attn_k && hparams.indexer_is_full[i] &&
+            // Z6 (GGML_Z6_KR_SOLO_DSA=1): without --dsa nothing reads or writes the indexer-key cache on GLM5NEXT
+            // (the graph takes the dense path); skip it and save 176 MiB at 32K, 704 MiB at 131K.
+            static const bool z6_kr_solo_dsa = [] { const char * e = std::getenv("GGML_Z6_KR_SOLO_DSA"); return e && std::atoi(e) > 0; }();
+            const bool z6_skip_kr = z6_kr_solo_dsa && model.arch == LLM_ARCH_GLM5NEXT && !cparams.dsa;
+            if (has_glm_dsa_indexer && model.layers[i].indexer_attn_k && hparams.indexer_is_full[i] && !z6_skip_kr &&
                     (!is_mtp_tail_layer || (model.arch == LLM_ARCH_GLM5NEXT && cparams.dsa))) {
                 const uint32_t idx_row = (model.arch == LLM_ARCH_GLM5NEXT)
                     ? 2 * hparams.indexer_head_size : hparams.indexer_head_size;
                 ggml_tensor * kr = ggml_new_tensor_2d(ctx, idx_type_k, idx_row, kv_size);
                 ggml_format_name(kr, "cache_kr_l%d", i);
                 cache.kr_l[i] = kr;
+                if (z6_glm_kp && !is_mtp_tail_layer) {
+                    ggml_tensor * kp = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hparams.indexer_head_size,
+                            std::max<int64_t>(1, kv_size / hparams.indexer_block_size));
+                    ggml_format_name(kp, "cache_kp_l%d", i);
+                    cache.kp_l[i] = kp;
+                }
             }
             if (!cparams.flash_attn && cparams.mla_attn == 1) {
                 ggml_tensor * kvt = ggml_new_tensor_1d(ctx, cache.type_v, kv_lora_rank*kv_size);
@@ -2761,6 +2797,52 @@ static void restore_recurrent_cache_tensors(int step, uint32_t slot, ggml_backen
     src = dst;
     src.data = (char *)per_step_conv->data + (size_t)step * conv_bytes;
     ggml_backend_tensor_copy_async(dst_backend, dst_backend, &src, &dst);
+}
+
+// Z6 (GGML_Z6_MTP_PIPELINE=1): the verification of a draft runs as two one-token graphs, so no graph writes the
+// per-step rows a batch of two would write. This queues, on the stream of the layer, the copy of the state the first
+// token left (SSM and conv) into row 0 of the per-step checkpoint: the same bytes the batch saves after its first
+// token, read back by per_step_restore(step 0) when the draft is refused. Layers (from, to], one sequence slot.
+bool llama_kv_cache::z6_per_step_capture(ggml_backend_sched_t sched, llama_ckpt_data ckpt_type, int from, int to, uint32_t slot) {
+    auto & ckpt = llama_get_ckpt(ckpt_type);
+    if (ckpt.per_step_ssm.empty() || ckpt.per_step_max_allocated <= 1) return false;
+    const int n_layer = (int) s_l.size();
+    auto copia = [&](ggml_tensor * state, ggml_tensor * per_ssm, ggml_tensor * per_conv) {
+        if (!state || !per_ssm || !per_conv || slot >= (uint32_t) state->ne[1]) return false;
+        const size_t ssm_bytes  = (size_t) per_ssm->ne[0] / (size_t) (ckpt.per_step_max_allocated - 1) * sizeof(float);
+        const size_t conv_bytes = (size_t) per_conv->ne[0] / (size_t) ckpt.per_step_max_allocated * sizeof(float);
+        auto backend = ggml_backend_sched_get_tensor_backend(sched, state);
+        if (!backend) return false;
+        ggml_tensor src = *state;
+        src.ne[0] = ssm_bytes/sizeof(float);
+        src.ne[1] = src.ne[2] = src.ne[3] = 1;
+        src.nb[1] = src.nb[2] = src.nb[3] = ssm_bytes + conv_bytes;
+        src.data  = (char *) state->data + slot*state->nb[1] + conv_bytes;
+        ggml_tensor dst = src;
+        dst.buffer = per_ssm->buffer;
+        dst.data   = (char *) per_ssm->data;            // row 0: the state after the first token
+        ggml_backend_tensor_copy_async(backend, backend, &src, &dst);
+        src.ne[0] = conv_bytes/sizeof(float);
+        src.data  = (char *) state->data + slot*state->nb[1];
+        dst = src;
+        dst.buffer = per_conv->buffer;
+        dst.data   = (char *) per_conv->data;
+        ggml_backend_tensor_copy_async(backend, backend, &src, &dst);
+        return true;
+    };
+    for (int il = std::max(0, from + 1); il <= to && il < n_layer; ++il) {
+        if (s_l[il] == nullptr || il >= (int) ckpt.per_step_ssm.size() || ckpt.per_step_ssm[il].empty()) continue;
+        if (!s_l[il]->extra) {
+            if (!copia(s_l[il], ckpt.per_step_ssm[il].front(), ckpt.per_step_conv[il].front())) return false;
+        } else {
+            auto split_sl = (const ggml_split_tensor_t *) s_l[il]->extra;
+            for (int id = 0; id < split_sl->n_device; ++id) {
+                if (!split_sl->splits[id]) continue;
+                if (!copia(split_sl->splits[id], ckpt.per_step_ssm[il][id], ckpt.per_step_conv[il][id])) return false;
+            }
+        }
+    }
+    return true;
 }
 
 bool llama_kv_cache::per_step_restore(ggml_backend_sched_t sched,llama_ckpt_data ckpt_type, int step, uint32_t slot) {
@@ -4853,6 +4935,69 @@ static std::pair<std::vector<double>, double> get_layer_sizes(const llama_model_
 }
 
 // Returns false if canceled by progress_callback
+#ifdef GGML_USE_CUDA
+// Z6 (GGML_Z6_NUMA_BILANCIO=1): before reading the file, compare the expert bytes bound to each node with the memory
+// that node can give to registered pages: MemFree minus the free CMA blocks (pages registered with cudaHostRegister
+// leave them), plus half of the page cache. One line per node; with less than GGML_Z6_NUMA_MARGINE_MIB (default 2048)
+// left on a node the load stops here, naming the node, instead of failing after minutes of reading or, with
+// GGML_Z6_NUMA_PRIMA=1 (MPOL_BIND before the first write), in the OOM killer. Any number of online nodes.
+static void z6_numa_bilancio(const llama_model & model) {
+    int n_nodes = 0;
+    while (n_nodes < 64 && access(format("/sys/devices/system/node/node%d/meminfo", n_nodes).c_str(), R_OK) == 0) ++n_nodes;
+    if (n_nodes < 2) { LLAMA_LOG_INFO("z6 bilancio: %d NUMA node(s), skipped\n", n_nodes); return; }
+    std::vector<size_t> req(n_nodes, 0), lut(n_nodes, 0), freeb(n_nodes, 0), file(n_nodes, 0), cma(n_nodes, 0);
+    for (const auto & named : model.tensors_by_name) {
+        const ggml_tensor * t = named.second;
+        if (!t->buffer || !ggml_backend_buffer_is_host(t->buffer) || named.first.find("_exps.weight") == std::string::npos) continue;
+        std::vector<size_t> part(n_nodes, 0);
+        ggml_z6_numa_bytes_per_node(t, part.data(), n_nodes);
+        for (int i = 0; i < n_nodes; ++i) {
+            req[i] += part[i];
+            if (t->type == GGML_TYPE_IQ3_S_Z6) lut[i] += part[i];
+        }
+    }
+    for (int i = 0; i < n_nodes; ++i) {
+        std::ifstream f(format("/sys/devices/system/node/node%d/meminfo", i));
+        std::string line;
+        while (std::getline(f, line)) {
+            unsigned long long kb = 0;
+            const auto pos = line.find(':');
+            if (pos == std::string::npos || sscanf(line.c_str() + pos + 1, "%llu", &kb) != 1) continue;
+            if (line.find(" MemFree:") != std::string::npos) freeb[i] = (size_t) kb << 10;
+            if (line.find(" FilePages:") != std::string::npos) file[i] = (size_t) kb << 10;
+        }
+    }
+    {
+        std::ifstream f("/proc/zoneinfo");
+        std::string line;
+        int node = -1;
+        const size_t page = (size_t) sysconf(_SC_PAGESIZE);
+        while (std::getline(f, line)) {
+            int nd = -1;
+            unsigned long long v = 0;
+            if (sscanf(line.c_str(), "Node %d, zone", &nd) == 1) node = nd;
+            else if (node >= 0 && node < n_nodes && sscanf(line.c_str(), " nr_free_cma %llu", &v) == 1) cma[node] += (size_t) v * page;
+        }
+    }
+    const char * m = getenv("GGML_Z6_NUMA_MARGINE_MIB");
+    const long long margin = (long long) (m && atoi(m) >= 0 ? atoi(m) : 2048) << 20;
+    const double gib = 1024.0*1024.0*1024.0;
+    std::string short_nodes;
+    for (int i = 0; i < n_nodes; ++i) {
+        const long long avail = (long long) freeb[i] - (long long) cma[i] + (long long) file[i] / 2;
+        const long long left = avail - (long long) req[i];
+        LLAMA_LOG_INFO("z6 bilancio: node %d experts %.2f GiB (reordered %.2f) | free %.2f, free CMA %.2f, cache %.2f -> "
+                "left after the experts %.2f GiB (margin %.2f)\n", i, req[i]/gib, lut[i]/gib, freeb[i]/gib, cma[i]/gib,
+                file[i]/gib, left/gib, margin/gib);
+        if (left < margin) short_nodes += format(" node %d short of %.2f GiB;", i, (margin - left)/gib);
+    }
+    if (!short_nodes.empty()) {
+        throw std::runtime_error("z6 bilancio: the experts do not fit with GGML_Z6_NUMA_MARGINE_MIB:" + short_nodes +
+                " fewer layers in GGML_Z6_IQ3S_LUT_LIVELLI or another GGML_Z6_NUMA_SPLIT_DOWN");
+    }
+}
+#endif
+
 static bool llm_load_tensors(
         llama_model_loader & ml,
         llama_model & model,
@@ -5684,6 +5829,13 @@ static bool llm_load_tensors(
         }
     }
 
+#ifdef GGML_USE_CUDA
+    if (!dry_run && z6_pin) {
+        const char * e = getenv("GGML_Z6_NUMA_BILANCIO");
+        if (e && atoi(e) > 0) z6_numa_bilancio(model);
+    }
+#endif
+
     // load tensor data
     if (!dry_run) {
         for (auto & it : ctx_bufs) {
@@ -6273,6 +6425,24 @@ static void z6_per_celle(int64_t n, int64_t passo, F && f) {
     f(0, n);
 }
 
+// Z6 (GGML_Z6_INGRESSI_OMP=1): i riempimenti di maschera causale e bias QSA da n_kv >= 1024 e 32 token creavano
+// 39 std::thread a ogni chiamata (4 a microbatch nel prefill a coppie, in modo kernel per allocare gli stack) mentre
+// la squadra OpenMP di ggml aspetta sveglia sugli stessi core. Stesse parti, stessi intervalli: cambia solo chi le
+// esegue, i byte scritti sono gli stessi. Senza la variabile, o dentro una regione parallela, false: std::thread.
+template <typename F>
+static bool z6_omp_parti(int n_parti, F && f) {
+#ifdef _OPENMP
+    static const bool attivo = [] { const char * e = getenv("GGML_Z6_INGRESSI_OMP"); return e && atoi(e) > 0; }();
+    if (attivo && n_parti > 1 && !omp_in_parallel()) {
+        #pragma omp parallel for schedule(static)
+        for (int p = 0; p < n_parti; ++p) f(p);
+        return true;
+    }
+#endif
+    GGML_UNUSED(n_parti); GGML_UNUSED(f);
+    return false;
+}
+
 static bool z6_ingressi_incr() {
     static const bool v = [] { const char * e = getenv("GGML_Z6_INGRESSI_INCR"); return e && atoi(e) > 0; }();
     return v;
@@ -6454,7 +6624,10 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
         const int64_t n_tok  = lctx.inp_kpool_bias->ne[1];
 
         int32_t * dst_pool_cells = (int32_t *) lctx.inp_kpool_cells->data;
-        float   * dst_pool_bias  = (float   *) lctx.inp_kpool_bias->data;
+        // Z6 (GGML_Z6_DSA_BIAS_F16=1): the graph asked for the bias in F16 (0 and -inf are exact)
+        const bool z6_bias_f16 = lctx.inp_kpool_bias->type == GGML_TYPE_F16;
+        float     * dst_pool_bias     = z6_bias_f16 ? nullptr : (float *) lctx.inp_kpool_bias->data;
+        ggml_half * dst_pool_bias_f16 = z6_bias_f16 ? (ggml_half *) lctx.inp_kpool_bias->data : nullptr;
         int32_t * dst_ape_slots  = (int32_t *) lctx.inp_kpool_ape_slots->data;
 
         // ape_slots = identity [0, 1, ..., r-1] (gathers the ape rows in member order)
@@ -6486,6 +6659,15 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
         // visible to query j (<= batch.pos[j]); else -inf (upstream pool_valid & pool_visible)
         for (int64_t j = 0; j < n_tok && j < (int64_t) batch.n_tokens; ++j) {
             const llama_pos q = batch.pos[j];
+            if (z6_bias_f16) {
+                const ggml_half h_zero = ggml_fp32_to_fp16(0.0f), h_inf = ggml_fp32_to_fp16(-INFINITY);
+                ggml_half * cur_bias = dst_pool_bias_f16 + j * n_pool;
+                for (int64_t b = 0; b < n_pool; ++b) {
+                    const bool ok = filled[b] == (int32_t) r && (llama_pos) ((b + 1) * r - 1) <= q;
+                    cur_bias[b] = ok ? h_zero : h_inf;
+                }
+                continue;
+            }
             float * cur_bias = dst_pool_bias + j * n_pool;
             for (int64_t b = 0; b < n_pool; ++b) {
                 const bool ok = filled[b] == (int32_t) r && (llama_pos) ((b + 1) * r - 1) <= q;
@@ -6525,6 +6707,24 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
                     }
                 }
             }
+        }
+
+        // Z6 (GGML_Z6_DSA_POOL_CACHE=1): a pool key depends only on its r members. Pool again the pools whose cached
+        // key was not built from their present members (llama-z6-kpool.h)
+        if (lctx.inp_kpool_win_cells) {
+            GGML_ASSERT(ggml_backend_buffer_is_host(lctx.inp_kpool_win_cells->buffer));
+            GGML_ASSERT(ggml_backend_buffer_is_host(lctx.inp_kpool_win_pools->buffer));
+            const int64_t n_win = lctx.inp_kpool_win_pools->ne[0];
+            // the list was made by z6_glm_kpool_prepara before the graph was chosen, so it fits the window
+            std::vector<uint8_t> piene(n_pool);
+            for (int64_t b = 0; b < n_pool; ++b) piene[b] = filled[b] >= (int32_t) r;
+            const int64_t fuori = llama_z6_kpool_riempi(lctx.z6_kpool_da_fare, dst_pool_cells, piene, r, n_win,
+                    (int32_t *) lctx.inp_kpool_win_cells->data, (int32_t *) lctx.inp_kpool_win_pools->data, lctx.z6_kpool_ombra);
+            if (fuori > 0) {
+                LLAMA_LOG_WARN("%s: z6 dsa pool cache: %lld pools left for the next ubatch (window %lld)\n",
+                        __func__, (long long) fuori, (long long) n_win);
+            }
+            lctx.qsa_pooled_stale = false;
         }
     }
 
@@ -6709,12 +6909,15 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
             // the same threshold the KQ_mask fill below uses for the same iteration space
             const int n_thread = std::max(1, int(std::thread::hardware_concurrency()/2));
             const int32_t npt = (n_tokens + n_thread - 1)/n_thread;
+            const int n_parti = (int) ((n_tokens + npt - 1)/npt);
+            if (!z6_omp_parti(n_parti, [&](int p) { fill_bias(p*npt, std::min(n_tokens, (p + 1)*npt)); })) {
             std::vector<std::thread> workers;
             for (int32_t i0 = npt; i0 < n_tokens; i0 += npt) {
                 workers.emplace_back(fill_bias, i0, std::min(n_tokens, i0 + npt));
             }
             fill_bias(0, std::min(n_tokens, npt));
             for (auto & w : workers) w.join();
+            }
         } else {
             z6_per_celle(n_kv, 1, [&](int64_t j0, int64_t j1) { fill_bias(0, n_tokens, (int32_t) j0, (int32_t) j1); });
         }
@@ -6898,6 +7101,32 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
         (hparams.causal_attn || !cparams.causal_attn) &&
         "causal attention is not supported by this model"
     );
+
+    // Z6 (GGML_Z6_DSA_CAUSALE_COMPATTA=1): the GLM5NEXT graph has no causal mask. Cell i is open for query j when
+    // cells[i].has_seq_id(seq) && cells[i].pos <= pos[j], which is what the mask holds without alibi; the graph is built
+    // this way only for an ubatch of one sequence (glm5next_z6_causale_compatta)
+    if (lctx.inp_z6_cell_pos && lctx.inp_z6_q_pos) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(lctx.inp_z6_cell_pos->buffer));
+        GGML_ASSERT(ggml_backend_buffer_is_host(lctx.inp_z6_q_pos->buffer));
+        GGML_ASSERT(cparams.causal_attn && !lctx.is_encoding && !hparams.use_alibi && batch.pos && batch.seq_id);
+        int32_t * cell_pos = (int32_t *) lctx.inp_z6_cell_pos->data;
+        int32_t * q_pos    = (int32_t *) lctx.inp_z6_q_pos->data;
+        const int64_t n_celle = lctx.inp_z6_cell_pos->ne[0];
+        const int64_t n_righe = lctx.inp_z6_q_pos->ne[0];
+        GGML_ASSERT(n_celle == (int64_t) kv_self.n && (int64_t) batch.n_tokens <= n_righe);
+        const llama_seq_id seq_id = batch.seq_id[0][0];
+        for (int64_t i = 0; i < n_celle; ++i) {
+            cell_pos[i] = kv_self.cells[i].has_seq_id(seq_id) ? (int32_t) kv_self.cells[i].pos : INT32_MAX;
+        }
+        for (int64_t j = 0; j < n_righe; ++j) {
+            if (j < (int64_t) batch.n_tokens) {
+                GGML_ASSERT(batch.seq_id[j][0] == seq_id);
+                q_pos[j] = (int32_t) batch.pos[j];
+            } else {
+                q_pos[j] = -1;
+            }
+        }
+    }
 
     if (lctx.inp_KQ_mask || lctx.inp_KQ_mask_swa || lctx.inp_KQ_mask_swa_win) {
 #if IK_PRINT_TIMING == 2
@@ -7119,7 +7348,9 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
                     }
                 };
                 std::vector<std::thread> workers(n_thread-1);
-                auto run = [](std::vector<std::thread> & workers, auto && fn) {
+                // Z6 (GGML_Z6_INGRESSI_OMP=1): the same n_thread parts run on the OpenMP team of ggml
+                auto run = [n_thread](std::vector<std::thread> & workers, auto && fn) {
+                    if (z6_omp_parti(n_thread, fn)) return;
                     int it = 0;
                     for (auto& w : workers) w = std::thread(fn, it++);
                     fn(it);
@@ -8017,6 +8248,20 @@ static bool prepare_mtp_graph_inputs(
 // ubatch's own graph with n_kv raised to n_kv_target (allocation only: the graph
 // actually computed is rebuilt afterwards with its real n_kv). Avoids regrowing
 // the compute and pinned host arenas at every ubatch as the context fills.
+// Z6 (GGML_Z6_MTP_PIPELINE_SOLA=1): see the pipeline in llama_decode_internal. Off whenever the overlap is on
+static bool z6_pipeline_sola_attiva() {
+    static const bool v = [] {
+        const char * e = getenv("GGML_Z6_MTP_PIPELINE_SOLA"); const char * pp = getenv("GGML_Z6_PP_SOVRAPPOSTO");
+        return e && atoi(e) > 0 && !(pp && atoi(pp) == 1);
+    }();
+    return v;
+}
+
+static bool z6_riserva_prefill() {
+    static const bool v = [] { const char * e = getenv("GGML_Z6_PP_RISERVA_PREFILL"); return e && atoi(e) > 0; }();
+    return v;
+}
+
 static bool z6_pair_reserve(llama_context & lctx, const llama_batch & u_batch, uint32_t n_kv_target) {
     auto & kv = lctx.kv_self;
     const uint32_t saved = kv.n;
@@ -8041,25 +8286,79 @@ struct z6_pair_decode {
     bool second = false;
     bool enabled = false;
     bool retain = true;
+    bool quiet = false;   // GGML_Z6_MTP_PIPELINE: a pair per generated token, no line per pair
     ggml_cgraph * pending = nullptr;
     ggml_tensor * pending_output = nullptr;
     int pending_outputs = 0;
     uint32_t pending_offset = 0;
+    ggml_tensor * pending_embd = nullptr;   // GGML_Z6_PP_SOVRAPPOSTO_MTP: hidden rows of the deferred ubatch
+    uint32_t pending_embd_offset = 0;
     int64_t preparation_us = 0;
     int64_t slot_us = 0;
     int64_t reset_us = 0, build_us = 0, alloc_us = 0, inputs_us = 0;
     int built = 0, reused = 0;
+    // GGML_Z6_PP_QUARTETTO: four ubatches in flight. `pending` is the first; `altri` the second and the third; the
+    // fourth is the one whose turn runs the quartet. Slot 0 is the primary scheduler, slot 1 the one of the pair,
+    // slots 2 and 3 live in ctx.z6_quartetto; `extra` says which of these two is exchanged into ctx (0 = none).
+    struct in_attesa {
+        ggml_cgraph * gf; ggml_tensor * output; int outputs; uint32_t offset; ggml_tensor * embd; uint32_t embd_offset;
+    };
+    std::vector<in_attesa> altri;
+    bool quartetto = false;      // this decode may run quartets
+    bool in_quartetto = false;   // a quartet is being prepared
+    int extra = 0;
 
     explicit z6_pair_decode(llama_context & c) : ctx(c), primary(c.sched) {
         const char * reuse = getenv("GGML_Z6_PP_SOVRAPPOSTO_RIUSO");
         retain = !reuse || atoi(reuse) != 0;
     }
+    int in_volo() const { return (pending ? 1 : 0) + (int) altri.size(); }
+    void lascia_extra() {
+        if (!extra) return;
+        ctx.z6_quartetto[extra - 2]->exchange(ctx);
+        ctx.sched = primary;
+        ctx.z6_caldi->pair_slot(0);
+        extra = 0;
+    }
+    // slot k of 0..3: 0 and 1 are the two of the pair, handled by select()
+    void select_n(int k) {
+        GGML_ASSERT(k >= 0 && k <= 3);
+        if (k < 2) { select(k == 1); return; }
+        if (extra == k) return;
+        select(false);   // the live state is the primary one again, and the slot of the pair exists
+        const int64_t start = ggml_time_us();
+        auto & slot = ctx.z6_quartetto[k - 2];
+        if (!slot) {
+            slot = std::make_unique<llama_context::Z6Pair>();
+            slot->sched = ggml_backend_sched_z6_pair_slot(primary, ctx.max_nodes(ctx.cparams.n_ubatch, ctx.cparams.n_ctx));
+            slot->buf_compute_meta.resize(ctx.buf_compute_meta.size());
+            slot->cache_copies.resize(ctx.cache_copies.size());
+            slot->dsa_cache_copies.resize(ctx.dsa_cache_copies.size());
+            slot->openpangu_cache_copies.resize(ctx.openpangu_cache_copies.size());
+            slot->openpangu_cache_copies_mtp.resize(ctx.openpangu_cache_copies_mtp.size());
+            slot->epoch = ctx.kv_self.z6_inputs_epoch;
+        }
+        if (slot->epoch != ctx.kv_self.z6_inputs_epoch) {
+            // restore/shift/sequence edits invalidate the graph description saved in this slot too
+            slot->prev.reset();
+            slot->prev_mtp.reset();
+            slot->epoch = ctx.kv_self.z6_inputs_epoch;
+        }
+        slot->exchange(ctx);
+        ctx.sched = slot->sched;
+        ctx.z6_caldi->pair_slot(k);
+        extra = k;
+        if (!retain) ctx.prev.reset();
+        slot_us += ggml_time_us() - start;
+    }
     void select(bool slot) {
+        lascia_extra();   // GGML_Z6_PP_QUARTETTO: slots 0 and 1 exchange with the primary state only
         const int64_t start = ggml_time_us();
         if (!ctx.z6_pair_slot) {
             GGML_ASSERT(!second);
             const char * compact = getenv("GGML_Z6_PP_SOVRAPPOSTO_COMPATTO");
-            if (retain && (!compact || atoi(compact) != 0)) {
+            // Z6 (GGML_Z6_MTP_PIPELINE_SOLA=1): the serial prefill keeps using the arena reserved at start-up
+            if (retain && (!compact || atoi(compact) != 0) && !z6_pipeline_sola_attiva()) {
                 ctx.reset_scheduler();
                 ggml_backend_sched_z6_pair_trim(primary);
             }
@@ -8098,13 +8397,109 @@ struct z6_pair_decode {
         // The normal can_reuse_graph() checks still decide whether a graph fits.
         if (!retain) {
             ctx.z6_pair_slot.reset();
+            ctx.z6_quartetto[0].reset();
+            ctx.z6_quartetto[1].reset();
             ctx.reset_scheduler();
         } else if (pending) {
             ctx.reset_scheduler();
             if (ctx.z6_pair_slot) ctx.z6_pair_slot->prev.reset();
+            for (auto & q : ctx.z6_quartetto) if (q) q->prev.reset();
         }
-        LLAMA_LOG_INFO("z6 sovrapposto: chiusura decode %.3f ms, slot conservato %d\n",
+        if (!quiet) LLAMA_LOG_INFO("z6 sovrapposto: chiusura decode %.3f ms, slot conservato %d\n",
                 (ggml_time_us()-start)/1000.0, int(retain));
+    }
+};
+
+// GLM's two prepared graphs share persistent KDA/conv and MLA/indexer caches.
+// Restrict the first port to a causal append-only, single-sequence flash path:
+// non-flash MLA has an extra V-cache copy not covered by cache_copies fixups,
+// and k-pool metadata is indexed by absolute positions, not sequence IDs.
+static bool z6_pair_glm_supported(const llama_context & ctx, const llama_batch & batch, bool mtp_ok = false) {
+    const auto & hp = ctx.model.hparams;
+    const auto & cp = ctx.cparams;
+    const auto & kv = ctx.kv_self;
+    if (ctx.model.arch != LLM_ARCH_GLM5NEXT || !cp.causal_attn ||
+            !cp.flash_attn || !cp.offload_kqv || cp.n_seq_max != 1 ||
+            (cp.mtp && !mtp_ok) || ctx.dflash.capture || hp.indexer_block_size != 4) return false;
+    const llama_pos first = batch.pos ? batch.pos[0] : batch.all_pos_0;
+    if (first < 0 || (uint64_t) first != kv.head || kv.head > kv.cells.size()) return false;
+    for (uint32_t i = 0; i < kv.cells.size(); ++i) {
+        const auto & cell = kv.cells[i];
+        if (i < kv.head) {
+            if (cell.pos != (llama_pos) i || cell.seq_id.size() != 1 || !cell.has_seq_id(0)) return false;
+        } else if (!cell.is_empty()) {
+            return false;
+        }
+    }
+    const uint32_t trunk = hp.n_layer - hp.nextn_predict_layers;
+    for (uint32_t il = 0; il < trunk; ++il) {
+        if (hp.is_recurrent(il)) {
+            if (il >= kv.s_l.size() || !kv.s_l[il]) return false;
+        } else {
+            if (il >= kv.k_l.size() || !kv.k_l[il]) return false;
+            if (cp.dsa && (il >= kv.kr_l.size() || !kv.kr_l[il])) return false;
+        }
+    }
+    return true;
+}
+
+// Z6 (GGML_Z6_DSA_POOL_CACHE=1): which GLM5NEXT pool keys this ubatch has to pool again. It runs before the graph is
+// chosen: when they do not fit the window of a graph for consecutive positions, the graph is built with the full one,
+// so the queries of this ubatch never score against a key that is out of date.
+static void z6_glm_kpool_prepara(llama_context & lctx, const llama_batch & u_batch) {
+    auto & kv = lctx.kv_self;
+    if (lctx.model.arch != LLM_ARCH_GLM5NEXT || kv.kp_l.empty() || !u_batch.pos) return;
+    const int64_t r = lctx.model.hparams.indexer_block_size;
+    const int64_t n_kv = kv.n;
+    if (r <= 0 || n_kv / r == 0) return;
+    if (lctx.z6_kpool_ombra.size() != (size_t) (kv.size / r * r)) lctx.z6_kpool_ombra.assign(kv.size / r * r, -1);
+    std::vector<int32_t> membri;
+    std::vector<uint8_t> piene;
+    llama_z6_kpool_membri([&](int64_t i) { return (int64_t) kv.cells[i].pos; }, n_kv, r, membri, piene);
+    llama_z6_kpool_da_fare(membri, piene, r, u_batch.pos, u_batch.n_tokens, lctx.qsa_pooled_stale,
+            lctx.z6_kpool_ombra, lctx.z6_kpool_da_fare);
+    lctx.qsa_pooled_stale = (int64_t) lctx.z6_kpool_da_fare.size() > llama_z6_kpool_finestra(n_kv / r, u_batch.n_tokens, r);
+}
+
+// Z6 (GGML_Z6_VERIFICA_SLOT=1): the verification batch of a draft (2-32 tokens) is decoded in the second scheduler
+// slot the prefill pair already owns, instead of the primary one. Today that batch replaces the saved one-token graph:
+// the step after a draft rebuilds it, and the CUDA graphs of its pieces (keyed by their first node) are captured again
+// after having been overwritten by the pieces of the batch. In the arenas of Qwen the single-token steps spend 3.1-3.7
+// ms launching GPU pieces against 1.6 on the bench, and a draft step costs 136 ms by regression against 104 ms of
+// graph. With two slots each shape keeps its own graph, arena and CUDA graphs. Same graphs and kernels: same numbers.
+struct z6_verifica_slot {
+    z6_pair_decode & pair;
+    bool attivo = false;
+    uint64_t epoca = 0;
+    explicit z6_verifica_slot(z6_pair_decode & p) : pair(p) {}
+    static bool richiesta() {
+        static const bool v = [] {
+            const char * e = getenv("GGML_Z6_VERIFICA_SLOT"); const char * pp = getenv("GGML_Z6_PP_SOVRAPPOSTO");
+            return e && atoi(e) > 0 && pp && atoi(pp) == 1;
+        }();
+        return v;
+    }
+    void entra() {
+        auto & ctx = pair.ctx;
+        // select() drops both saved graphs when the cache was edited since the last pair (a refused draft is such an
+        // edit). In generation the ordinary can_reuse_graph() checks decide, as they do without a second slot.
+        epoca = ctx.z6_pair_slot->epoch;
+        ctx.z6_pair_slot->epoch = ctx.kv_self.z6_inputs_epoch;
+        pair.select(true);
+        attivo = true;
+        static int64_t n = 0;
+        if (++n % 500 == 1) LLAMA_LOG_INFO("z6 verifica: %lld batch di bozze nel secondo slot\n", (long long) n);
+    }
+    ~z6_verifica_slot() {
+        if (!attivo) return;
+        auto & ctx = pair.ctx;
+        // queued copies still reference the arena of the slot
+        ggml_backend_sched_synchronize(pair.primary);
+        if (ctx.z6_pair_slot) {
+            ctx.z6_pair_slot->epoch = ctx.kv_self.z6_inputs_epoch;
+            pair.select(false);
+            ctx.z6_pair_slot->epoch = epoca;   // the next prefill pair still sees every edit made since its last run
+        }
     }
 };
 
@@ -8150,7 +8545,7 @@ static int llama_decode_internal(
     uint32_t n_outputs_embd = 0;
     uint32_t n_outputs_prev_embd = 0;
 
-    const auto n_ubatch = cparams.n_ubatch;
+    auto n_ubatch = cparams.n_ubatch;
 
     // TODO: simplify or deprecate
     std::vector<llama_pos> pos;
@@ -8207,7 +8602,16 @@ static int llama_decode_internal(
     }
 
     bool warned_qnext_mixed_repeat = false;
+    // Z6 (GGML_Z6_MTP_PIPELINE): declared before the pair, so it is destroyed after the pair has gone back to the
+    // primary slot. See below where the pipeline is chosen.
+    struct z6_pipeline_epoca {
+        llama_context & ctx;
+        bool attiva = false;
+        uint64_t epoca = 0;
+        ~z6_pipeline_epoca() { if (attiva && ctx.z6_pair_slot) ctx.z6_pair_slot->epoch = epoca; }
+    } z6_pl_epoca{lctx};
     z6_pair_decode z6_pair(lctx);
+    z6_verifica_slot z6_verifica(z6_pair);
     const char * z6_pp = getenv("GGML_Z6_PP_SOVRAPPOSTO");
     // Optional operational limit: above it, release the second arena and use
     // the original schedule, without changing context capacity or microbatch.
@@ -8222,12 +8626,23 @@ static int llama_decode_internal(
     if (z6_memory_fallback && n_tokens_all >= 256 && lctx.z6_pair_slot) {
         ggml_backend_sched_synchronize(lctx.sched);
         lctx.z6_pair_slot.reset();
+        lctx.z6_quartetto[0].reset();
+        lctx.z6_quartetto[1].reset();
         LLAMA_LOG_INFO("z6 sovrapposto: secondo slot liberato, limite KV %llu\n", (unsigned long long)z6_max_kv);
         z6_reserve_full = true;  // back to the control's allocation, once, at full KV size
     }
-    if (z6_pp && atoi(z6_pp) == 1 && !z6_memory_fallback && model.arch == LLM_ARCH_QWEN4EXP &&
+    // Z6 (GGML_Z6_PP_SOVRAPPOSTO_MTP=1): with --spec-type mtp the target decodes the prompt with the hidden rows of
+    // every token as a second output (the server turns embeddings on for that), and the pair was refused: the prefill
+    // lost the overlap, 229 -> 153 t/s at 14K on GLM. The MTP graph differs from the plain one only after the last
+    // layer (norm of all the rows, marked as output), so the pair runs it as it is; the rows of the deferred ubatch
+    // are downloaded after the pair, like its logits. GLM5NEXT only, token-level hidden rows only.
+    static const bool z6_pp_mtp = [] { const char * e = getenv("GGML_Z6_PP_SOVRAPPOSTO_MTP"); return e && atoi(e) > 0; }();
+    const bool z6_mtp_coppia = z6_pp_mtp && has_mtp && model.arch == LLM_ARCH_GLM5NEXT && cparams.mtp &&
+            cparams.pooling_type == LLAMA_POOLING_TYPE_NONE && !embd_pooled && !lctx.is_encoding;
+    if (z6_pp && atoi(z6_pp) == 1 && !z6_memory_fallback &&
+            (model.arch == LLM_ARCH_QWEN4EXP || z6_pair_glm_supported(lctx, batch_all, z6_mtp_coppia)) &&
             n_ubatch >= 256 && n_tokens_all >= n_ubatch+256 && batch_all.token &&
-            cparams.mtp_op_type == MTP_OP_NONE && !has_mtp && !cparams.embeddings &&
+            cparams.mtp_op_type == MTP_OP_NONE && ((!has_mtp && !cparams.embeddings) || z6_mtp_coppia) &&
             !cparams.cb_eval && !cparams.split_mode_graph_scheduling &&
             model.split_mode == LLAMA_SPLIT_MODE_LAYER && lctx.z6_caldi && lctx.z6_caldi->parallel() &&
             n_ubatch <= (uint32_t)lctx.z6_caldi->staging_tokens() &&
@@ -8238,6 +8653,7 @@ static int llama_decode_internal(
         bool eligible = true;
         const auto seq = batch_all.seq_id && batch_all.seq_id[0] && batch_all.n_seq_id && batch_all.n_seq_id[0] == 1
                 ? batch_all.seq_id[0][0] : batch_all.all_seq_id;
+        if (model.arch == LLM_ARCH_GLM5NEXT && seq != 0) eligible = false;
         for (uint32_t i = 0; i < n_tokens_all; ++i) {
             if (batch_all.seq_id && (!batch_all.n_seq_id || batch_all.n_seq_id[i] != 1 ||
                     !batch_all.seq_id[i] || batch_all.seq_id[i][0] != seq)) eligible = false;
@@ -8255,15 +8671,128 @@ static int llama_decode_internal(
         const char * prefetch = getenv("GGML_MOE_PREFETCH");
         if ((pesanti && atoi(pesanti) > 0) || (prefetch && atoi(prefetch) > 0)) eligible = false;
         z6_pair.enabled = eligible;
+        // Z6 (GGML_Z6_PP_QUARTETTO=1): with at least 3 ubatches and 256 tokens the prompt is decoded four ubatches at a
+        // time; the cold experts of two ubatches run as twin CPU nodes (GGML_Z6_PP_GEMELLI=1: one conversion of every
+        // expert tile for both) while the GPU works on the other two. The ubatches are the ones of the pair, so the
+        // logits are the same. What is left after the last quartet goes through the pair or the single ubatch as
+        // before. Needs -b of at least 3*ub+256. A deferred ubatch has its outputs copied as a whole: all or none.
+        static const bool z6_quartetto_env = [] { const char * e = getenv("GGML_Z6_PP_QUARTETTO"); return e && atoi(e) > 0; }();
+        if (eligible && z6_quartetto_env && n_tokens_all >= 3*n_ubatch+256 && !z6_mtp_coppia && !cparams.dsa) {
+            bool quartetto = true;
+            const char * soglia = getenv("GGML_Z6_FREDDI_SOGLIA");
+            if (soglia && atof(soglia) > 0.0) quartetto = false;
+            if (batch_all.logits) for (uint32_t i = 0; i+n_ubatch <= n_tokens_all; i += n_ubatch) {
+                uint32_t outputs = 0;
+                for (uint32_t j = 0; j < n_ubatch; ++j) outputs += batch_all.logits[i+j] != 0;
+                if (outputs != 0 && outputs != n_ubatch) quartetto = false;
+            }
+            z6_pair.quartetto = quartetto;
+        }
     }
     if (z6_pp && atoi(z6_pp) == 1 && n_tokens_all >= 256 && !z6_pair.enabled)
         LLAMA_LOG_INFO("z6 sovrapposto: fallback sequenziale, batch=%u ubatch=%u\n", n_tokens_all, n_ubatch);
+    // Z6 (GGML_Z6_MTP_PIPELINE=1, with GGML_Z6_PP_SOVRAPPOSTO=1): the verification batch of a one-token draft, [x, d],
+    // runs as two one-token graphs in the pair of the prefill instead of one graph of two tokens. A two-token graph
+    // costs about 1.85 single steps on GLM (the two tokens pick different cold experts and the GPU waits for both);
+    // here the GPU works on one token while the CPU reads the experts of the other. The graphs are the ones of the
+    // single-token step, so the logits of x are bit for bit those of a step without drafts. GLM5NEXT, one sequence,
+    // dense attention (no --dsa: the pool keys of the indexer are not covered), checkpoint per step or none.
+    static const bool z6_pipeline_env = [] { const char * e = getenv("GGML_Z6_MTP_PIPELINE"); return e && atoi(e) > 0; }();
+    // Z6 (GGML_Z6_MTP_PIPELINE_DSA=1): the pipeline also with --dsa. Pool inputs, pooling window, top-k and lists are
+    // per graph and exchanged with the slot (Z6Pair), the window flag included; the shadow of the pool keys stays
+    // valid across a refused draft (Fable 12, z6/logs/fable12-20261115). Same one-token graphs, so the same text.
+    static const bool z6_pipeline_dsa = [] { const char * e = getenv("GGML_Z6_MTP_PIPELINE_DSA"); return e && atoi(e) > 0; }();
+    // Z6 (GGML_Z6_MTP_PIPELINE_SOLA=1, only with GGML_Z6_PP_SOVRAPPOSTO off): the pipeline without the overlapped
+    // prefill. The prefill stays serial in the primary slot, with the arena reserved at start-up; the second slot
+    // holds only the one-token graph of d and is reserved once at the full cache. For long contexts with --dsa,
+    // where the two prefill arenas of the overlap do not fit in VRAM.
+    const bool z6_pipeline_sola = z6_pipeline_sola_attiva();
+    bool z6_pipeline = false;
+    if (z6_pipeline_env && n_tokens_all == 2 && cparams.mtp_op_type == MTP_OP_NONE) {
+        // The first condition that fails is the reason of the fallback to the batch: counted and logged, so that a
+        // run that never enters the pipeline says why.
+        const char * motivo = nullptr;
+        const auto seq = batch_all.seq_id && batch_all.seq_id[0] && batch_all.n_seq_id && batch_all.n_seq_id[0] == 1
+                ? batch_all.seq_id[0][0] : batch_all.all_seq_id;
+        bool in_fila = seq == 0;
+        for (uint32_t i = 0; i < n_tokens_all; ++i) {
+            if (batch_all.seq_id && (!batch_all.n_seq_id || batch_all.n_seq_id[i] != 1 ||
+                    !batch_all.seq_id[i] || batch_all.seq_id[i][0] != seq)) in_fila = false;
+            if (batch_all.pos && batch_all.pos[i] != batch_all.pos[0]+(llama_pos)i) in_fila = false;
+        }
+        if (!batch_all.pos && batch_all.all_pos_1 != 1) in_fila = false;
+        const char * pesanti = getenv("GGML_Z6_PP_PESANTI");
+        const char * prefetch = getenv("GGML_MOE_PREFETCH");
+        if (!(z6_pp && atoi(z6_pp) == 1) && !z6_pipeline_sola)  motivo = "GGML_Z6_PP_SOVRAPPOSTO spento";
+        else if (z6_pair.enabled)                               motivo = "coppia del prefill già scelta";
+        else if (!batch_all.token)                              motivo = "batch di embedding";
+        else if (model.arch != LLM_ARCH_GLM5NEXT)               motivo = "architettura diversa da GLM5NEXT";
+        else if (cparams.dsa && !z6_pipeline_dsa)               motivo = "--dsa attiva";
+        else if (!z6_pair_glm_supported(lctx, batch_all, true)) motivo = "KV non in fila da zero, più sequenze o attenzione non flash";
+        else if (!((!has_mtp && !cparams.embeddings) ||
+                   (has_mtp && cparams.mtp && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE && !embd_pooled)))
+                                                                motivo = "uscite di embedding non coperte";
+        else if (cparams.cb_eval || cparams.split_mode_graph_scheduling || model.split_mode != LLAMA_SPLIT_MODE_LAYER)
+                                                                motivo = "callback o split diverso da -sm layer";
+        else if (!lctx.z6_caldi || !lctx.z6_caldi->parallel())  motivo = "caldi in parallelo assenti (GGML_Z6_CALDI_PARALLELO)";
+        else if (kv_self.has_shift || kv_self.do_defrag || kv_self.do_copy || kv_self.any_compacted())
+                                                                motivo = "KV con spostamenti, copie o compattazione in sospeso";
+        else if (kv_self.ckpt.selected_spec_mode != LLAMA_SPEC_CKPT_NONE && kv_self.ckpt.selected_spec_mode != LLAMA_SPEC_CKPT_PER_STEP)
+                                                                motivo = "checkpoint delle bozze di tipo non coperto";
+        else if (kv_self.save_per_step_ssm && kv_self.ckpt.per_step_max_allocated < 2)
+                                                                motivo = "checkpoint per passo con meno di 2 righe";
+        else if (kv_self.head+n_tokens_all > kv_self.size)      motivo = "KV piena";
+        else if (cparams.prefetch_experts || z6_memory_fallback) motivo = "prefetch degli esperti o limite di memoria della coppia";
+        else if (!in_fila)                                      motivo = "sequenza diversa da 0 o posizioni non consecutive";
+        else if ((pesanti && atoi(pesanti) > 0) || (prefetch && atoi(prefetch) > 0))
+                                                                motivo = "GGML_Z6_PP_PESANTI o GGML_MOE_PREFETCH";
+        if (!motivo) {
+            z6_pipeline = true;
+            z6_pair.enabled = true;
+            z6_pair.quiet = true;
+            n_ubatch = 1;
+            // A refused draft is a cache edit (seq_rm), and select() would drop both saved graphs for it: the pair
+            // would rebuild two graphs, and capture their CUDA graphs again, after every refusal. In generation the
+            // ordinary can_reuse_graph() checks decide, as they do for the single-token step; the slot gets its epoch
+            // back afterwards, so the next prefill pair still sees every edit. GGML_Z6_MTP_PIPELINE_RIUSO=0: as before.
+            static const bool z6_pl_riuso = [] { const char * e = getenv("GGML_Z6_MTP_PIPELINE_RIUSO"); return !e || atoi(e) != 0; }();
+            if (z6_pl_riuso && lctx.z6_pair_slot) {
+                z6_pl_epoca.epoca = lctx.z6_pair_slot->epoch;
+                z6_pl_epoca.attiva = true;
+                lctx.z6_pair_slot->epoch = kv_self.z6_inputs_epoch;
+            }
+        }
+        static int64_t z6_pl_si = 0, z6_pl_no = 0;
+        static std::map<std::string, int64_t> z6_pl_motivi;
+        ++(z6_pipeline ? z6_pl_si : z6_pl_no);
+        if (motivo) ++z6_pl_motivi[motivo];
+        const int64_t z6_pl_n = z6_pl_si + z6_pl_no;
+        if (z6_pl_n == 1 || z6_pl_n == 20 || z6_pl_n % 500 == 0) {
+            std::string elenco;
+            for (const auto & m : z6_pl_motivi) elenco += (elenco.empty() ? "" : "; ") + m.first + " " + std::to_string(m.second);
+            LLAMA_LOG_INFO("z6 pipeline: verifiche a due token in coppia %lld, a batch %lld%s%s\n", (long long) z6_pl_si,
+                    (long long) z6_pl_no, elenco.empty() ? "" : "; motivi della ricaduta: ", elenco.c_str());
+        }
+    }
     for (uint32_t cur_token = 0; cur_token < n_tokens_all; ) {
         if (z6_pair.enabled) z6_pair.select(z6_pair.pending != nullptr);
 #if IK_PRINT_TIMING
         auto tim1 = ggml_time_us();
 #endif
         uint32_t n_tokens = std::min(n_ubatch, n_tokens_all - cur_token);
+        if (z6_pair.enabled && z6_pair.quartetto) {
+            // GGML_Z6_PP_QUARTETTO: a quartet starts only when four ubatches fit, three whole ones and at least 256
+            // tokens; the ubatch number k of a quartet is prepared in slot k (the line above knows only slots 0 and 1)
+            if (z6_pair.in_volo() == 0) z6_pair.in_quartetto = n_tokens_all - cur_token >= 3*n_ubatch+256;
+            z6_pair.select_n(z6_pair.in_volo());
+        }
+        if (cur_token == 0 && z6_verifica_slot::richiesta() && !z6_pair.enabled && lctx.z6_pair_slot && z6_pair.retain &&
+                n_tokens_all >= 2 && n_tokens_all <= 32 && n_tokens_all <= n_ubatch && batch_all.token &&
+                cparams.mtp_op_type == MTP_OP_NONE && !cparams.cb_eval && !cparams.split_mode_graph_scheduling &&
+                model.split_mode == LLAMA_SPLIT_MODE_LAYER && lctx.z6_caldi && lctx.z6_caldi->parallel()) {
+            // the slot exists once a prefill pair has run; before that the batch stays where it is today
+            z6_verifica.entra();
+        }
         if (llm_arch_is_hybrid(model.arch) &&
                 n_tokens > 1 &&
                 batch_all.n_seq_id != nullptr &&
@@ -8441,6 +8970,7 @@ static int llama_decode_internal(
             if (llm_arch_is_dsv4(lctx.model.arch) && !llama_prepare_dsv4_graph_inputs(lctx, u_batch, false, false)) {
                 return GGML_STATUS_FAILED;
             }
+            z6_glm_kpool_prepara(lctx, u_batch);
         }
 
 #if IK_PRINT_TIMING
@@ -8459,10 +8989,30 @@ static int llama_decode_internal(
             if (z6_reserve_full) {
                 z6_reserve_full = false;
                 if (!z6_pair_reserve(lctx, u_batch, kv_self.size)) return GGML_STATUS_ALLOC_FAILED;
+            } else if (z6_pair.extra && z6_max_kv && z6_pair.retain && !lctx.z6_quartetto[z6_pair.extra - 2]->reserved[0]) {
+                // third and fourth slot of the quartet: their arena is reserved once at the KV limit, like the two of the pair
+                lctx.z6_quartetto[z6_pair.extra - 2]->reserved[0] = true;
+                if (!z6_pair_reserve(lctx, u_batch, (uint32_t) GGML_PAD(z6_max_kv, 256))) return GGML_STATUS_ALLOC_FAILED;
             } else if (z6_pair.enabled && z6_max_kv && lctx.z6_pair_slot && z6_pair.retain &&
-                    !lctx.z6_pair_slot->reserved[z6_pair.second]) {
+                    !lctx.z6_pair_slot->reserved[z6_pair.second] &&
+                    // Z6 (GGML_Z6_PP_RISERVA_PREFILL=1): the reservation sizes the arena for the graph of this ubatch.
+                    // A pair of the MTP pipeline (one token, the warm-up at start-up included) would mark both slots
+                    // reserved with one-token arenas, and every prefill pair after it regrows them with the context
+                    // (GLM 14/11: CUDA0 502 -> 594 MiB in about 25 frees, one of them the step before the crash).
+                    // Here the first pair of a prefill ubatch reserves them, as without the pipeline.
+                    !(z6_riserva_prefill() && u_batch.n_tokens < 256)) {
                 lctx.z6_pair_slot->reserved[z6_pair.second] = true;
                 if (!z6_pair_reserve(lctx, u_batch, (uint32_t) GGML_PAD(z6_max_kv, 256))) return GGML_STATUS_ALLOC_FAILED;
+            } else if (z6_pipeline_sola_attiva() && z6_pair.enabled && z6_pair.second && lctx.z6_pair_slot &&
+                    !lctx.z6_pair_slot->reserved[1]) {
+                // Z6 (GGML_Z6_MTP_PIPELINE_SOLA=1): the second slot only ever holds the one-token graph of d. Reserved
+                // once at the full cache, so it does not regrow every 256 cells (each regrowth frees the buffer and
+                // the CUDA graphs are captured again). d never asks for the full pooling window: nothing between the
+                // inputs of x and the pooling of d makes the shadow stale
+                GGML_ASSERT(u_batch.n_tokens == 1 && !lctx.qsa_pooled_stale);
+                lctx.z6_pair_slot->reserved[1] = true;
+                if (!z6_pair_reserve(lctx, u_batch, kv_self.size)) return GGML_STATUS_ALLOC_FAILED;
+                LLAMA_LOG_INFO("z6 pipeline sola: secondo slot prenotato a %u celle\n", kv_self.size);
             }
             if (z6_pair.enabled) ++z6_pair.built;
             const int64_t z6_reset_start = z6_pair.enabled ? ggml_time_us() : 0;
@@ -8610,27 +9160,99 @@ static int llama_decode_internal(
 #endif
         //fprintf(stderr, "%s: invoking llama_graph_compute\n", __func__);
         if (z6_pair.enabled) z6_pair.preparation_us += ggml_time_us() - z6_prepare_start;
-        const bool z6_defer = z6_pair.enabled && !z6_pair.pending && n_tokens_all-cur_token >= n_ubatch+256;
+        // GGML_Z6_PP_QUARTETTO: the first three ubatches of a quartet are deferred, the fourth runs all of them
+        const int z6_quarti = z6_pair.in_quartetto ? z6_pair.in_volo() : -1;
+        const bool z6_defer = z6_quarti >= 0 ? z6_quarti < 3 : z6_pair.enabled && !z6_pair.pending &&
+                (z6_pipeline ? cur_token == 0 : n_tokens_all-cur_token >= n_ubatch+256);
+        if (z6_quarti == 1 || z6_quarti == 2) {
+            z6_pair.altri.push_back({ gf, res, lctx.n_outputs, (uint32_t) n_outputs_prev, embd, (uint32_t) n_outputs_prev_embd });
+            res = nullptr; // downloaded after the four graphs have actually executed
+        } else if (z6_quarti == 3) {
+            ggml_backend_cpu_set_n_threads(lctx.backend_cpu, n_threads);
+            ggml_backend_cpu_set_abort_callback(lctx.backend_cpu, lctx.abort_callback, lctx.abort_callback_data);
+            ggml_backend_cpu_set_moe_expert_prefetch(lctx.backend_cpu, false);
+            LLAMA_LOG_INFO("z6 quartetto: preparazione %.3f ms, slot %.3f ms, grafi nuovi %d riusati %d\n",
+                    z6_pair.preparation_us/1000.0, z6_pair.slot_us/1000.0, z6_pair.built, z6_pair.reused);
+            z6_pair.reset_us = z6_pair.build_us = z6_pair.alloc_us = z6_pair.inputs_us = 0;
+            z6_pair.preparation_us = z6_pair.slot_us = 0;
+            z6_pair.built = z6_pair.reused = 0;
+            GGML_ASSERT(z6_pair.extra == 3 && lctx.z6_pair_slot && lctx.z6_quartetto[0] && lctx.z6_quartetto[1]);
+            ggml_backend_sched_t z6_slot[4] = { z6_pair.primary, lctx.z6_pair_slot->sched, lctx.z6_quartetto[0]->sched, lctx.sched };
+            GGML_ASSERT(lctx.sched == lctx.z6_quartetto[1]->sched);
+            auto status = ggml_backend_sched_z6_quartet_compute(z6_slot);
+            if (status != GGML_STATUS_SUCCESS) {
+                LLAMA_LOG_ERROR("z6 quartetto: fallito (%d), stato da ripristinare\n", (int)status);
+                return status;
+            }
+            // outputs of the three deferred ubatches, each from the scheduler that ran it
+            const z6_pair_decode::in_attesa z6_primo = { z6_pair.pending, z6_pair.pending_output, z6_pair.pending_outputs,
+                    z6_pair.pending_offset, z6_pair.pending_embd, z6_pair.pending_embd_offset };
+            const z6_pair_decode::in_attesa * z6_att[3] = { &z6_primo, &z6_pair.altri[0], &z6_pair.altri[1] };
+            for (int k = 0; k < 3; ++k) {
+                const auto & a = *z6_att[k];
+                if (a.output && a.outputs) {
+                    auto backend = ggml_backend_sched_get_tensor_backend(z6_slot[k], a.output);
+                    ggml_backend_tensor_get_async(backend, a.output, lctx.logits+(size_t)a.offset*n_vocab, 0,
+                            (size_t)a.outputs*n_vocab*sizeof(float));
+                }
+                // the quartet is refused with hidden-state outputs (MTP): nothing else to download
+                GGML_ASSERT(!a.embd);
+            }
+            z6_pair.pending = nullptr;
+            z6_pair.pending_embd = nullptr;
+            z6_pair.altri.clear();
+            z6_pair.in_quartetto = false;
+        } else
         if (z6_defer) {
             z6_pair.pending = gf;
             z6_pair.pending_output = res;
             z6_pair.pending_outputs = lctx.n_outputs;
             z6_pair.pending_offset = n_outputs_prev;
             res = nullptr; // downloaded after both graphs have actually executed
+            z6_pair.pending_embd = embd;
+            z6_pair.pending_embd_offset = n_outputs_prev_embd;
         } else if (z6_pair.pending) {
             ggml_backend_cpu_set_n_threads(lctx.backend_cpu, n_threads);
             ggml_backend_cpu_set_abort_callback(lctx.backend_cpu, lctx.abort_callback, lctx.abort_callback_data);
             ggml_backend_cpu_set_moe_expert_prefetch(lctx.backend_cpu, false);
+            if (z6_pipeline) {
+                // a pair is a step of the generation here: one line every 200 pairs
+                // (the first line after 20 pairs: a short request still shows whether the graphs are reused)
+                static int64_t n = 0, tot = 0, prep = 0, nuovi = 0, riusati = 0, build = 0, alloc = 0, ingressi = 0;
+                ++n; ++tot; prep += z6_pair.preparation_us; nuovi += z6_pair.built; riusati += z6_pair.reused;
+                build += z6_pair.build_us; alloc += z6_pair.alloc_us; ingressi += z6_pair.inputs_us;
+                if (tot == 20 || n == 200) {
+                    LLAMA_LOG_INFO("z6 pipeline: %lld coppie, preparazione %.3f ms a coppia (build %.3f, alloc %.3f, ingressi %.3f), "
+                            "grafi nuovi %.2f riusati %.2f a coppia\n", (long long) tot, prep/1000.0/n, build/1000.0/n, alloc/1000.0/n,
+                            ingressi/1000.0/n, double(nuovi)/n, double(riusati)/n);
+                    n = prep = nuovi = riusati = build = alloc = ingressi = 0;
+                }
+            } else {
             LLAMA_LOG_INFO("z6 sovrapposto: preparazione %.3f ms, slot %.3f ms, grafi nuovi %d riusati %d\n",
                     z6_pair.preparation_us/1000.0, z6_pair.slot_us/1000.0, z6_pair.built, z6_pair.reused);
             LLAMA_LOG_INFO("z6 sovrapposto: dettaglio reset %.3f build %.3f alloc %.3f ingressi %.3f ms\n",
                     z6_pair.reset_us/1000.0, z6_pair.build_us/1000.0, z6_pair.alloc_us/1000.0, z6_pair.inputs_us/1000.0);
+            }
             z6_pair.reset_us = z6_pair.build_us = z6_pair.alloc_us = z6_pair.inputs_us = 0;
             z6_pair.preparation_us = z6_pair.slot_us = 0;
             z6_pair.built = z6_pair.reused = 0;
-            // like the upstream compute paths (llama_graph_compute); a prefill pair is never a single-token decode
+            // the draft overwrites the recurrent state the sampled token left: with a per-step checkpoint armed, save
+            // it layer by layer just before the piece of the draft that updates it is queued
+            struct z6_cattura { llama_context * ctx; bool ok; } cattura = { &lctx, true };
+            const bool z6_salva = z6_pipeline && kv_self.save_per_step_ssm &&
+                    kv_self.ckpt.selected_spec_mode == LLAMA_SPEC_CKPT_PER_STEP;
+            // like the upstream compute paths (llama_graph_compute); a pair is never a single-token decode
             if (lctx.moe_cache) lctx.moe_cache->begin_compute(false);
-            auto status = ggml_backend_sched_z6_pair_compute(z6_pair.primary, lctx.sched);
+            auto status = !z6_pipeline ? ggml_backend_sched_z6_pair_compute(z6_pair.primary, lctx.sched)
+                    : ggml_backend_sched_z6_pair_compute_pipeline(z6_pair.primary, lctx.sched,
+                            z6_salva ? +[](int from, int to, void * ud) {
+                                auto c = (z6_cattura *) ud;
+                                if (!c->ctx->kv_self.z6_per_step_capture(c->ctx->sched, { LLAMA_CHECKPOINT_SPEC, 0 }, from, to, 0)) c->ok = false;
+                            } : nullptr, &cattura);
+            if (status == GGML_STATUS_SUCCESS && !cattura.ok) {
+                LLAMA_LOG_ERROR("z6 pipeline: stato per passo non salvato, checkpoint non valido\n");
+                status = GGML_STATUS_FAILED;
+            }
             if (status != GGML_STATUS_SUCCESS) {
                 LLAMA_LOG_ERROR("z6 sovrapposto: coppia fallita (%d), stato da ripristinare\n", (int)status);
                 return status;
@@ -8640,6 +9262,16 @@ static int llama_decode_internal(
                 ggml_backend_tensor_get_async(backend, z6_pair.pending_output,
                         lctx.logits+(size_t)z6_pair.pending_offset*n_vocab, 0,
                         (size_t)z6_pair.pending_outputs*n_vocab*sizeof(float));
+            }
+            if (z6_pair.pending_embd) {
+                // only the MTP pair gets here with a hidden-state output (embeddings are refused otherwise)
+                GGML_ASSERT(has_mtp && lctx.embd != nullptr);
+                const size_t rows = (size_t) z6_pair.pending_embd->ne[1];
+                GGML_ASSERT((z6_pair.pending_embd_offset + rows)*n_embd_output <= lctx.embd_size);
+                auto backend = ggml_backend_sched_get_tensor_backend(z6_pair.primary, z6_pair.pending_embd);
+                ggml_backend_tensor_get_async(backend, z6_pair.pending_embd,
+                        lctx.embd+(size_t)z6_pair.pending_embd_offset*n_embd_output, 0, rows*n_embd_output*sizeof(float));
+                z6_pair.pending_embd = nullptr;
             }
             z6_pair.pending = nullptr;
         } else {
@@ -8798,7 +9430,7 @@ static int llama_decode_internal(
 
         // extract embeddings
         //if (embd && (cparams.mtp_op_type == MTP_OP_NONE || cparams.mtp_op_type == MTP_OP_DRAFT_GEN)) {
-        if (embd && cparams.mtp_op_type != MTP_OP_WARMUP) {
+        if (embd && !z6_defer && cparams.mtp_op_type != MTP_OP_WARMUP) {
 #if IK_PRINT_TIMING
             tim1 = ggml_time_us();
 #endif
@@ -10945,6 +11577,7 @@ struct llama_context * llama_init_from_model(
             pipeline_parallel = pipeline_parallel && params.moe_cache_size == 0;
             pipeline_parallel = pipeline_parallel && !llama_z6_caldi::requested();
             pipeline_parallel = pipeline_parallel && !llama_z6_testa::requested();
+            pipeline_parallel = pipeline_parallel && !llama_z6_tp::requested();
 #ifndef GGML_USE_CUDA
             // pipeline parallelism requires support for async compute and events
             // currently this is only implemented in the CUDA backend
@@ -10957,6 +11590,16 @@ struct llama_context * llama_init_from_model(
             }
 
             llama_repack_up_gate_exps(*ctx);
+
+            if (llama_z6_tp::requested()) {
+                try {
+                    ctx->z6_tp = std::make_unique<llama_z6_tp>(*model, ctx->backends);
+                } catch (const std::exception & e) {
+                    LLAMA_LOG_ERROR("z6 densa tp: %s\n", e.what());
+                    llama_free(ctx);
+                    return nullptr;
+                }
+            }
 
             if (llama_z6_testa::requested()) {
                 try {
@@ -12298,6 +12941,8 @@ void llama_kv_cache_seq_add(struct llama_context * ctx, llama_seq_id seq_id, lla
     }
 
     llama_kv_cache_seq_add(ctx->kv_self, seq_id, p0, p1, delta);
+    // GLM5NEXT pools are keyed by position: shifted positions change their members
+    if (ctx->model.arch == LLM_ARCH_GLM5NEXT && !ctx->kv_self.kp_l.empty()) ctx->qsa_pooled_stale = true;
 }
 
 void llama_kv_cache_seq_div(struct llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
@@ -12306,6 +12951,7 @@ void llama_kv_cache_seq_div(struct llama_context * ctx, llama_seq_id seq_id, lla
     }
 
     llama_kv_cache_seq_div(ctx->kv_self, seq_id, p0, p1, d);
+    if (ctx->model.arch == LLM_ARCH_GLM5NEXT && !ctx->kv_self.kp_l.empty()) ctx->qsa_pooled_stale = true;
 }
 
 bool llama_kv_cache_is_compacted(const struct llama_context * ctx) {
@@ -14766,6 +15412,8 @@ int32_t llama_encode(
 int32_t llama_decode(
         struct llama_context * ctx,
           struct llama_batch   batch) {
+    static const int64_t z6_ripristino = [] { const char * e = getenv("GGML_Z6_CALDI_RIPRISTINO"); return e ? atoll(e) : 0; }();
+    if (z6_ripristino > 0 && batch.n_tokens >= z6_ripristino && ctx->z6_caldi) ctx->z6_caldi->prima_del_prefill(batch.n_tokens);
     const int ret = llama_decode_internal(*ctx, batch);
     if (ret < 0) {
         LLAMA_LOG_ERROR("%s: failed to decode, ret = %d\n", __func__, ret);

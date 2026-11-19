@@ -236,6 +236,11 @@ bool common_speculative_commit(
         llama_pos pos_base,
         const std::vector<int32_t> & accepted_output_indices);
 
+// Z6 (GGML_Z6_TEMPI=1): time inside common_speculative_commit, summed since start (all zero without the variable):
+// restore of a refused draft (checkpoint restore plus any re-decode) and update of the MTP hidden state (copy of the
+// accepted hidden rows and the MTP accept batch), and the number of restores
+void common_speculative_z6_tempi(int64_t * ripristino_us, int64_t * mtp_us, int64_t * ripristini);
+
 bool common_speculative_has_sequence_hidden(const common_speculative * spec, llama_seq_id seq_id);
 
 void common_speculative_clear_sequence_hidden(common_speculative * spec, llama_seq_id seq_id);

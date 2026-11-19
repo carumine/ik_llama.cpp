@@ -101,6 +101,10 @@ struct DataInfo {
     int           ne11;
     const mmid_row_mapping * row_mapping = nullptr;
     size_t        bs2 = 0;
+    // Z6 (GGML_Z6_PP_UG_LOCALE): when set, the results go to this small buffer (row iy at tile + iy*tile_bs) instead
+    // of the destination tensor; the inputs are still found through cur_y and row_mapping
+    float       * tile = nullptr;
+    size_t        tile_bs = 0;
 
     inline const char * src1_row(int iy) const {
         if (!row_mapping) return cy + (cur_y + iy)*by;
@@ -131,6 +135,7 @@ struct DataInfo {
     }
 #endif
     inline float * dst_row(int iy) const {
+        if (tile) return tile + iy*tile_bs;
         if (!row_mapping) return s + (cur_y + iy)*bs;
         int i12 = row_mapping[cur_y + iy].i2;
         int i1  = row_mapping[cur_y + iy].i1;

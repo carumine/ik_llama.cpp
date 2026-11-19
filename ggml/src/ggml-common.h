@@ -551,6 +551,18 @@ typedef struct {
 } block_iq3_s;
 static_assert(sizeof(block_iq3_s) == sizeof(ggml_half) + 13*(QK_K/32) + IQ3S_N_SCALE, "wrong iq3_s block size/padding");
 
+// Z6 (GGML_Z6_IQ3S_LUT=1): IQ3_S with the grid lookup resolved at load time. Every weight of IQ3_S is
+// +-(1, 3, ..., 15) times the scale of its group of 32: here it takes 4 bits, 3 for the magnitude index (value 2*m+1)
+// and 1 for the sign, so the kernels decode it with vpshufb instead of a gather on the 512-entry grid.
+// Byte b of sub-block s (64 weights): low nibble = weight 64*s+b, high nibble = weight 64*s+32+b.
+// d and scales are the bytes of block_iq3_s: values, scales and summation order do not change.
+typedef struct {
+    ggml_half d;
+    uint8_t scales[IQ3S_N_SCALE];
+    uint8_t nib[QK_K/2];
+} block_iq3_s_z6;
+static_assert(sizeof(block_iq3_s_z6) == sizeof(ggml_half) + IQ3S_N_SCALE + QK_K/2, "wrong iq3_s_z6 block size/padding");
+
 typedef struct {
     ggml_half d[4];
     uint8_t qs[QK_K];

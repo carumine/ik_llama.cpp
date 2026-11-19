@@ -99,6 +99,11 @@ void dequantize_row_iq1_m  (const block_iq1_m   * GGML_RESTRICT x, float * GGML_
 void dequantize_row_iq4_nl (const block_iq4_nl  * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 void dequantize_row_iq4_xs (const block_iq4_xs  * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 void dequantize_row_iq3_s  (const block_iq3_s   * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+// Z6: IQ3_S reordered to 4 bits per weight (GGML_TYPE_IQ3_S_Z6, see block_iq3_s_z6 in ggml-common.h)
+void dequantize_row_iq3_s_z6(const block_iq3_s_z6 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+bool iq3s_z6_prepare(void);
+bool iq3s_z6_from_iq3s(const block_iq3_s * GGML_RESTRICT x, block_iq3_s_z6 * GGML_RESTRICT y, int64_t nb);
+bool iq3s_z6_to_iq3s(const block_iq3_s_z6 * GGML_RESTRICT x, block_iq3_s * GGML_RESTRICT y, int64_t nb);
 void dequantize_row_iq1_bn (const block_iq1_bn  * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 
 #if GGML_USE_IQK_MULMAT
@@ -145,6 +150,7 @@ void ggml_vec_dot_iq1_m_q8_K  (int n, float * GGML_RESTRICT s, size_t bs, const 
 void ggml_vec_dot_iq4_nl_q8_0 (int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
 void ggml_vec_dot_iq4_xs_q8_K (int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
 void ggml_vec_dot_iq3_s_q8_K  (int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
+void ggml_vec_dot_iq3_s_z6_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
 void ggml_vec_dot_iq1_bn_q8_K64(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
 
 struct quantize_user_data;

@@ -37,6 +37,23 @@ IQK_API bool iqk_moe_fused_up_gate(long Nx, long Ny, long ne00, int ne11, int un
         float * C, long nb1, long nb2, const void * vrow_mapping, float limit,
         float situ_beta, float situ_beta_linear, int ith, int nth);
 
+// Z6 (GGML_Z6_PP_GEMELLI): the same rows of one expert for two batches of tokens, one conversion for both.
+// Each batch gets the result of its own call of the function above with ith = 0, nth = 1.
+IQK_API bool iqk_moe_fused_up_gate_gemelli(long Nx, long ne00, int ne11, int unary_op,
+        int typeA, const void * Aup, const void * Agate, long strideA,
+        int typeB, long strideB,
+        const char * up_b, const char * gate_b,
+        long Ny0, const void * B0, float * C0, const void * vrow_mapping0,
+        long Ny1, const void * B1, float * C1, const void * vrow_mapping1,
+        long nb1, long nb2, float limit, float situ_beta, float situ_beta_linear);
+
+IQK_API bool iqk_mul_mat_moe_gemelli(long Nx, long ne00, int ne11,
+        int typeA, const void * A, long strideA,
+        int typeB, long strideB,
+        long Ny0, const void * B0, float * C0, const void * vrow_mapping0,
+        long Ny1, const void * B1, float * C1, const void * vrow_mapping1,
+        long nb1, long nb2);
+
 IQK_API int iqk_dequant_type(int type, int Ny);
 
 IQK_API void iqk_vec_dot_f8_e4m3_ks(int n, float * s, size_t bs, const void * x, size_t bx,

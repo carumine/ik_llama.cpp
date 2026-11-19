@@ -51,6 +51,15 @@ GGML_API GGML_CALL void ggml_backend_cuda_invalidate_graphs(const void * model);
 
 // Z6: small explicit pinned staging, independent of GGML_CUDA_NO_PINNED.
 GGML_API GGML_CALL void * ggml_backend_cuda_z6_host_alloc(size_t bytes);
+// Z6 (GGML_Z6_DENSA_TP=1): a dense matrix split by rows over the two GPUs. The owner keeps rows [0, rows_local) and
+// computes them in place; w_remote holds the other rows on the second GPU. A mul_mat on w with at most 16 columns is
+// then computed by both GPUs inside the same CUDA op, exchanging input and output through pinned RAM (no P2P).
+// x_remote F32 [ne0, 16] and y_remote F32 [rows_remote, 16] live on the remote GPU, y_local F32 [rows_local, 16] on the owner.
+GGML_API GGML_CALL bool ggml_backend_cuda_z6_tp_register(const struct ggml_tensor * w, int64_t rows_local,
+        struct ggml_tensor * w_remote, struct ggml_tensor * x_remote, struct ggml_tensor * y_remote, struct ggml_tensor * y_local);
+GGML_API GGML_CALL void ggml_backend_cuda_z6_tp_clear(void);
+GGML_API GGML_CALL bool ggml_backend_cuda_z6_tp_type_ok(enum ggml_type type);
+GGML_API GGML_CALL void ggml_backend_cuda_z6_tp_unregister(const struct ggml_tensor * w);
 // caldi dinamici: copie verso la VRAM su uno stream proprio, in parallelo al calcolo
 GGML_API GGML_CALL void ggml_backend_cuda_z6_carica_async(ggml_backend_t backend, struct ggml_tensor * dst, size_t offset, const void * src, size_t size);
 GGML_API GGML_CALL void ggml_backend_cuda_z6_carica_attendi(ggml_backend_t backend);
@@ -60,6 +69,12 @@ GGML_API GGML_CALL void ggml_backend_cuda_z6_event_record(ggml_backend_event_t e
 GGML_API GGML_CALL bool ggml_backend_cuda_z6_event_ready(ggml_backend_event_t event);
 GGML_API GGML_CALL void ggml_backend_cuda_z6_get_async(ggml_backend_t backend, const struct ggml_tensor * src, void * dst);
 GGML_API GGML_CALL void ggml_backend_cuda_z6_set_async(ggml_backend_t backend, struct ggml_tensor * dst, const void * src);
+// Z6 (GGML_Z6_TEMPI=1): host time of the CUDA graph launch path summed since start, all zero without the variable.
+// Fills up to n values and returns how many: [0] us in the node property walk, [1] us in the compatibility walk
+// (without the pointer copy), [2] us in the copy of the CPY destination pointers, [3] us in cudaGraphLaunch,
+// [4] us in direct evaluation or capture, [5] us in instantiate/update, [6] graph launches, [7] pointer copies,
+// [8] direct evaluations, [9] captures.
+GGML_API GGML_CALL int ggml_backend_cuda_z6_tempi_avvio(int64_t * out, int n);
 
 GGML_API GGML_CALL size_t ggml_cuda_quantize(int device, enum ggml_type type, const float * src, void * dst, int64_t nrows, int64_t n_per_row, int64_t nslice, const float * imatrix);
 

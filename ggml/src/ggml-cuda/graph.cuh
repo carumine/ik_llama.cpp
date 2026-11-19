@@ -32,6 +32,8 @@ struct ggml_cuda_graph {
         }
     }
     uint64_t uid = 0;
+    // Z6 (GGML_Z6_GRAFI_EPOCA): epoch of the CUDA memory frees this instance was captured in, see ggml-cuda.cu
+    uint64_t z6_epoca = 0;
     int64_t last_used_time = 0;
     cudaGraph_t graph = nullptr;
     cudaGraphExec_t instance = nullptr;

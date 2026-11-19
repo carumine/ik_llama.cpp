@@ -513,6 +513,7 @@ extern "C" {
         GGML_TYPE_Q8_K_R16   = 397,
         GGML_TYPE_Q8_KV_R8   = 398,
         GGML_TYPE_Q8_K_R8    = 399,
+        GGML_TYPE_IQ3_S_Z6   = 400, // Z6: IQ3_S reordered to 4 bits per weight at load time (GGML_Z6_IQ3S_LUT=1), CPU only, never in a file
         GGML_TYPE_COUNT,
     };
 
@@ -976,6 +977,27 @@ extern "C" {
     GGML_API void    ggml_numa_init(enum ggml_numa_strategy numa); // call once for better performance on NUMA systems
     // Z6: establish expert page policy before loading/pinning owned host weights.
     GGML_API bool ggml_z6_numa_place_tensor(const struct ggml_tensor * tensor);
+    // Z6 (GGML_Z6_AFFINITA_STABILE=1): between hold_begin and the matching hold_end, the calling thread keeps the
+    // CPU of worker 0 across ggml_graph_compute calls instead of pinning and restoring its mask at every graph; the
+    // outermost hold_end restores the launcher mask. release restores it at once, before code that creates threads
+    // (they would inherit the single CPU). Holds nest and are per thread; all three are no-ops without the variable.
+    GGML_API void ggml_z6_affinity_hold_begin(void);
+    GGML_API void ggml_z6_affinity_hold_end(void);
+    GGML_API void ggml_z6_affinity_release(void);
+    // true when the holds act (variable set, Linux build with OpenMP); for tests that must tell "not enabled" from a failure
+    GGML_API bool ggml_z6_affinity_hold_enabled(void);
+    // adds to out[0..n) the bytes of tensor that ggml_z6_numa_place_tensor binds to each node; returns the nodes used
+    GGML_API int  ggml_z6_numa_bytes_per_node(const struct ggml_tensor * tensor, size_t * out, int n);
+    // Z6 (GGML_Z6_IQ3S_LUT=1): cold IQ3_S experts kept in RAM as GGML_TYPE_IQ3_S_Z6 (see block_iq3_s_z6).
+    // _requested: the variable is set and this build has the kernels. _retype: before allocation, switches an
+    // unallocated IQ3_S tensor to the reordered type (strides included). _from_iq3s / _to_iq3s: convert n_blocks
+    // blocks of 256 weights (110 <-> 134 bytes); src and dst must not overlap; false on a block that is not valid.
+    GGML_API bool ggml_z6_iq3s_lut_requested(void);
+    GGML_API bool ggml_z6_layer_in_list(const char * list, int il);   // "3-10,13": il in the list; NULL or empty: true
+    GGML_API bool ggml_z6_iq3s_lut_layer(int il);                      // GGML_Z6_IQ3S_LUT_LIVELLI
+    GGML_API bool ggml_z6_iq3s_lut_retype(struct ggml_tensor * tensor);
+    GGML_API bool ggml_z6_iq3s_lut_from_iq3s(const void * src, void * dst, int64_t n_blocks);
+    GGML_API bool ggml_z6_iq3s_lut_to_iq3s(const void * src, void * dst, int64_t n_blocks);
     GGML_API bool    ggml_is_numa(void); // true if init detected that system has >1 NUMA node
 
     GGML_API void    ggml_print_object (const struct ggml_object * obj);
@@ -2913,6 +2935,16 @@ extern "C" {
             struct ggml_tensor  * topk,
             int                   max_row_size);
 
+    // Z6 (GGML_Z6_DSA_CAUSALE_COMPATTA): ggml_indexer_mask_to_index for a causal mask that is never built. Cell c is
+    // open for row i when cell_pos[c] <= q_pos[i]: a cell that is empty or of another sequence holds INT32_MAX, a
+    // padding row holds -1. Every cell is listed once. Result: I32 [min(n_kv, max_row_size), n_rows]
+    GGML_API struct ggml_tensor * ggml_z6_indexer_pos_to_index(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * cell_pos,   // I32 [n_kv]
+            struct ggml_tensor  * q_pos,      // I32 [n_rows]
+            struct ggml_tensor  * topk,       // I32 [n_topk, n_tok], n_tok <= n_rows
+            int                   max_row_size);
+
     GGML_API struct ggml_tensor * ggml_ds4_comp(
             struct ggml_context * ctx,
             struct ggml_tensor  * state,
@@ -3105,6 +3137,24 @@ extern "C" {
     // same as ggml_graph_compute() but the work data is allocated as a part of the context
     // note: the drawback of this API is that you must have ensured that the context has enough memory for the work data
     GGML_API enum ggml_status  ggml_graph_compute_with_ctx(struct ggml_context * ctx, struct ggml_cgraph * cgraph, int n_threads);
+
+    // Z6 (GGML_Z6_MTP_LANCI_NASCOSTI): work the calling thread hands to thread 0 of the next CPU graph it computes.
+    // Thread 0 is the caller itself (OpenMP primary thread, worker 0 without OpenMP), so a thread-local pointer reaches
+    // it and no other worker. Thread 0 runs the work where it is known to be free while the others compute: the cold
+    // MoE nodes of one token with GGML_Z6_PRINCIPALE_LIBERO and GGML_Z6_FREDDI_CODA, right before their barrier.
+    // `eseguito` tells the caller whether the work ran (if not, the caller runs it after the graph);
+    // `a_parti_esaurite` whether, when it ended, the queue of that node had no parts left, i.e. the other threads may
+    // have reached the barrier before thread 0.
+    struct ggml_z6_laterale {
+        void (*fn)(void * ud);
+        void * ud;
+        int    eseguito;
+        int    a_parti_esaurite;
+    };
+    // NULL clears it; it is also cleared when the work starts, so it runs at most once
+    GGML_API void ggml_z6_laterale_imposta(struct ggml_z6_laterale * lavoro);
+    // true when thread 0 skips the cold experts of one token (GGML_Z6_PRINCIPALE_LIBERO=1 with GGML_Z6_FREDDI_CODA)
+    GGML_API bool ggml_z6_principale_libero_attivo(void);
 
     GGML_API struct ggml_tensor * ggml_graph_get_tensor(struct ggml_cgraph * cgraph, const char * name);
 
