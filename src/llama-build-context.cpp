@@ -1927,6 +1927,9 @@ llm_expert_gating_func_type   gating_op,
                 ggml_backend_sched_get_n_copies(lctx.sched) == 1 &&
                 graph && n_expert_used == lctx.model.hparams.n_expert_used && !lctx.cparams.split_mode_graph_scheduling &&
                 lctx.model.split_mode != LLAMA_SPLIT_MODE_GRAPH;
+        // ClassLRU observes the hot slots only in parallel one-token graphs; other one-token graphs (reserve with all
+        // experts, non-parallel paths) leave the -2 marker and dopo_token skips that layer for that step
+        int32_t * usage = n_tokens == 1 && parallel ? hot.usage_slots(il) : nullptr;
         ggml_tensor * cpu_x = x, * cpu_ids = cold_ids, * cpu_weights = nullptr;
         ggml_tensor * hot_begin = nullptr;
         if (parallel) {
@@ -1988,7 +1991,7 @@ llm_expert_gating_func_type   gating_op,
         if (parallel) {
             hot.stage_output(cold_end);
             const ggml_z6_caldi_group group = { hot_begin, hot_sum, cold_par, cold_end,
-                    {x, cold_ids, weights}, {cpu_x, cpu_ids, cpu_weights}, il };
+                    {x, cold_ids, weights}, {cpu_x, cpu_ids, cpu_weights}, il, usage ? hot_ids : nullptr, usage };
             ggml_backend_sched_z6_add_group(lctx.sched, &group);
         }
         auto cold_sum = sum_cpu || sum_batch ? cold_end

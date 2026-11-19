@@ -15,6 +15,7 @@
 #include <thread>
 #include <cerrno>
 #include <cstdlib>
+#include <cmath>
 #include <fstream>
 #include <limits>
 #include <sstream>
@@ -36,6 +37,22 @@ uint64_t env_integer(const char * name, uint64_t fallback) {
 std::vector<ggml_tensor *> weights(const llama_layer & l) {
     if (l.ffn_up_gate_exps) return {l.ffn_up_gate_exps, l.ffn_down_exps};
     return {l.ffn_up_exps, l.ffn_gate_exps, l.ffn_down_exps};
+}
+
+// GGML_Z6_IQ3S_LUT=1: in RAM the IQ3_S experts are reordered (GGML_TYPE_IQ3_S_Z6, 134 bytes per block). The banks in
+// VRAM keep IQ3_S, the only layout the CUDA kernels read: every expert that goes to a bank passes through the inverse
+// of the reordering, which rebuilds the bytes of the file.
+ggml_type bank_type(const ggml_tensor * src) { return src->type == GGML_TYPE_IQ3_S_Z6 ? GGML_TYPE_IQ3_S : src->type; }
+size_t bank_expert_bytes(const ggml_tensor * src) { return ggml_row_size(bank_type(src), src->ne[0])*src->ne[1]; }
+// One expert of src in the layout of the bank: src itself, or its restored copy in tmp
+const void * bank_expert(const ggml_tensor * src, int expert, std::vector<uint8_t> & tmp) {
+    const char * data = (const char *)src->data + (size_t)expert*src->nb[2];
+    if (src->type != GGML_TYPE_IQ3_S_Z6) return data;
+    const size_t bytes = bank_expert_bytes(src);
+    tmp.resize(bytes);
+    if (!ggml_z6_iq3s_lut_to_iq3s(data, tmp.data(), (int64_t)(bytes/ggml_type_size(GGML_TYPE_IQ3_S))))
+        throw std::runtime_error("z6 caldi: esperto riordinato non riportabile a IQ3_S");
+    return tmp.data();
 }
 }
 
@@ -68,11 +85,21 @@ struct llama_z6_caldi::impl {
         std::vector<int32_t> hot, cold, owner, seen;
         size_t next_slot = 0, slots_fissi = 0;
         bool dirty = false;
+        std::vector<double> score;
+        std::vector<int64_t> score_token;
+        int64_t observed = 0, cold_uses = 0, loads = 0, rejected = 0;
     };
     struct pending_upload { int il, expert, slot; };
     // Le copie grandi occupano il motore di copia e fanno aspettare quelle piccole del calcolo: un thread proprio,
     // sul fratello HT dell'ultimo core, le manda a pezzi piccoli
-    struct upload_job { ggml_backend_t gpu; ggml_tensor * dst; size_t offset; const char * src; size_t size; };
+    // tensor/expert set: source reordered by GGML_Z6_IQ3S_LUT, restored by the upload thread before the copy
+    struct upload_job { ggml_backend_t gpu; ggml_tensor * dst; size_t offset; const char * src; size_t size;
+                        const ggml_tensor * lut_src = nullptr; int lut_expert = 0; };
+    static upload_job make_job(ggml_backend_t gpu, ggml_tensor * dst, const ggml_tensor * src, int expert, int slot) {
+        upload_job j{gpu, dst, (size_t)slot*dst->nb[2], (const char *)src->data + (size_t)expert*src->nb[2], (size_t)dst->nb[2]};
+        if (src->type == GGML_TYPE_IQ3_S_Z6) { j.lut_src = src; j.lut_expert = expert; }
+        return j;
+    }
     std::thread uploader;
     std::mutex upload_m;
     std::condition_variable upload_cv;
@@ -80,6 +107,7 @@ struct llama_z6_caldi::impl {
     std::atomic<int64_t> upload_left{0};
     bool upload_stop = false;
     size_t upload_chunk = 256*1024;
+    std::vector<uint8_t> upload_tmp;   // upload thread only
     void upload_loop() {
 #ifdef GGML_USE_CUDA
         cpu_set_t set;
@@ -95,6 +123,8 @@ struct llama_z6_caldi::impl {
                 j = upload_q.front();
                 upload_q.pop_front();
             }
+            // each piece is awaited before the next one: the restored copy outlives its uploads
+            if (j.lut_src) j.src = (const char *)bank_expert(j.lut_src, j.lut_expert, upload_tmp);
             for (size_t done = 0; done < j.size; done += upload_chunk) {
                 ggml_backend_cuda_z6_carica_async(j.gpu, j.dst, j.offset + done, j.src + done, std::min(upload_chunk, j.size - done));
                 ggml_backend_cuda_z6_carica_attendi(j.gpu);
@@ -103,7 +133,22 @@ struct llama_z6_caldi::impl {
         }
 #endif
     }
+    void report_usage() const {
+        if (!class_debug || !token) return;
+        int64_t calls = 0, cold = 0;
+        for (size_t il = 0; il < layers.size(); ++il) {
+            const auto & l = layers[il];
+            if (!l.observed) continue;
+            calls += l.observed; cold += l.cold_uses;
+            LLAMA_LOG_INFO("z6 classlru livello: L=%zu chiamate=%lld freddi=%lld caricamenti=%lld rifiuti=%lld\n",
+                    il, (long long)l.observed, (long long)l.cold_uses, (long long)l.loads, (long long)l.rejected);
+        }
+        LLAMA_LOG_INFO("z6 classlru finale: emivita=%llu token=%lld chiamate=%lld freddi_per_livello=%.6f caricamenti_per_token=%.6f\n",
+                (unsigned long long)class_half, (long long)token, (long long)calls,
+                calls ? double(cold)/calls : 0.0, double(dyn_up)/token);
+    }
     ~impl() {
+        report_usage();
         if (uploader.joinable()) {
             { std::lock_guard<std::mutex> lock(upload_m); upload_stop = true; }
             upload_cv.notify_all();
@@ -117,7 +162,81 @@ struct llama_z6_caldi::impl {
     std::vector<std::pair<int,int>> wanted;
     std::vector<pending_upload> pending;
     int64_t dyn_tot = 0, dyn_up = 0;
+    uint64_t class_half = 0;
+    bool class_debug = false;
+    int64_t class_mancanti = 0; // passi in cui un livello non aveva osservazione dei caldi (grafo non parallelo)
+    double class_decay = 0;
+    // The clock follows the existing policy: successful decode calls of exactly one token.
+    double score_at(const layer & l, int e) const {
+        return e < 0 ? 0.0 : l.score[e]*std::exp(-class_decay*double(token - l.score_token[e]));
+    }
+    void touch(layer & l, int e) {
+        GGML_ASSERT(e >= 0 && (size_t)e < l.score.size());
+        l.score[e] = score_at(l, e) + 1.0;
+        l.score_token[e] = token;
+    }
 
+    // GGML_Z6_CALDI_RIPRISTINO: in generazione gli slot dinamici seguono gli esperti di un token alla volta; un prefill
+    // grande che arriva dopo trova un insieme caldi peggiore per i blocchi (14,6K: 490 contro 515 t/s, 07/11). Prima
+    // del batch gli slot dinamici tornano agli esperti statici della selezione iniziale, se non sono già caldi altrove.
+    // Gli stessi caricamenti dei dinamici, ma aspettati qui: il prefill parte con mappe e banchi coerenti.
+    int64_t rip_volte = 0, rip_slot = 0, rip_us = 0;
+    void prima_del_prefill(int64_t n_tokens) {
+#ifdef GGML_USE_CUDA
+        const int64_t t0 = ggml_time_us();
+        bool diverso = !pending.empty() || upload_left.load() > 0;
+        for (size_t il = 0; !diverso && il < layers.size(); ++il) {
+            const auto & l = layers[il];
+            for (size_t s = l.slots_fissi; s < l.owner.size(); ++s) if (l.owner[s] != l.selected[s]) { diverso = true; break; }
+        }
+        if (!diverso) return;
+        // i caricamenti in corso finiscono prima di riscrivere slot e mappe
+        for (auto & b : gpus) ggml_backend_synchronize(b.gpu);
+        while (upload_left.load() > 0) std::this_thread::yield();
+        for (auto & p : pending) {
+            auto & l = layers[p.il];
+            l.hot[p.expert] = p.slot; l.cold[p.expert] = -1; l.dirty = true;
+        }
+        pending.clear();
+        wanted.clear();
+        std::vector<pending_upload> rimessi;
+        for (size_t il = 0; il < layers.size(); ++il) {
+            auto & l = layers[il];
+            for (size_t s = l.slots_fissi; s < l.owner.size(); ++s) {
+                const int e = l.selected[s], vecchio = l.owner[s];
+                if (vecchio == e || l.hot[e] >= 0) continue;
+                if (vecchio >= 0) { l.hot[vecchio] = -1; l.cold[vecchio] = vecchio; }
+                l.owner[s] = e; l.hot[e] = (int32_t)s; l.cold[e] = -1; l.dirty = true;
+                rimessi.push_back({(int)il, e, (int)s});
+            }
+        }
+        for (auto & q : rimessi) {
+            auto & l = layers[q.il];
+            auto gpu = gpus[layer_bank[q.il]].gpu;
+            for (auto src : l.sources) {
+                auto dst = banks.at(src);
+                upload_left.fetch_add(1);
+                std::lock_guard<std::mutex> lock(upload_m);
+                upload_q.push_back(make_job(gpu, dst, src, q.expert, q.slot));
+            }
+        }
+        upload_cv.notify_all();
+        while (upload_left.load() > 0) std::this_thread::yield();
+        for (auto & l : layers) {
+            if (!l.dirty) continue;
+            l.dirty = false;
+            ggml_backend_tensor_set(l.hot_map, l.hot.data(), 0, l.hot.size()*sizeof(int32_t));
+            ggml_backend_tensor_set(l.cold_map, l.cold.data(), 0, l.cold.size()*sizeof(int32_t));
+        }
+        for (auto & b : gpus) ggml_backend_synchronize(b.gpu);
+        rip_volte++; rip_slot += (int64_t)rimessi.size(); rip_us += ggml_time_us() - t0;
+        LLAMA_LOG_INFO("z6 ripristino: batch da %lld token, %zu slot tornati statici in %.1f ms (in tutto %lld volte, %.1f slot e %.1f ms in media)\n",
+                (long long)n_tokens, rimessi.size(), (ggml_time_us() - t0)/1e3, (long long)rip_volte,
+                1.0*rip_slot/rip_volte, rip_us/1e3/rip_volte);
+#else
+        (void)n_tokens;
+#endif
+    }
     void dopo_token() {
         ++token;
         int scelti[16];
@@ -126,6 +245,27 @@ struct llama_z6_caldi::impl {
             if (l.selected.empty()) continue;
             const int n = ggml_z6_freddi_scelti((int)il, scelti, 16);
             dyn_tot += n;
+            if (class_debug) { ++l.observed; l.cold_uses += n; }
+            if (class_half) {
+                // ready was already waited by the cold CPU split. Map ownership cannot change
+                // until below: pending uploads have not yet been published or replaced.
+                auto slots = (int32_t *)((char *)usage_pinned.get() + il*usage_stride);
+                bool mancante = true;
+                for (int64_t k = 0; k < n_used; ++k) mancante = mancante && slots[k] == -2;
+                if (mancante) { ++class_mancanti; goto z6_classlru_fatto; }
+                {
+                int hot_uses = 0;
+                for (int64_t k = 0; k < n_used; ++k) {
+                    const int s = slots[k];
+                    GGML_ASSERT(s == -1 || (s >= 0 && (size_t)s < l.owner.size()));
+                    if (s >= 0) { touch(l, l.owner[s]); ++hot_uses; }
+                    slots[k] = -2; // detect a missed observation on the next decode
+                }
+                GGML_ASSERT(hot_uses + n == n_used);
+                for (int k = 0; k < n; ++k) touch(l, scelti[k]);
+                }
+            }
+            z6_classlru_fatto:
             for (int i = 0; i < n; ++i) {
                 const int e = scelti[i];
                 if (token - l.seen[e] <= 2) wanted.emplace_back((int)il, e);   // seconda vista
@@ -166,8 +306,28 @@ struct llama_z6_caldi::impl {
                 // al massimo un nuovo esperto per slot a ogni giro, e i più frequenti restano fissi
                 const size_t dinamici = l.owner.size() - l.slots_fissi;
                 if (nel_giro[il] >= dinamici) continue;
+                int slot;
+                if (!class_half) {
+                    // Keep the original FIFO and its cursor exactly when opt-in is absent/zero.
+                    slot = (int)(l.slots_fissi + l.next_slot++ % dinamici);
+                } else {
+                    slot = -1;
+                    double lowest = std::numeric_limits<double>::infinity();
+                    for (size_t s = l.slots_fissi; s < l.owner.size(); ++s) {
+                        bool reserved = false;
+                        for (const auto & q : next) if (q.il == il && q.slot == (int)s) { reserved = true; break; }
+                        if (reserved) continue;
+                        const double value = score_at(l, l.owner[s]);
+                        if (value < lowest) { lowest = value; slot = (int)s; }
+                    }
+                    // Strictly better only; rejection must not consume the per-layer load budget.
+                    if (slot < 0 || lowest >= score_at(l, e)) {
+                        if (class_debug) ++l.rejected;
+                        continue;
+                    }
+                }
                 nel_giro[il]++;
-                const int slot = (int)(l.slots_fissi + l.next_slot++ % dinamici);
+                if (class_debug) ++l.loads;
                 const int vecchio = l.owner[slot];
                 if (vecchio >= 0) { l.hot[vecchio] = -1; l.cold[vecchio] = vecchio; l.dirty = true; }
                 l.owner[slot] = e;
@@ -188,7 +348,7 @@ struct llama_z6_caldi::impl {
                 auto dst = banks.at(src);
                 upload_left.fetch_add(1);
                 std::lock_guard<std::mutex> lock(upload_m);
-                upload_q.push_back({gpu, dst, q.slot*dst->nb[2], (const char *)src->data + q.expert*src->nb[2], (size_t)src->nb[2]});
+                upload_q.push_back(make_job(gpu, dst, src, q.expert, q.slot));
             }
         }
         upload_cv.notify_all();
@@ -209,6 +369,8 @@ struct llama_z6_caldi::impl {
     std::vector<layer> layers;
     std::unordered_map<const ggml_tensor *, ggml_tensor *> banks;
     std::unique_ptr<void, pinned_deleter> pinned;
+    std::unique_ptr<void, pinned_deleter> usage_pinned;
+    size_t usage_stride = 0;
     ggml_backend_buffer_ptr host_buffer;
     std::unique_ptr<void, pinned_deleter> pair_pinned;
     ggml_backend_buffer_ptr pair_host_buffer;
@@ -250,6 +412,12 @@ struct llama_z6_caldi::impl {
         for (size_t il = 0; il < layers.size(); ++il) {
             const auto & l = model.layers[il];
             if (!l.ffn_down_exps) continue;
+            // MTP (nextn) layers are loaded only with speculative MTP and are not in the counts file:
+            // they stay on the normal path instead of aborting context creation.
+            if (model.hparams.nextn_predict_layers > 0 && il >= model.hparams.n_layer - model.hparams.nextn_predict_layers) {
+                LLAMA_LOG_INFO("z6 caldi: livello %zu MTP escluso\n", il);
+                continue;
+            }
             if (l.ffn_up_exps_b || l.ffn_gate_exps_b || l.ffn_up_gate_exps_b || l.ffn_down_exps_b || l.ffn_down_exps_s)
                 throw std::runtime_error("esperti con bias/scale non supportati nella prima versione");
             auto ws = weights(l);
@@ -262,7 +430,7 @@ struct llama_z6_caldi::impl {
             if (!l.ffn_up_gate_exps && l.ffn_up_exps->type != l.ffn_gate_exps->type)
                 throw std::runtime_error("up e gate devono avere lo stesso tipo per MMVQ fuso");
             size_t bytes_per_expert = 0;
-            for (auto t : ws) bytes_per_expert += t->nb[2];
+            for (auto t : ws) bytes_per_expert += bank_expert_bytes(t);
             LLAMA_LOG_INFO("z6 caldi: costo livello %zu byte_esperto %zu\n", il, bytes_per_expert);
             layers[il].sources = std::move(ws);
         }
@@ -292,6 +460,8 @@ struct llama_z6_caldi::impl {
             size_t bytes = 2*pad(ne*sizeof(int32_t));
             for (auto src : layers[il].sources) {
                 auto t = *src;
+                t.type = bank_type(src);
+                t.nb[0] = ggml_type_size(t.type); t.nb[1] = ggml_row_size(t.type, t.ne[0]); t.nb[2] = t.nb[1]*t.ne[1];
                 t.ne[2] = slots; t.nb[3] = t.nb[2]*slots;
                 bytes += pad(ggml_backend_buft_get_alloc_size(buft, &t));
             }
@@ -300,13 +470,33 @@ struct llama_z6_caldi::impl {
         size_t selected = 0;
         uint64_t total = 0, covered = 0;
         for (const auto & c : counts) total += c.n;
-        for (const auto & c : counts) {
-            if (!c.n) break;
+        // GGML_Z6_CALDI_MIN_LIVELLO=<n>: the n most used experts of every layer are taken first, then the budget is
+        // filled by count as before. A layer without hot experts has no parallel group: its cold experts run as an
+        // ordinary CPU piece with the GPU waiting, and the pair of GGML_Z6_MTP_PIPELINE loses the overlap there. With
+        // a small budget (when the GPU, not the CPU, sets the pace) this keeps every layer in the parallel path.
+        const uint64_t min_livello = env_integer("GGML_Z6_CALDI_MIN_LIVELLO", 0);
+        std::vector<std::vector<bool>> preso(layers.size(), std::vector<bool>(ne));
+        auto prendi = [&](const count & c) {
             auto & l = layers[c.il];
             const size_t delta = layer_size(c.il, l.selected.size() + 1) - layer_size(c.il, l.selected.size());
             auto & b = gpus[layer_bank[c.il]];
-            if (delta > budget - b.allocated) continue;
+            if (delta > budget - b.allocated) return;
             b.allocated += delta; l.selected.push_back(c.expert); covered += c.n; ++selected;
+            preso[c.il][c.expert] = true;
+        };
+        if (min_livello) for (const auto & c : counts) {
+            if (!c.n) break;
+            if (layers[c.il].selected.size() < min_livello) prendi(c);
+        }
+        for (const auto & c : counts) {
+            if (!c.n) break;
+            if (!preso[c.il][c.expert]) prendi(c);
+        }
+        if (min_livello) {
+            size_t senza = 0;
+            for (size_t il = 0; il < layers.size(); ++il) senza += !layers[il].sources.empty() && layers[il].selected.empty();
+            LLAMA_LOG_INFO("z6 caldi: almeno %llu esperti per livello richiesti, livelli rimasti senza caldi %zu\n",
+                    (unsigned long long)min_livello, senza);
         }
         if (!selected) throw std::runtime_error("budget insufficiente o conteggi vuoti");
         for (size_t il = 0; il < layers.size(); ++il)
@@ -324,7 +514,7 @@ struct llama_z6_caldi::impl {
             ggml_format_name(l.hot_map, "z6_caldi.map-%zu", il);
             ggml_format_name(l.cold_map, "z6_freddi.map-%zu", il);
             for (auto src : l.sources) {
-                auto dst = ggml_new_tensor_3d(ctx, src->type, src->ne[0], src->ne[1], l.selected.size());
+                auto dst = ggml_new_tensor_3d(ctx, bank_type(src), src->ne[0], src->ne[1], l.selected.size());
                 ggml_format_name(dst, "z6_caldi.%s", src->name);
                 banks[src] = dst;
             }
@@ -342,6 +532,8 @@ struct llama_z6_caldi::impl {
             actual += size;
             names += std::string(names.empty() ? "" : "+") + ggml_backend_name(b.gpu);
         }
+        std::vector<uint8_t> restored;   // GGML_Z6_IQ3S_LUT: one expert back in the IQ3_S layout
+        size_t restored_experts = 0;
         for (size_t il = 0; il < layers.size(); ++il) {
             auto & l = layers[il];
             if (l.selected.empty()) continue;
@@ -351,8 +543,9 @@ struct llama_z6_caldi::impl {
                 const int e = l.selected[slot]; hot[e] = slot; cold[e] = -1;
                 for (auto src : l.sources) {
                     auto dst = banks.at(src);
-                    ggml_backend_tensor_set(dst, (const char *)src->data + e*src->nb[2], slot*dst->nb[2], src->nb[2]);
+                    ggml_backend_tensor_set(dst, bank_expert(src, e, restored), slot*dst->nb[2], dst->nb[2]);
                 }
+                for (auto src : l.sources) restored_experts += src->type == GGML_TYPE_IQ3_S_Z6;
                 LLAMA_LOG_INFO("z6 caldi: scelto %zu %d slot %zu\n", il, e, slot);
             }
             ggml_backend_tensor_set(l.hot_map, hot.data(), 0, hot.size()*sizeof(int32_t));
@@ -361,7 +554,20 @@ struct llama_z6_caldi::impl {
             l.owner = l.selected;
             l.seen.assign(ne, -1000000);
         }
+        if (restored_experts) LLAMA_LOG_INFO("z6 caldi: %zu matrici di esperti riportate da IQ3_S riordinato a IQ3_S per la VRAM\n", restored_experts);
         dyn_period = env_integer("GGML_Z6_CALDI_DINAMICI", 0);
+        class_half = env_integer("GGML_Z6_CALDI_CLASSLRU", 0);
+        class_debug = env_integer("GGML_Z6_CALDI_CLASSLRU_DEBUG", 0) != 0;
+        if (class_half && (!dyn_period || n_used > 16 || layers.size() > 128))
+            throw std::runtime_error("ClassLRU richiede dinamici, <=16 esperti usati e <=128 livelli");
+        if (class_half) {
+            class_decay = std::log(2.0)/double(class_half);
+            for (auto & l : layers) {
+                if (l.selected.empty()) continue;
+                l.score.assign(ne, 0.0);
+                l.score_token.assign(ne, 0);
+            }
+        }
         if (dyn_period) {
             dyn_max = (int)env_integer("GGML_Z6_CALDI_DIN_MAX", 20);
             upload_chunk = env_integer("GGML_Z6_CALDI_DIN_PEZZO_KIB", 256)*1024;
@@ -389,6 +595,20 @@ struct llama_z6_caldi::impl {
                     pinned ? "attivo" : "allocazione fallita, ritorno sequenziale");
 #else
             throw std::runtime_error("GGML_Z6_CALDI_PARALLELO richiede CUDA");
+#endif
+        }
+        if (class_half) {
+#ifdef GGML_USE_CUDA
+            if (!pinned) throw std::runtime_error("ClassLRU richiede lo staging parallelo pinned");
+            usage_stride = (n_used*sizeof(int32_t) + 127)/128*128;
+            usage_pinned.reset(ggml_backend_cuda_z6_host_alloc(layers.size()*usage_stride));
+            if (!usage_pinned) throw std::runtime_error("ClassLRU: allocazione osservazioni fallita");
+            for (size_t il = 0; il < layers.size(); ++il) {
+                auto ptr = (int32_t *)((char *)usage_pinned.get() + il*usage_stride);
+                std::fill(ptr, ptr + n_used, -2);
+            }
+#else
+            throw std::runtime_error("ClassLRU richiede CUDA");
 #endif
         }
         // ultimo passo: un'eccezione del costruttore non troverebbe il distruttore a fermare il thread
@@ -426,7 +646,11 @@ void llama_z6_caldi::pair_slot(int slot) {
 #endif
     pimpl->pair_slot = slot;
 }
+int32_t * llama_z6_caldi::usage_slots(int il) const {
+    return pimpl->class_half ? (int32_t *)((char *)pimpl->usage_pinned.get() + il*pimpl->usage_stride) : nullptr;
+}
 void llama_z6_caldi::dopo_token() { if (pimpl->dyn_period) pimpl->dopo_token(); }
+void llama_z6_caldi::prima_del_prefill(int64_t n_tokens) { if (pimpl->dyn_period) pimpl->prima_del_prefill(n_tokens); }
 void llama_z6_caldi::staging(ggml_context * ctx, int layer, int64_t nt, ggml_tensor ** x, ggml_tensor ** ids, ggml_tensor ** w) const {
     GGML_ASSERT(parallel() && nt > 0 && nt <= pimpl->staging_tokens);
     auto make = [&](ggml_type type, int64_t a, int64_t b, int64_t c, size_t offset, const char * name) {
