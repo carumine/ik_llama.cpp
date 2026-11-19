@@ -3918,6 +3918,25 @@ void dequantize_row_iq3_s(const block_iq3_s * restrict x, float * restrict y, in
     }
 }
 
+// ====================== Z6: IQ3_S reordered to 4 bits per weight (GGML_TYPE_IQ3_S_Z6, GGML_Z6_IQ3S_LUT=1)
+// The conversions live in ggml-z6-iq3s.h so that tests/test-z6-iq3s-lut.cpp checks the same code.
+#include "ggml-z6-iq3s.h"
+
+bool iq3s_z6_prepare(void) { return z6_iq3s_prepare(); }
+
+bool iq3s_z6_from_iq3s(const block_iq3_s * restrict x, block_iq3_s_z6 * restrict y, int64_t nb) {
+    return z6_iq3s_from_iq3s(x, y, nb);
+}
+
+bool iq3s_z6_to_iq3s(const block_iq3_s_z6 * restrict x, block_iq3_s * restrict y, int64_t nb) {
+    return z6_iq3s_to_iq3s(x, y, nb);
+}
+
+void dequantize_row_iq3_s_z6(const block_iq3_s_z6 * restrict x, float * restrict y, int64_t k) {
+    assert(k % QK_K == 0);
+    z6_iq3s_dequantize_row(x, y, k);
+}
+
 // ====================== 1.5625 bpw (de)-quantization
 
 void dequantize_row_iq1_s(const block_iq1_s * restrict x, float * restrict y, int64_t k) {
@@ -11477,6 +11496,41 @@ void ggml_vec_dot_iq3_s_q8_K (int n, float * restrict s, size_t bs, const void *
 #endif
 }
 
+// Z6: generic fallback for GGML_TYPE_IQ3_S_Z6; the matrix products go through iqk (DequantizerIQ3SLut).
+// Integer sums per group of 32 as in the generic branch of ggml_vec_dot_iq3_s_q8_K.
+void ggml_vec_dot_iq3_s_z6_q8_K(int n, float * restrict s, size_t bs, const void * restrict vx, size_t bx, const void * restrict vy, size_t by, int nrc) {
+    assert(n % QK_K == 0);
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    const block_iq3_s_z6 * restrict x = vx;
+    const block_q8_K     * restrict y = vy;
+
+    const int nb = n / QK_K;
+
+    float sumf = 0.f;
+    for (int i = 0; i < nb; ++i) {
+        const float d = GGML_FP16_TO_FP32(x[i].d) * y[i].d;
+        const int8_t * restrict q8 = y[i].qs;
+        int32_t bsum = 0;
+        for (int ib32 = 0; ib32 < QK_K/32; ++ib32) {
+            const int32_t ls = 2*((x[i].scales[ib32/2] >> 4*(ib32%2)) & 0xf) + 1;
+            int32_t sumi = 0;
+            for (int j = 0; j < 32; ++j) {
+                const unsigned nibble = z6_iq3s_nibble(x + i, 32*ib32 + j);
+                sumi += (int32_t)(2*(nibble & 7) + 1) * q8[j] * (nibble & 8 ? -1 : 1);
+            }
+            q8 += 32;
+            bsum += sumi * ls;
+        }
+        sumf += d * bsum;
+    }
+    *s = sumf;
+}
+
 
 #if defined(__AVX__)
 static inline __m128i mul_add_epi8_sse(const __m128i x, const __m128i y) {
@@ -15896,6 +15950,10 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
         case GGML_TYPE_IQ3_S:
             {
                 VALIDATE_ROW_DATA_D_F16_IMPL(block_iq3_s, data, nb);
+            } break;
+        case GGML_TYPE_IQ3_S_Z6:
+            {
+                VALIDATE_ROW_DATA_D_F16_IMPL(block_iq3_s_z6, data, nb);
             } break;
         case GGML_TYPE_IQ4_XS:
             {

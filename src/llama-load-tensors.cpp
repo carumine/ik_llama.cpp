@@ -521,12 +521,32 @@ ggml_context * create_tensors_helper::get_context_for_tensor(ggml_context * ctx,
     return ctx;
 }
 
+// "blk.N.xxx" -> N; -1 for tensors outside the layers (never selected by a non-empty GGML_Z6_IQ3S_LUT_LIVELLI)
+static int z6_layer_of(const std::string & name) {
+    int il = -1;
+    return sscanf(name.c_str(), "blk.%d.", &il) == 1 ? il : -1;
+}
+
 ggml_tensor * create_tensors_helper::create_tensor(ggml_context * ctx, const std::string & name, const std::vector<int64_t> & ne,
         int flags, ggml_context ** actual_context) {
     bool split_requested = ctx == split_ctx;
     ctx = get_context_for_tensor(ctx, name);
     if (actual_context) *actual_context = ctx;
     auto tensor = ml.create_tensor(ctx, name, ne, flags);
+    // Z6 (GGML_Z6_IQ3S_LUT=1): the IQ3_S experts that stay in RAM switch to the reordered type GGML_TYPE_IQ3_S_Z6
+    // here, before allocation, so that buffer size, strides and the NUMA row split are those of the 134-byte block.
+    // The loader converts while it reads (llama_model_loader::load_all_data). Only for owned host copies (--no-mmap):
+    // a mapping aliases the bytes of the file.
+    if (tensor && tensor->type == GGML_TYPE_IQ3_S && tensor->ne[2] > 1 && !ml.use_mmap &&
+            !(flags & llama_model_loader::TENSOR_DUPLICATED) && name.find("_exps.weight") != std::string::npos &&
+            ggml_z6_iq3s_lut_requested() && ggml_z6_iq3s_lut_layer(z6_layer_of(name))) {
+        bool host = false;
+        const size_t before = ggml_nbytes(tensor);
+        if (host && ggml_z6_iq3s_lut_retype(tensor)) {
+            LLAMA_LOG_INFO("z6 iq3s lut: %s in RAM as %s, %.2f -> %.2f MiB\n", name.c_str(), ggml_type_name(tensor->type),
+                    before/1024./1024., ggml_nbytes(tensor)/1024./1024.);
+        }
+    }
     if (tensor && ctx == split_ctx) {
         split_tensors.insert(tensor);
     } else if (tensor && split_requested) {

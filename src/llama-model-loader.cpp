@@ -1678,6 +1678,8 @@ bool llama_model_loader::load_all_data(
     // Tensors are loaded in a threadpool. A lot of the ops are serialized
     // and this is the mutex we use.
     std::mutex load_mutex;
+    std::atomic<size_t> z6_lut_blocks{0};   // GGML_Z6_IQ3S_LUT: IQ3_S blocks reordered by this call
+    const int64_t z6_lut_t0 = ggml_time_us();
 
 #ifdef GGML_USE_CUDA
     auto z6_bind_owned = [](ggml_tensor * tensor) {
@@ -1834,6 +1836,33 @@ bool llama_model_loader::load_all_data(
 
         // host. Parallel.
         if (ggml_backend_buffer_is_host(cur->buffer)) {
+            // Z6 (GGML_Z6_IQ3S_LUT=1): the file holds IQ3_S and the tensor was created with the reordered type
+            // (create_tensors_helper::create_tensor). Read and convert in pieces through the worker's buffer: the
+            // weights never exist twice in RAM. Progress counts the bytes of the file, as for every other tensor.
+            if (cur->type == GGML_TYPE_IQ3_S_Z6 && weight->tensor->type == GGML_TYPE_IQ3_S) {
+                const size_t in_block  = ggml_type_size(GGML_TYPE_IQ3_S);
+                const size_t out_block = ggml_type_size(GGML_TYPE_IQ3_S_Z6);
+                const size_t n_file    = ggml_nbytes(weight->tensor);
+                const size_t n_blocks  = n_file/in_block;
+                if (n_file % in_block != 0 || n_blocks*out_block != n_size) {
+                    throw std::runtime_error(format("tensor '%s': unexpected size for the IQ3_S reordering", ggml_get_name(cur)));
+                }
+                constexpr size_t piece = 32768;   // blocks per piece: 3.4 MiB read, 4.2 MiB written
+                auto & read_buf = read_bufs[thread_idx];
+                read_buf.resize(piece*in_block);
+                for (size_t done = 0; done < n_blocks; done += piece) {
+                    const size_t n = std::min(piece, n_blocks - done);
+                    file->read_raw(read_buf.data(), n*in_block);
+                    if (check_tensors && !ggml_validate_row_data(GGML_TYPE_IQ3_S, read_buf.data(), n*in_block)) {
+                        throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));
+                    }
+                    if (!ggml_z6_iq3s_lut_from_iq3s(read_buf.data(), (uint8_t *) cur->data + done*out_block, (int64_t) n)) {
+                        throw std::runtime_error(format("tensor '%s': IQ3_S block that cannot be reordered", ggml_get_name(cur)));
+                    }
+                }
+                z6_lut_blocks.fetch_add(n_blocks, std::memory_order_relaxed);
+                return n_file;
+            }
             file->seek(weight->offs, SEEK_SET);
             file->read_raw(cur->data, n_size);
             if (check_tensors) {
@@ -1985,6 +2014,12 @@ bool llama_model_loader::load_all_data(
     size_done = loaded.load();
     if (first_exception) {
         std::rethrow_exception(first_exception);
+    }
+    if (z6_lut_blocks.load() > 0) {
+        const double blocks = (double) z6_lut_blocks.load();
+        LLAMA_LOG_INFO("z6 iq3s lut: %.0f blocks reordered while loading, %.2f GiB of IQ3_S now %.2f GiB in RAM; buffer loaded in %.1f s, file reads included\n",
+                blocks, blocks*ggml_type_size(GGML_TYPE_IQ3_S)/1073741824., blocks*ggml_type_size(GGML_TYPE_IQ3_S_Z6)/1073741824.,
+                (ggml_time_us() - z6_lut_t0)/1e6);
     }
     if (cancelled.load()) {
         return false;

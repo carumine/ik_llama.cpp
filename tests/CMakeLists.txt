@@ -24,6 +24,15 @@ target_link_libraries(test-z6-glm-pair PRIVATE common)
 # logica della cache dei pool DSA di GLM (GGML_Z6_DSA_POOL_CACHE): solo CPU, senza modello
 add_executable(test-z6-kpool test-z6-kpool.cpp)
 target_include_directories(test-z6-kpool PRIVATE ../src)
+# riordino IQ3_S a 4 bit (GGML_Z6_IQ3S_LUT): kernel a 1-8 colonne, conversione Q8 e inverso, bit per bit; solo CPU.
+# Include i sorgenti dei kernel: stessi flag di architettura della libreria.
+add_executable(test-z6-iq3s-lut test-z6-iq3s-lut.cpp)
+target_include_directories(test-z6-iq3s-lut PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src ${PROJECT_SOURCE_DIR}/ggml/include)
+target_compile_definitions(test-z6-iq3s-lut PRIVATE GGML_USE_IQK_MULMAT)
+if (GGML_NATIVE AND NOT MSVC)
+    target_compile_options(test-z6-iq3s-lut PRIVATE -march=native)
+endif()
+target_link_libraries(test-z6-iq3s-lut PRIVATE ggml Threads::Threads)
 if (GGML_CUDA)
     add_executable(test-z6-parallelo test-z6-parallelo.cpp)
     target_link_libraries(test-z6-parallelo PRIVATE common)
