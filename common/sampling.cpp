@@ -5,6 +5,8 @@
 #include "speculative.h"
 #include "reasoning-budget.cpp"
 
+#include <algorithm>
+#include <functional>
 #include <limits>
 #include <random>
 #include <unordered_map>
@@ -508,6 +510,176 @@ static bool grammar_should_apply(struct common_sampler * gsmpl) {
     return true;
 }
 
+// Z6: IK_Z6_CAMPIONA_VELOCE=1 skips the n_vocab-sized candidate array when the result cannot depend on it:
+// no grammar, no CFG, no forced reasoning-budget token, no mirostat/adaptive-p, and either greedy (temp == 0)
+// or a sampler chain whose first set-changing step is TOP_K (only no-op DRY/ADAPTIVE_P entries before it).
+// Same arithmetic as llama_sampling_prepare_impl: logit_bias and expiring biases in place on the logits,
+// server_biases added per token, repetition penalties (and the newline restore) applied to the penalized ids
+// only. Greedy returns the first maximum like std::max_element. Top-k keeps every token >= the k-th value
+// (ties included) in id order and then runs the unchanged sampler_queue on that set. Known difference: with
+// exact logit ties inside the top k the order handed to partial_sort differs, and with temp == 0 the
+// candidate list kept for post-sampling probabilities holds only the chosen token.
+//
+// IK_Z6_CAMPIONA_VELOCE=2: also with a grammar (the lazy grammar of tool calls is always set in agentic use, so
+// level 1 never fires there). The grammar-free draw is the same one the normal path makes first; the sampled token
+// then gets the same single-token grammar check. A rejected token restores the logits and resamples grammar-first
+// through the normal path, like llama_sampling_sample_impl does: same tokens, same number of rng draws.
+// IK_Z6_CAMPIONA_CONTA=1 prints every 5000 samples how many took the fast path and why the others did not.
+static int z6_campiona_veloce_livello() {
+    static const int v = [] { const char * e = getenv("IK_Z6_CAMPIONA_VELOCE"); return e ? atoi(e) : 0; }();
+    return v;
+}
+static bool z6_campiona_veloce_attivo() {
+    return z6_campiona_veloce_livello() > 0;
+}
+static void z6_campiona_conta(int quale) {  // 0 fast, 1 grammar, 2 other reason, 3 grammar rejected the fast token
+    static const bool attivo = [] { const char * e = getenv("IK_Z6_CAMPIONA_CONTA"); return e && atoi(e) > 0; }();
+    if (!attivo) return;
+    static long long n[4] = {0, 0, 0, 0};
+    n[quale]++;
+    if ((n[0] + n[1] + n[2]) % 5000 == 0) {
+        fprintf(stderr, "z6 campiona: veloci %lld, lenti per grammatica %lld, lenti per altro %lld, veloci rifiutati dalla grammatica %lld\n",
+                n[0], n[1], n[2], n[3]);
+    }
+}
+
+static llama_token llama_sampling_sample_impl(struct common_sampler * ctx_sampling, struct llama_context * ctx_main,
+        struct llama_context * ctx_cfg, const int idx, bool grammar_first);
+
+static bool z6_campiona_veloce(common_sampler * ctx_sampling, llama_context * ctx_main, llama_context * ctx_cfg,
+                               const int idx, bool grammar_first, llama_token & out) {
+    const common_params_sampling & params = ctx_sampling->params;
+    if (ctx_cfg || params.mirostat != 0) { z6_campiona_conta(2); return false; }
+    // the grammar constrains this sample: only the post-check of level 2 can keep the fast path, never a grammar-first call
+    const bool z6_gr = ctx_sampling->grammar != NULL && (z6_campiona_veloce_livello() < 2 || grammar_should_apply(ctx_sampling));
+    if (z6_gr && (z6_campiona_veloce_livello() < 2 || grammar_first)) { z6_campiona_conta(1); return false; }
+    if (ctx_sampling->rbudget && common_reasoning_budget_get_state(ctx_sampling->rbudget) == REASONING_BUDGET_FORCING) { z6_campiona_conta(2); return false; }
+    const float temp = params.temp;
+    if (temp < 0.0f) { z6_campiona_conta(2); return false; }
+    const int n_vocab = llama_n_vocab(llama_get_model(ctx_main));
+    int k_eff = 0;
+    if (temp > 0.0f) {
+        if (ctx_sampling->adapt_p_ctx) { z6_campiona_conta(2); return false; }
+        const bool dry_noop = params.dry_multiplier == 0.0f || params.dry_base < 1.0f || params.dry_penalty_last_n == 0;
+        bool top_k_first = false;
+        for (auto s : params.samplers_sequence) {
+            if (s == llama_sampler_type::TOP_K) { top_k_first = true; break; }
+            if (s == llama_sampler_type::ADAPTIVE_P || (s == llama_sampler_type::DRY && dry_noop)) continue;
+            break;
+        }
+        if (!top_k_first || params.top_k <= 0) { z6_campiona_conta(2); return false; }
+        k_eff = std::max(params.top_k, std::max(1, params.min_keep));
+        if (k_eff > 1024 || k_eff >= n_vocab) { z6_campiona_conta(2); return false; }
+    }
+
+    float * logits = llama_get_logits_ith(ctx_main, idx);
+    // with a grammar the biases below change the logits in place: keep a copy for the resample, as the normal path does
+    static thread_local std::vector<float> z6_originali;
+    const bool z6_copia = z6_gr && (!params.logit_bias.empty() || ctx_sampling->elb_states.size() > ctx_sampling->elb_idx);
+    if (z6_copia) z6_originali.assign(logits, logits + n_vocab);
+    // the single-token check of llama_sampling_sample_impl; false = the caller must return the grammar-first resample
+    auto z6_accetta = [&](llama_token id) {
+        z6_campiona_conta(0);
+        if (!z6_gr) return true;
+        llama_token_data uno = {id, logits[id], 0.0f};
+        llama_token_data_array uno_a = { &uno, 1, false };
+        llama_grammar_apply(ctx_sampling->grammar, ctx_main, &uno_a);
+        if (uno_a.data[0].logit != -INFINITY) {
+            ctx_sampling->n_valid = temp == 0.0f ? 0 : ctx_sampling->cur_p.size;  // as at the end of the normal path
+            return true;
+        }
+        z6_campiona_conta(3);
+        if (z6_copia) std::copy(z6_originali.begin(), z6_originali.end(), logits);
+        out = llama_sampling_sample_impl(ctx_sampling, ctx_main, ctx_cfg, idx, /* is_resampling= */ true);
+        return false;
+    };
+    for (auto it = params.logit_bias.begin(); it != params.logit_bias.end(); it++) {
+        logits[it->first] += it->second;
+    }
+    if (ctx_sampling->elb_states.size() > ctx_sampling->elb_idx) {
+        common_expiring_logit_bias_apply(ctx_sampling, logits);
+    }
+    const float * sb = (ctx_sampling->server_biases != nullptr && ctx_sampling->server_biases->size() == (size_t)n_vocab)
+                     ? ctx_sampling->server_biases->data() : nullptr;
+
+    // penalized ids with their final values, sorted by id
+    std::vector<llama_token_data> & over = ctx_sampling->z6_sovrascritti;
+    over.clear();
+    const int32_t penalty_last_n = params.penalty_last_n < 0 ? params.n_prev : params.penalty_last_n;
+    const auto & penalty_tokens = params.use_penalty_prompt_tokens ? params.penalty_prompt_tokens : ctx_sampling->prev;
+    const int used = std::min((int)penalty_tokens.size(), penalty_last_n);
+    if (used > 0) {
+        const llama_token * last = penalty_tokens.data() + penalty_tokens.size() - used;
+        for (int i = 0; i < used; ++i) {
+            const llama_token t = last[i];
+            if (t >= 0 && t < n_vocab) over.push_back({t, sb ? logits[t] + sb[t] : logits[t], 0.0f});
+        }
+        std::sort(over.begin(), over.end(), [](const llama_token_data & a, const llama_token_data & b) { return a.id < b.id; });
+        over.erase(std::unique(over.begin(), over.end(), [](const llama_token_data & a, const llama_token_data & b) { return a.id == b.id; }), over.end());
+        llama_token_data_array small = { over.data(), over.size(), false };
+        llama_sample_repetition_penalties(ctx_main, &small, last, used, params.penalty_repeat, params.penalty_freq, params.penalty_present);
+        const llama_token nl_token = llama_token_nl(llama_get_model(ctx_main));
+        if (!params.penalize_nl && nl_token != LLAMA_TOKEN_NULL && nl_token >= 0 && nl_token < n_vocab) {
+            auto it = std::lower_bound(over.begin(), over.end(), nl_token, [](const llama_token_data & a, llama_token b) { return a.id < b; });
+            if (it != over.end() && it->id == nl_token) it->logit = logits[nl_token];
+            else over.insert(it, {nl_token, logits[nl_token], 0.0f});
+        }
+    }
+
+    auto & cur = ctx_sampling->cur;
+    if (temp == 0.0f) {
+        llama_token best = -1; float best_v = 0.0f;
+        size_t j = 0;
+        int i = 0;
+        while (i < n_vocab) {
+            const int stop = j < over.size() ? over[j].id : n_vocab;
+            if (sb) { for (; i < stop; ++i) { const float v = logits[i] + sb[i]; if (best < 0 || v > best_v) { best = i; best_v = v; } } }
+            else    { for (; i < stop; ++i) { const float v = logits[i];         if (best < 0 || v > best_v) { best = i; best_v = v; } } }
+            if (i < n_vocab) { const float v = over[j].logit; if (best < 0 || v > best_v) { best = i; best_v = v; } ++i; ++j; }
+        }
+        cur.resize(1);
+        cur[0] = llama_token_data{best, best_v, 0.0f};
+        ctx_sampling->cur_p = { cur.data(), 1, false };
+        out = best;
+        z6_accetta(best);
+        return true;
+    }
+
+    // top-k: min-heap of the k largest values; buffer every value >= the heap minimum at visit time
+    std::vector<float> & heap = ctx_sampling->z6_mucchio;
+    heap.clear();
+    cur.clear();
+    auto visit = [&](int t, float v) {
+        if ((int)heap.size() < k_eff) {
+            heap.push_back(v); std::push_heap(heap.begin(), heap.end(), std::greater<float>());
+            cur.push_back({t, v, 0.0f});
+        } else if (v >= heap.front()) {
+            if (v > heap.front()) {
+                std::pop_heap(heap.begin(), heap.end(), std::greater<float>());
+                heap.back() = v; std::push_heap(heap.begin(), heap.end(), std::greater<float>());
+            }
+            cur.push_back({t, v, 0.0f});
+        }
+    };
+    size_t j = 0;
+    int i = 0;
+    while (i < n_vocab) {
+        const int stop = j < over.size() ? over[j].id : n_vocab;
+        if (sb) { for (; i < stop; ++i) visit(i, logits[i] + sb[i]); }
+        else    { for (; i < stop; ++i) visit(i, logits[i]); }
+        if (i < n_vocab) { visit(i, over[j].logit); ++i; ++j; }
+    }
+    const float thr = heap.front();
+    cur.erase(std::remove_if(cur.begin(), cur.end(), [thr](const llama_token_data & d) { return !(d.logit >= thr); }), cur.end());
+    ctx_sampling->cur_p = { cur.data(), cur.size(), false };
+    llama_token_data_array & cur_p = ctx_sampling->cur_p;
+    sampler_queue(ctx_main, params, ctx_sampling, cur_p, std::max(1, params.min_keep));
+    out = llama_sample_token_with_rng(ctx_main, &cur_p, ctx_sampling->rng);
+    ctx_sampling->z6_estrazioni++;
+    z6_accetta(out);
+    return true;
+}
+
 static llama_token llama_sampling_sample_impl(
                   struct common_sampler * ctx_sampling,
                   struct llama_context * ctx_main,
@@ -521,6 +693,11 @@ static llama_token llama_sampling_sample_impl(
     const float   mirostat_tau    = params.mirostat_tau;
     const float   mirostat_eta    = params.mirostat_eta;
     const float   adaptive_target = params.adaptive_target;
+
+    if (z6_campiona_veloce_attivo()) {
+        llama_token z6_id;
+        if (z6_campiona_veloce(ctx_sampling, ctx_main, ctx_cfg, idx, grammar_first, z6_id)) return z6_id;
+    }
 
     std::vector<float> original_logits;
     llama_sampling_prepare(ctx_sampling, ctx_main, ctx_cfg, idx, /* grammar_first= */ grammar_first, &original_logits);

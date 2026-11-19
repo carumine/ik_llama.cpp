@@ -770,9 +770,23 @@ struct common_speculative_state_ngram_mod : public common_speculative_state {
     // enable trace logging if LLAMA_TRACE is set
     const bool verbose;
 
+    // Z6: IK_Z6_BOZZE_ADATTIVE=<start> (0 = off) caps the draft at n_cur: a fully accepted draft doubles n_cur
+    // up to n_max, an acceptance fraction below 0.5 halves it down to max(1, n_min). Drafts are verified, so the
+    // generated text does not change; only how many tokens each verification step proposes.
+    // IK_Z6_BOZZE_TRACCIA=1 logs every accept with the drafted length and the new cap.
+    const int z6_start;
+    const bool z6_traccia;
+    int z6_n_cur = 0;
+    int z6_n_max = 0;
+    int z6_n_min = 0;
+
+    static int z6_env_int(const char * name) { const char * e = std::getenv(name); return e ? std::atoi(e) : 0; }
+
     common_speculative_state_ngram_mod(enum common_speculative_type type, common_ngram_mod & mod)
-        : common_speculative_state(type), mod(mod), verbose(std::getenv("LLAMA_TRACE") != nullptr) {
+        : common_speculative_state(type), mod(mod), verbose(std::getenv("LLAMA_TRACE") != nullptr),
+          z6_start(std::max(0, z6_env_int("IK_Z6_BOZZE_ADATTIVE"))), z6_traccia(z6_env_int("IK_Z6_BOZZE_TRACCIA") > 0) {
         static_assert(sizeof(llama_token) == sizeof(common_ngram_mod::entry_t));
+        z6_n_cur = z6_start;
     }
 
     void begin(const llama_tokens & prompt) override {
@@ -780,6 +794,7 @@ struct common_speculative_state_ngram_mod : public common_speculative_state {
 
         n_draft_last = 0;
         n_low = 0;
+        z6_n_cur = z6_start;
 
         const size_t n = mod.get_n();
 
@@ -829,13 +844,21 @@ struct common_speculative_state_ngram_mod : public common_speculative_state {
             i_last = cur_len - n;
         }
 
-        result.resize(n + params.n_max);
+        int n_max = params.n_max;
+        if (z6_start > 0) {
+            z6_n_max = params.n_max;
+            z6_n_min = std::max(1, params.n_min);
+            z6_n_cur = std::min(std::max(z6_n_cur, z6_n_min), z6_n_max);
+            n_max = z6_n_cur;
+        }
+
+        result.resize(n + n_max);
         for (size_t i = 0; i < n - 1; ++i) {
             result[i] = prompt_tgt[cur_len - n + 1 + i];
         }
         result[n - 1] = id_last;
 
-        for (int i = 0; i < params.n_max; ++i) {
+        for (int i = 0; i < n_max; ++i) {
             const llama_token token = mod.get(result.data() + i);
             if (token == common_ngram_mod::EMPTY) {
                 if (i < params.n_min) {
@@ -862,6 +885,20 @@ struct common_speculative_state_ngram_mod : public common_speculative_state {
     void accept(uint16_t n_accepted) override {
         if (verbose) {
             LOG_INF("%s: accepted %d tokens from %zu drafted tokens\n", __func__, n_accepted, n_draft_last);
+        }
+
+        if (z6_start > 0 && n_draft_last > 0) {
+            const int prima = z6_n_cur;
+            if (n_accepted >= n_draft_last) {
+                z6_n_cur = std::min(2*z6_n_cur, z6_n_max);
+            } else if (2*(size_t)n_accepted < n_draft_last) {
+                z6_n_cur = std::max(z6_n_cur/2, z6_n_min);
+            }
+            if (z6_traccia) {
+                LOG_INF("z6 bozze: proposti %zu accettati %d tetto %d -> %d\n", n_draft_last, (int)n_accepted, prima, z6_n_cur);
+            }
+        } else if (z6_traccia && n_draft_last > 0) {
+            LOG_INF("z6 bozze: proposti %zu accettati %d\n", n_draft_last, (int)n_accepted);
         }
 
         // compute acceptance fraction if we have a recorded draft length
@@ -2683,6 +2720,25 @@ void common_speculative_checkpoint_discard(
     llama_spec_ckpt_discard(ctx, spec_ckpt);
 }
 
+// Z6 (GGML_Z6_TEMPI=1): split of the commit of a speculative step into restore and MTP update (B8). Only timer reads
+// on the server thread; read by the server through common_speculative_z6_tempi.
+static bool z6_spec_tempi_attivi() {
+    static const bool v = [] { const char * e = std::getenv("GGML_Z6_TEMPI"); return e && std::atoi(e) > 0; }();
+    return v;
+}
+static int64_t z6_spec_ripristino_us = 0, z6_spec_mtp_us = 0, z6_spec_ripristini = 0;
+struct z6_spec_cronometro {
+    int64_t * somma;
+    int64_t t0;
+    explicit z6_spec_cronometro(int64_t * s) : somma(z6_spec_tempi_attivi() ? s : nullptr), t0(somma ? ggml_time_us() : 0) {}
+    ~z6_spec_cronometro() { if (somma) *somma += ggml_time_us() - t0; }
+};
+void common_speculative_z6_tempi(int64_t * ripristino_us, int64_t * mtp_us, int64_t * ripristini) {
+    if (ripristino_us) *ripristino_us = z6_spec_ripristino_us;
+    if (mtp_us) *mtp_us = z6_spec_mtp_us;
+    if (ripristini) *ripristini = z6_spec_ripristini;
+}
+
 bool common_speculative_checkpoint_restore(
         common_speculative_checkpoint & ckpt,
         common_speculative * spec,
@@ -2710,8 +2766,13 @@ bool common_speculative_checkpoint_restore(
     const bool z6_keep_sampler = z6_keep_sampler_on && common_speculative_type_is_self_spec(spec_type_used);
 
     const int step = (int) ids.size() - 1;
-    const enum llama_spec_ckpt_restore_result restore_result = llama_spec_ckpt_restore_ex(
+    if (z6_spec_tempi_attivi()) ++z6_spec_ripristini;
+    enum llama_spec_ckpt_restore_result restore_result;
+    {
+        z6_spec_cronometro z6_c(&z6_spec_ripristino_us);
+        restore_result = llama_spec_ckpt_restore_ex(
             ctx, spec_ckpt, seq_id, ckpt.n_past, ckpt.mode == LLAMA_SPEC_CKPT_PER_STEP ? step : 0);
+    }
     if (restore_result == LLAMA_SPEC_CKPT_RESTORE_FAILED) {
         LOG_ERR("%s: seq_id=%d speculative checkpoint restore failed\n", __func__, (int) seq_id);
         common_speculative_checkpoint_discard(ckpt, ctx);
@@ -3471,7 +3532,11 @@ std::vector<llama_token> mtp_speculative_gen_draft(
 
         llama_token id_next = common_sampler_sample_speculative(smpl, ctx, 0, prob_ptr);
 
-        if (i > 0 && prob_ptr && prob < p_min) {
+        // Z6 (IK_Z6_MTP_PMIN_PRIMO=1): p_min cuts the first draft token too. As it is, the first token is always
+        // proposed, so with n_max=1 p_min does nothing and every step pays the verification of two tokens, also
+        // when the head gives its own token a low probability. An empty draft is a plain one-token step.
+        static const bool z6_pmin_primo = [] { const char * e = getenv("IK_Z6_MTP_PMIN_PRIMO"); return e && atoi(e) > 0; }();
+        if ((i > 0 || z6_pmin_primo) && prob_ptr && prob < p_min) {
             break;
         }
 
