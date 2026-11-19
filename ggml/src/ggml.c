@@ -3315,6 +3315,7 @@ struct ggml_compute_state_shared {
     int z6_locale; // Z6: thread i in [0, n/2) sul nodo 0, gli altri sul nodo 1 (vedi z6_locale_valido)
     // Z6: barriera gerarchica per socket (GGML_Z6_BARRIERA_SOCKET), contatori su linee di cache distinte
     struct { atomic_int v; char pad[CACHE_LINE_SIZE - sizeof(atomic_int)]; } z6_bar_sock[2], z6_bar_glob, z6_bar_gen;
+    int z6_pool; // Z6 (GGML_Z6_POOL): il grafo gira nella squadra OpenMP tenuta aperta dal pool, vedi ggml_z6_pool_run
 };
 
 struct ggml_compute_state {
@@ -5219,6 +5220,20 @@ static inline void ggml_barrier_impl(struct ggml_compute_state_shared * shared) 
     }
 }
 
+// Z6 (GGML_Z6_POOL=1, 19/11/2026, sciame dei motori S5, progetto di Fable 30 §2): la squadra OpenMP resta aperta per
+// tutto un decode (ggml_z6_pool_run). Il thread 0 esegue lo scheduler; gli altri girano su un'epoca e a ogni pezzo CPU
+// eseguono ggml_graph_compute_thread col loro ith. Toglie l'apertura e la chiusura della regione a ogni grafo CPU
+// (12 us x 51 pezzi a token, misurati). Stessi thread, stessi core, stessi ith: i numeri non cambiano.
+#define Z6_POOL_MAX 128
+typedef struct { atomic_int v; char pad[CACHE_LINE_SIZE - sizeof(atomic_int)]; } z6_pool_riga;
+static struct {
+    z6_pool_riga epoca, fine;
+    z6_pool_riga fatto[Z6_POOL_MAX];
+    struct ggml_compute_state_shared * _Atomic shared;
+    int n;
+} z6_pool;
+static __thread int z6_pool_capo = 0;   // 1 nel thread 0 mentre esegue il corpo dentro la regione
+
 #ifdef GGML_USE_OPENMP
 // Z6 (GGML_Z6_BARRIERA_SOCKET=1, solo nel percorso locale: thread [0, n/2) sul nodo 0): ogni socket conta i suoi
 // thread su una linea di cache propria e solo l'ultimo di ciascuno tocca il contatore comune, che attraversa
@@ -5260,6 +5275,11 @@ static void ggml_barrier(struct ggml_compute_state_shared * shared) {
         return;
     }
     if (shared && shared->n_batch > 32) {
+        ggml_barrier_impl(shared);
+        return;
+    }
+    // Z6 (GGML_Z6_POOL): con meno thread della squadra gli altri non arrivano alla barriera di OpenMP
+    if (shared->z6_pool && shared->n_threads != z6_pool.n) {
         ggml_barrier_impl(shared);
         return;
     }
@@ -31870,6 +31890,8 @@ static void z6_t0_rilascia(void) {
 }
 
 // pin worker `thread_n` to its assigned logical CPU (no-op without affinity)
+static __thread int z6_cpu_legata = -1;   // Z6: CPU a cui questo thread è già legato (-1: nessuna)
+
 static void set_cpu_thread_affinity(const struct ggml_cplan * cplan, int thread_n) {
     if (cplan == NULL || cplan->cpu_affinity == NULL || cplan->n_cpu_affinity <= 0) {
         return;
@@ -31895,6 +31917,13 @@ static void set_cpu_thread_affinity(const struct ggml_cplan * cplan, int thread_
 
     // Z6 (GGML_Z6_NUMA_AFFINITY): i thread del pool OpenMP restano gli stessi fra le chiamate e
     // nessuno cambia la loro maschera, quindi basta legarli una volta (circa 27 µs per chiamata a
+    // 40 thread). Il thread 0 è il chiamante, che ggml_graph_compute riporta alla maschera iniziale;
+    // dentro il pool (GGML_Z6_POOL) resta legato per tutta la regione e ggml_z6_pool_run lo riporta alla fine.
+    const bool z6_tiene = thread_n != 0 || z6_pool_capo;
+    if (z6_options.affinity && z6_tiene && z6_cpu_legata == cpu) {
+        return;
+    }
+
     // Z6 (GGML_Z6_AFFINITA_STABILE): inside a hold the caller is already on this CPU since the previous graph.
     // Requires GGML_Z6_NUMA_AFFINITY, which skips set_numa_thread_affinity for explicit CPU lists: otherwise
     // worker 0 would have just been widened to the NUMA mask and must be pinned again.
@@ -31907,6 +31936,7 @@ static void set_cpu_thread_affinity(const struct ggml_cplan * cplan, int thread_
     cpu_set_t mask;
     CPU_ZERO(&mask);
     CPU_SET(cpu, &mask);
+    z6_cpu_legata = z6_tiene ? cpu : -1;
 
     const int rv = pthread_setaffinity_np(pthread_self(), sizeof(mask), &mask);
     if (rv) {
@@ -32727,6 +32757,69 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     return 0;
 }
 
+bool ggml_z6_pool_requested(void) {
+    static int v = -1;
+    if (v < 0) { const char * e = getenv("GGML_Z6_POOL"); v = e && atoi(e) > 0; }
+    return v;
+}
+
+void ggml_z6_pool_run(int n, const int32_t * cpu_affinity, int32_t n_cpu_affinity, void (*corpo)(void *), void * ud) {
+    z6_options_init();
+#if defined(GGML_USE_OPENMP) && defined(__gnu_linux__)
+    if (!ggml_z6_pool_requested() || !z6_options.barrier || !z6_options.affinity || cpu_affinity == NULL ||
+            n_cpu_affinity <= 0 || n < 2 || n > Z6_POOL_MAX || z6_pool_capo || omp_in_parallel() || omp_get_dynamic() ||
+            n > omp_get_thread_limit()) {
+        corpo(ud);
+        return;
+    }
+    z6_pool.n = n;
+    atomic_store_explicit(&z6_pool.epoca.v, 0, memory_order_relaxed);
+    atomic_store_explicit(&z6_pool.fine.v, 0, memory_order_relaxed);
+    for (int i = 0; i < n; ++i) atomic_store_explicit(&z6_pool.fatto[i].v, 0, memory_order_relaxed);
+    atomic_store_explicit(&z6_pool.shared, NULL, memory_order_relaxed);
+    cpu_set_t salvata;
+    const bool ripristina = pthread_getaffinity_np(pthread_self(), sizeof(salvata), &salvata) == 0;
+    int squadra_ok = 1;
+    #pragma omp parallel num_threads(n)
+    {
+        const int ith = omp_get_thread_num();
+        if (omp_get_num_threads() != n) {
+            if (ith == 0) squadra_ok = 0;
+        } else if (ith == 0) {
+            z6_pool_capo = 1;
+            corpo(ud);
+            z6_pool_capo = 0;
+            atomic_store_explicit(&z6_pool.fine.v, 1, memory_order_release);
+        } else {
+            int vista = 0;
+            for (;;) {
+                int e;
+                while ((e = atomic_load_explicit(&z6_pool.epoca.v, memory_order_acquire)) == vista) {
+                    if (atomic_load_explicit(&z6_pool.fine.v, memory_order_acquire)) goto z6_pool_esci;
+#if defined(__SSE3__)
+                    _mm_pause();
+#endif
+                }
+                vista = e;
+                struct ggml_compute_state_shared * sh = atomic_load_explicit(&z6_pool.shared, memory_order_relaxed);
+                if (ith < sh->n_threads) {
+                    struct ggml_compute_state w = { .thrd = 0, .ith = ith, .shared = sh };
+                    ggml_graph_compute_thread(&w);
+                }
+                atomic_store_explicit(&z6_pool.fatto[ith].v, e, memory_order_release);
+            }
+z6_pool_esci: ;
+        }
+    }
+    z6_cpu_legata = -1;
+    if (ripristina) pthread_setaffinity_np(pthread_self(), sizeof(salvata), &salvata);
+    if (!squadra_ok) corpo(ud);
+#else
+    GGML_UNUSED(n); GGML_UNUSED(cpu_affinity); GGML_UNUSED(n_cpu_affinity);
+    corpo(ud);
+#endif
+}
+
 enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cplan * cplan) {
     z6_options_init();
     GGML_ASSERT(cplan);
@@ -32740,17 +32833,20 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
     // explicit worker affinity; clearing NUMA affinity must not widen a Z6
     // node-0 process to both sockets between graph executions.
     cpu_set_t saved_affinity;
+    // Z6 (GGML_Z6_POOL): the head of the persistent team neither saves nor restores an affinity
+    bool z6_tieni = false;
+    bool restore_affinity = false;
+    if (!z6_pool_capo) {
     // Z6 (GGML_Z6_AFFINITA_STABILE): a graph that would not pin worker 0 through the explicit CPU list runs with
     // the launcher mask, exactly as without the variable. While the caller is still pinned by a previous graph of
     // the hold, its current mask is that single CPU: the launcher mask is the one saved by the first graph.
-    const bool z6_tieni = z6_t0_tenuta > 0 && z6_options.affinity && cplan->cpu_affinity != NULL && cplan->n_cpu_affinity > 0;
+    z6_tieni = z6_t0_tenuta > 0 && z6_options.affinity && cplan->cpu_affinity != NULL && cplan->n_cpu_affinity > 0;
     if (z6_t0_tenuta > 0) {
         atomic_fetch_add_explicit(&z6_t0_grafi, 1, memory_order_relaxed);
     }
     if (!z6_tieni) {
         z6_t0_rilascia();
     }
-    bool restore_affinity;
     if (z6_t0_cpu >= 0) {
         saved_affinity = z6_t0_salvata;
         restore_affinity = true;
@@ -32762,6 +32858,7 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
         if (z6_tieni) {
             atomic_fetch_add_explicit(&z6_t0_eseguite, 1, memory_order_relaxed);
         }
+    }
     }
 #endif
 
@@ -32784,7 +32881,25 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
     state_shared.z6_locale = z6_locale_valido(cplan, n_threads);
 
 #ifdef GGML_USE_OPENMP
-    if (n_threads > 1) {
+    if (z6_pool_capo && n_threads > 1) {
+        // Z6 (GGML_Z6_POOL): la squadra è già aperta, si pubblica il grafo invece di aprire una regione
+        if (n_threads > z6_pool.n) {
+            GGML_ABORT("z6 pool: grafo da %d thread in una squadra da %d", n_threads, z6_pool.n);
+        }
+        state_shared.z6_pool = 1;
+        atomic_store_explicit(&z6_pool.shared, &state_shared, memory_order_relaxed);
+        const int e = atomic_load_explicit(&z6_pool.epoca.v, memory_order_relaxed) + 1;
+        atomic_store_explicit(&z6_pool.epoca.v, e, memory_order_release);
+        struct ggml_compute_state worker = { .thrd = 0, .ith = 0, .shared = &state_shared };
+        ggml_graph_compute_thread(&worker);
+        for (int i = 1; i < z6_pool.n; ++i) {
+            while (atomic_load_explicit(&z6_pool.fatto[i].v, memory_order_acquire) != e) {
+#if defined(__SSE3__)
+                _mm_pause();
+#endif
+            }
+        }
+    } else if (n_threads > 1) {
 //#if IK_PRINT_TIMING
 //        int64_t tim1 = ggml_time_us();
 //#endif
@@ -32867,12 +32982,13 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
         if (rv != 0) {
             fprintf(stderr, "warning: restoring CPU affinity failed: %s\n", strerror(rv));
         }
+    } else if (!z6_pool_capo) {
         // Z6 (GGML_Z6_AFFINITA_STABILE): without a saved launcher mask nothing is kept, as before
         z6_t0_cpu = -1;
         clear_numa_thread_affinity();
     }
 #else
-    clear_numa_thread_affinity();
+    if (!z6_pool_capo) clear_numa_thread_affinity();
 #endif
 
     if (z6_inizio) {

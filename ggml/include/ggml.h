@@ -996,6 +996,10 @@ extern "C" {
     GGML_API bool ggml_z6_layer_in_list(const char * list, int il);   // "3-10,13": il in the list; NULL or empty: true
     GGML_API bool ggml_z6_iq3s_lut_layer(int il);                      // GGML_Z6_IQ3S_LUT_LIVELLI
     GGML_API bool ggml_z6_iq3s_lut_retype(struct ggml_tensor * tensor);
+    // Z6 (GGML_Z6_POOL=1): esegue corpo(ud) nel thread chiamante con la squadra OpenMP di n thread aperta per tutta la
+    // durata; i grafi CPU calcolati dentro corpo usano quella squadra invece di aprirne una a ogni chiamata.
+    GGML_API bool ggml_z6_pool_requested(void);
+    GGML_API void ggml_z6_pool_run(int n, const int32_t * cpu_affinity, int32_t n_cpu_affinity, void (*corpo)(void *), void * ud);
     GGML_API bool ggml_z6_iq3s_lut_from_iq3s(const void * src, void * dst, int64_t n_blocks);
     GGML_API bool ggml_z6_iq3s_lut_to_iq3s(const void * src, void * dst, int64_t n_blocks);
     GGML_API bool    ggml_is_numa(void); // true if init detected that system has >1 NUMA node

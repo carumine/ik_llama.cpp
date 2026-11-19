@@ -36,6 +36,7 @@ struct z6_pair_range {
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <string>
 #include <vector>
 #include <algorithm>
@@ -4435,6 +4436,21 @@ enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sch
     }
 
     z6_affinity_hold affinity_hold; // Z6 (GGML_Z6_AFFINITA_STABILE)
+    // Z6 (GGML_Z6_POOL=1): un decode intero dentro la squadra OpenMP della CPU (ggml_z6_pool_run). Solo -sm layer e
+    // batch fino a 32 token: prefill, coppie del sovrapposto e -sm graph restano sul percorso di sempre.
+    if (ggml_z6_pool_requested() && !sched->split_mode_graph && graph->n_batch <= 32) {
+        for (int i = 0; i < sched->n_backends; ++i) {
+            if (!ggml_backend_is_cpu(sched->backends[i])) continue;
+            auto * cpu = (ggml_backend_cpu_context *) sched->backends[i]->context;
+            struct z6_corpo_t { ggml_backend_sched_t sched; enum ggml_status ec; std::exception_ptr ex; } corpo{sched, GGML_STATUS_SUCCESS, nullptr};
+            ggml_z6_pool_run(cpu->n_threads, cpu->cpu_affinity, cpu->n_cpu_affinity, [](void * p) {
+                auto * c = (z6_corpo_t *) p;
+                try { c->ec = ggml_backend_sched_compute_splits(c->sched); } catch (...) { c->ex = std::current_exception(); }
+            }, &corpo);
+            if (corpo.ex) std::rethrow_exception(corpo.ex);
+            return corpo.ec;
+        }
+    }
     return ggml_backend_sched_compute_splits(sched);
 }
 
