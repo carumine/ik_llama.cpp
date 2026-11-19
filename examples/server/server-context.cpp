@@ -4343,6 +4343,11 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
                                         string_format("request (%d tokens) exceeds the available context size (%d tokens), try increasing it",
                                             slot.n_prompt_tokens, slot.n_ctx),
                                         ERROR_TYPE_EXCEED_CONTEXT_SIZE);
+                                // release() acts only on a PROCESSING slot: without these two lines the rejected
+                                // request stayed queued and was prefilled anyway, from 0 and up to n_ctx (Z6,
+                                // 14/11/2026: 337 s of GPU on a 400 answer). Same as the empty-prompt branch above.
+                                slot.state = SLOT_STATE_PROCESSING;
+                                slot.command = SLOT_COMMAND_NONE;
                                 slot.release();
                                 continue;
                             }

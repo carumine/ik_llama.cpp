@@ -607,6 +607,34 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
 
 }
 
+// Z6 (GGML_Z6_GRAFI_EPOCA=1): every memcpy and memset node of a captured CUDA graph keeps the driver object of the
+// allocation it touched at capture time, and cudaGraphLaunch dereferences it on the host. When a CUDA buffer is freed
+// and the next one lands at the same address (a compute arena regrown by less than its 2 MiB page rounding, as
+// CUDA1 732.91 -> 733.62 MiB on 14/11), every node address of the next ggml graph is unchanged,
+// is_cuda_graph_update_required() finds nothing to update and the launch walks the freed object: the segfaults in
+// libcuda.so.595.99.02 at +0x118f811/+0x118f818 (copy submission reached from cuGraphLaunch) of 14/11. Every free of
+// a CUDA device or pinned host buffer bumps this epoch, and a cached graph of an older epoch is captured and
+// instantiated again before it is launched. Same kernels in the same order: same numbers. The cost is one capture
+// per cached graph after each free (arena growth, slot release, model reload), nothing in a step without frees.
+static std::atomic<uint64_t> z6_grafi_epoca_memoria{0};
+// GGML_Z6_GRAFI_EPOCA=2 only counts the frees and names every cached instance launched after one: nothing is captured
+// again, the behaviour stays the one without the variable. It tells which piece dies when a launch fails.
+static int z6_grafi_epoca_livello() {
+    static const int v = [] { const char * e = getenv("GGML_Z6_GRAFI_EPOCA"); return e ? atoi(e) : 0; }();
+    return v;
+}
+static bool z6_grafi_epoca() {
+    return z6_grafi_epoca_livello() > 0;
+}
+static void z6_grafi_memoria_liberata(const char * dove, size_t bytes) {
+    if (!z6_grafi_epoca()) return;
+    const uint64_t n = ++z6_grafi_epoca_memoria;
+    if (n <= 20 || n % 100 == 0) {
+        GGML_CUDA_LOG_INFO("z6 grafi: epoca %llu, liberati %.2f MiB su %s, grafi CUDA catturati prima da ricatturare\n",
+                (unsigned long long) n, bytes/1048576.0, dove);
+    }
+}
+
 // cuda buffer
 
 struct ggml_backend_cuda_buffer_context {
@@ -635,6 +663,7 @@ GGML_CALL bool ggml_backend_buffer_is_cuda(ggml_backend_buffer_t buffer) {
 
 GGML_CALL static void ggml_backend_cuda_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
+    z6_grafi_memoria_liberata(ctx->name.c_str(), buffer->size);
     delete ctx;
 }
 
@@ -2086,6 +2115,7 @@ GGML_CALL bool ggml_backend_cuda_host_register_pending(void) {
 }
 
 GGML_CALL static void ggml_backend_cuda_host_buffer_free_buffer(ggml_backend_buffer_t buffer) {
+    z6_grafi_memoria_liberata(GGML_CUDA_NAME "_Host", buffer->size);
     std::lock_guard<std::mutex> lock(z6_host_mutex);
     auto it = z6_host_ranges.find(buffer->context);
     GGML_ASSERT(it != z6_host_ranges.end());
@@ -2244,6 +2274,7 @@ static void * ggml_cuda_host_malloc(size_t size) {
 }
 
 GGML_CALL static void ggml_backend_cuda_host_buffer_free_buffer(ggml_backend_buffer_t buffer) {
+    z6_grafi_memoria_liberata(GGML_CUDA_NAME "_Host", buffer->size);
     CUDA_CHECK(cudaFreeHost(buffer->context));
     g_cuda_pinned_bytes -= std::min(g_cuda_pinned_bytes, buffer->size);
     g_cuda_pinned_count -= g_cuda_pinned_count > 0 ? 1 : 0;
@@ -3874,6 +3905,8 @@ GGML_CALL bool ggml_backend_cuda_z6_tp_register(const ggml_tensor * w, int64_t r
 static void z6_tp_release(z6_tp_entry & e) {
     ggml_cuda_set_device(e.remote);
     cudaStreamSynchronize(e.rctx->stream());
+    // the exchange nodes of the captured graphs copy through this pinned memory
+    z6_grafi_memoria_liberata("RAM pinned della TP", 0);
     if (e.hx) cudaFreeHost(e.hx);
     if (e.hy) cudaFreeHost(e.hy);
     if (e.ey) cudaEventDestroy(e.ey);
@@ -6278,6 +6311,32 @@ GGML_CALL static enum ggml_status ggml_backend_cuda_graph_compute_impl(ggml_back
         use_cuda_graph = false;
     }
 
+    // Z6 (GGML_Z6_GRAFI_EPOCA=1): a CUDA buffer was freed after this instance was captured. Its memcpy/memset nodes
+    // may hold the driver object of that allocation even when every address matches again: never launch or update
+    // it, capture and instantiate anew. Not counted as a consecutive update: the graph itself did not change.
+    bool z6_epoca_nuova = false;
+    if (use_cuda_graph && z6_grafi_epoca()) {
+        const uint64_t epoca = z6_grafi_epoca_memoria.load(std::memory_order_relaxed);
+        if (graph->z6_epoca != epoca && z6_grafi_epoca_livello() == 2) {
+            static int detti = 0;
+            if (graph->instance != nullptr && detti < 400) {
+                ++detti;
+                GGML_CUDA_LOG_INFO("z6 grafi diag: CUDA%d, istanza dell'epoca %llu usata all'epoca %llu, %d nodi, primo nodo %s (%s)\n",
+                        cuda_ctx->device, (unsigned long long) graph->z6_epoca, (unsigned long long) epoca, cgraph->n_nodes,
+                        cgraph->nodes[0]->name, ggml_op_name(cgraph->nodes[0]->op));
+            }
+            graph->z6_epoca = epoca;
+        } else if (graph->z6_epoca != epoca) {
+            if (graph->instance != nullptr) {
+                CUDA_CHECK(cudaGraphExecDestroy(graph->instance));
+                graph->instance = nullptr;
+                z6_epoca_nuova = true;
+            }
+            graph->uid = 0;   // no shortcut on the ggml graph id: properties compared and stored again
+            graph->z6_epoca = epoca;
+        }
+    }
+
     if (use_cuda_graph) {
         cuda_graph_update_required = is_cuda_graph_update_required(graph, cgraph);
 
@@ -6285,7 +6344,9 @@ GGML_CALL static enum ggml_status ggml_backend_cuda_graph_compute_impl(ggml_back
 
         // Disable CUDA graphs (from the next token) if the use-case is demanding too many consecutive graph updates.
         if (use_cuda_graph) {
-            if (cuda_graph_update_required) {
+            if (cuda_graph_update_required && z6_epoca_nuova) {
+                // forced by GGML_Z6_GRAFI_EPOCA: the counter stays where it was
+            } else if (cuda_graph_update_required) {
                 graph->number_consecutive_updates++;
             } else {
                 graph->number_consecutive_updates = 0;
@@ -6894,7 +6955,10 @@ GGML_CALL void * ggml_backend_cuda_z6_host_alloc(size_t bytes) {
     }
     return ptr;
 }
-GGML_CALL void ggml_backend_cuda_z6_host_free(void * ptr) { CUDA_CHECK(cudaFreeHost(ptr)); }
+GGML_CALL void ggml_backend_cuda_z6_host_free(void * ptr) {
+    z6_grafi_memoria_liberata("RAM pinned z6", 0);
+    CUDA_CHECK(cudaFreeHost(ptr));
+}
 GGML_CALL ggml_backend_event_t ggml_backend_cuda_z6_event_new(ggml_backend_t backend) {
     auto ctx = (ggml_backend_cuda_context *)backend->context;
     ggml_cuda_set_device(ctx->device);

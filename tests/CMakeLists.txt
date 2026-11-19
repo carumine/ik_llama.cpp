@@ -39,6 +39,12 @@ target_link_libraries(test-z6-iq3s-lut PRIVATE ggml Threads::Threads)
 if (GGML_CUDA)
     add_executable(test-z6-parallelo test-z6-parallelo.cpp)
     target_link_libraries(test-z6-parallelo PRIVATE common)
+    # grafo CUDA rilanciato dopo che il suo buffer è stato liberato e riallocato allo stesso indirizzo
+    # (GGML_Z6_GRAFI_EPOCA): una GPU, senza modello
+    add_executable(test-z6-grafi-epoca test-z6-grafi-epoca.cpp)
+    target_link_libraries(test-z6-grafi-epoca PRIVATE ggml)
+    add_executable(test-z6-grafi-tp test-z6-grafi-tp.cpp)
+    target_link_libraries(test-z6-grafi-tp PRIVATE ggml)
 endif()
 
 function(llama_build source)
