@@ -180,7 +180,22 @@ struct MulMat {
 #endif
         auto op = ggml_unary_op(unary_op);
         float tmp[k_x_step*16];
-        auto process = [&tmp, n, op, vx_gate, vx_up, gate_b, up_b, bx, xstep = k_x_step, limit, situ_beta, situ_beta_linear] (mul_mat_t func, const DataInfo& this_info, int ix, int this_nrc_x, int ny) {
+        // Z6 (GGML_Z6_PP_UG_LOCALE=1): gate, activation, up and their product are computed in a buffer on the stack
+        // and each row is copied to the destination once, at the end. As it is, every 64 bytes of the destination are
+        // written by the gate kernel, read back by the activation, written again by the up kernel and read and written
+        // by the product: the reads wait for the ownership of lines that are not in the cache (the destination of a
+        // 1024-token ubatch is 67 MB) and that for the second socket live on the other NUMA node. Same operations on
+        // the same values in the same order: same numbers. Only with more than one token per call (the prefill).
+        static const bool z6_locale = [] { const char * e = getenv("GGML_Z6_PP_UG_LOCALE"); return e && atoi(e) > 0; }();
+        float out[k_x_step*16];
+        auto process = [&tmp, &out, n, op, vx_gate, vx_up, gate_b, up_b, bx, xstep = k_x_step, limit, situ_beta, situ_beta_linear] (mul_mat_t func, const DataInfo& that_info, int ix, int this_nrc_x, int ny) {
+            const bool locale = z6_locale && ny > 1 && !that_info.tile;
+            DataInfo this_info = that_info;
+            if (locale) { this_info.tile = out; this_info.tile_bs = xstep; }
+            struct copia {
+                const DataInfo & vero; const float * out; int n, ny, xstep; bool attiva;
+                ~copia() { if (attiva) for (int ky = 0; ky < ny; ++ky) std::memcpy(vero.dst_row(ky), out + ky*xstep, n*sizeof(float)); }
+            } copia{that_info, out, this_nrc_x, ny, xstep, locale};
             func(n, (const void *)((const char *)vx_gate + ix*bx), bx, this_info, this_nrc_x);
             for (int ky = 0; ky < ny; ++ky) {
                 if (gate_b) {
@@ -1167,6 +1182,146 @@ extern "C" IQK_API bool iqk_moe_fused_up_gate(long Nx, long Ny, long ne00, int n
     auto gate_b = gate_b_c ? (const float *)gate_b_c + first_x : nullptr;
     mm.mul_mat_up_gate_NxM(ne00, (const char *)Aup + row_size_qx*first_x, (const char *)Agate + row_size_qx*first_x, row_size_qx,
             up_b, gate_b, info, nrc_x, Ny, unary_op, limit, situ_beta, situ_beta_linear);
+    return true;
+}
+
+// Z6 (GGML_Z6_PP_GEMELLI): the same rows of the same expert for two independent batches of tokens (two microbatches of
+// the prefill). The result of each batch is the one of its own call with ith = 0, nth = 1: same choice between the
+// direct kernel and the conversion (taken on the tokens of that batch alone), same tiles of rows, same kernels. When
+// both batches take the conversion to the same type, every tile is converted once and multiplied by both: at 1024
+// tokens the conversion is about half of the CPU time of the cold experts and nearly every expert is converted again
+// by every microbatch. In all the other cases the two calls run one after the other, as before.
+extern "C" IQK_API bool iqk_moe_fused_up_gate_gemelli(long Nx, long ne00, int ne11, int unary_op,
+        int typeA, const void * Aup, const void * Agate, long strideA,
+        int typeB, long strideB,
+        const char * up_b_c, const char * gate_b_c,
+        long Ny0, const void * B0, float * C0, const void * vrow_mapping0,
+        long Ny1, const void * B1, float * C1, const void * vrow_mapping1,
+        long nb1, long nb2, float limit, float situ_beta, float situ_beta_linear) {
+
+    const long         Ny[2]  = { Ny0, Ny1 };
+    const void *       B[2]   = { B0, B1 };
+    float *            C[2]   = { C0, C1 };
+    const void *       map[2] = { vrow_mapping0, vrow_mapping1 };
+
+    auto etypeA = ggml_type(typeA);
+    MulMat    mm[2];
+    ggml_type dq[2]     = { etypeA, etypeA };
+    bool      conv[2]   = { false, false };
+    bool      panel[2]  = { false, false };
+    for (int k = 0; k < 2; ++k) {
+        if (Ny[k] <= 0) continue;
+        dq[k] = z6_dequant_moe(etypeA, Ny[k]);
+        if (dq[k] != etypeA && MulMat::prepare(dq[k], typeB, ne00, mm[k], Ny[k])) {
+            panel[k] = z6_select_panel16(typeA, typeB, Ny[k], mm[k].funcs);
+            conv[k]  = true;
+        }
+    }
+    if (!(conv[0] && conv[1] && dq[0] == dq[1] && panel[0] == panel[1])) {
+        for (int k = 0; k < 2; ++k) {
+            if (Ny[k] <= 0) continue;
+            if (!iqk_moe_fused_up_gate(Nx, Ny[k], ne00, ne11, unary_op, typeA, Aup, Agate, strideA, typeB, B[k], strideB,
+                        up_b_c, gate_b_c, C[k], nb1, nb2, map[k], limit, situ_beta, situ_beta_linear, 0, 1)) return false;
+        }
+        return true;
+    }
+
+    constexpr int k_x_step = 64;   // the tile of iqk_moe_fused_up_gate
+
+    GGML_ASSERT(Nx%MulMat::num_rows(dq[0]) == 0);
+    const int nrc_x = int(Nx);
+    const size_t row_size_qx = ggml_row_size(dq[0], ne00);
+    const size_t row_size_qy = strideB;
+
+    DataInfo info[2] = {
+        { C[0], (const char *)B[0], size_t(nb1/sizeof(float)), row_size_qy, 0, ne11, (const mmid_row_mapping *)map[0], size_t(nb2/sizeof(float)) },
+        { C[1], (const char *)B[1], size_t(nb1/sizeof(float)), row_size_qy, 0, ne11, (const mmid_row_mapping *)map[1], size_t(nb2/sizeof(float)) },
+    };
+
+    auto& f = thread_local_work_buffer();
+
+    for (int ix = 0; ix < nrc_x; ix += k_x_step) {
+        int this_nrc_x = ix + k_x_step <= nrc_x ? k_x_step : nrc_x - ix;
+        if (f.size() < 2*row_size_qx*this_nrc_x) f.resize(2*row_size_qx*this_nrc_x);
+        auto Xu = f.data();
+        auto Xg = f.data() + row_size_qx*this_nrc_x;
+        if (!iqk_convert_repack(typeA, ne00, (const char *)Aup   + ix*strideA, strideA, Xu, ne00, this_nrc_x, panel[0])) {
+            GGML_ABORT("Fatal error");
+        }
+        if (!iqk_convert_repack(typeA, ne00, (const char *)Agate + ix*strideA, strideA, Xg, ne00, this_nrc_x, panel[0])) {
+            GGML_ABORT("Fatal error");
+        }
+        auto up_b   = up_b_c   ? (const float *)up_b_c + ix : nullptr;
+        auto gate_b = gate_b_c ? (const float *)gate_b_c + ix : nullptr;
+        for (int k = 0; k < 2; ++k) {
+            auto this_info = info[k];
+            this_info.s += ix;
+            mm[k].mul_mat_up_gate_NxM(ne00, Xu, Xg, row_size_qx, up_b, gate_b, this_info, this_nrc_x, Ny[k], unary_op, limit, situ_beta, situ_beta_linear);
+        }
+    }
+    return true;
+}
+
+// Z6 (GGML_Z6_PP_GEMELLI): like iqk_moe_fused_up_gate_gemelli, for iqk_mul_mat_moe (the down projection).
+extern "C" IQK_API bool iqk_mul_mat_moe_gemelli(long Nx, long ne00, int ne11,
+        int typeA, const void * A, long strideA,
+        int typeB, long strideB,
+        long Ny0, const void * B0, float * C0, const void * vrow_mapping0,
+        long Ny1, const void * B1, float * C1, const void * vrow_mapping1,
+        long nb1, long nb2) {
+
+    const long         Ny[2]  = { Ny0, Ny1 };
+    const void *       B[2]   = { B0, B1 };
+    float *            C[2]   = { C0, C1 };
+    const void *       map[2] = { vrow_mapping0, vrow_mapping1 };
+
+    auto etypeA = ggml_type(typeA);
+    MulMat    mm[2];
+    ggml_type dq[2]     = { etypeA, etypeA };
+    bool      conv[2]   = { false, false };
+    bool      panel[2]  = { false, false };
+    for (int k = 0; k < 2; ++k) {
+        if (Ny[k] <= 0) continue;
+        dq[k] = z6_dequant_moe(etypeA, Ny[k]);
+        if (dq[k] != etypeA && Nx%MulMat::num_rows(dq[k]) == 0 && MulMat::prepare(dq[k], typeB, ne00, mm[k], Ny[k])) {
+            panel[k] = z6_select_panel16(typeA, typeB, Ny[k], mm[k].funcs);
+            conv[k]  = true;
+        }
+    }
+    if (!(conv[0] && conv[1] && dq[0] == dq[1] && panel[0] == panel[1])) {
+        for (int k = 0; k < 2; ++k) {
+            if (Ny[k] <= 0) continue;
+            if (!iqk_mul_mat_moe(Nx, Ny[k], ne00, ne11, typeA, A, strideA, typeB, B[k], strideB,
+                        C[k], nb1, nb2, map[k], 0, 1)) return false;
+        }
+        return true;
+    }
+
+    const int k_x_step = z6_repack_tile();   // the tile of iqk_mul_mat_moe
+
+    const int nrc_x = int(Nx);
+    const size_t row_size_qx = ggml_row_size(dq[0], ne00);
+    const size_t row_size_qy = strideB;
+
+    DataInfo info[2] = {
+        { C[0], (const char *)B[0], size_t(nb1/sizeof(float)), row_size_qy, 0, ne11, (const mmid_row_mapping *)map[0], size_t(nb2/sizeof(float)) },
+        { C[1], (const char *)B[1], size_t(nb1/sizeof(float)), row_size_qy, 0, ne11, (const mmid_row_mapping *)map[1], size_t(nb2/sizeof(float)) },
+    };
+
+    auto& f = thread_local_work_buffer();
+
+    for (int ix = 0; ix < nrc_x; ix += k_x_step) {
+        int this_nrc_x = ix + k_x_step <= nrc_x ? k_x_step : nrc_x - ix;
+        if (f.size() < row_size_qx*this_nrc_x) f.resize(row_size_qx*this_nrc_x);
+        if (!iqk_convert_repack(typeA, ne00, (const char *)A + ix*strideA, strideA, f.data(), ne00, this_nrc_x, panel[0])) {
+            GGML_ABORT("Fatal error");
+        }
+        for (int k = 0; k < 2; ++k) {
+            auto this_info = info[k];
+            this_info.s += ix;
+            mm[k].mul_mat_NxM(ne00, f.data(), row_size_qx, this_info, this_nrc_x, Ny[k]);
+        }
+    }
     return true;
 }
 
@@ -2872,6 +3027,19 @@ extern "C" IQK_API bool iqk_moe_fused_up_gate(long /*Nx*/, long /*Ny*/, long /*n
         int /*typeB*/, const void * /*B*/, long /*strideB*/,
         float * /*C*/, long /*nb1*/, long /*nb2*/, const void * /*vrow_mapping*/, float,
         float, float, int /*ith*/, int /*nth*/) {
+    GGML_ABORT("Unsupported CPU. You may need to manually set compilation flags\n");
+    return false;
+}
+
+extern "C" IQK_API bool iqk_moe_fused_up_gate_gemelli(long, long, int, int, int, const void *, const void *, long, int, long,
+        const char *, const char *, long, const void *, float *, const void *, long, const void *, float *, const void *,
+        long, long, float, float, float) {
+    GGML_ABORT("Unsupported CPU. You may need to manually set compilation flags\n");
+    return false;
+}
+
+extern "C" IQK_API bool iqk_mul_mat_moe_gemelli(long, long, int, int, const void *, long, int, long,
+        long, const void *, float *, const void *, long, const void *, float *, const void *, long, long) {
     GGML_ABORT("Unsupported CPU. You may need to manually set compilation flags\n");
     return false;
 }
