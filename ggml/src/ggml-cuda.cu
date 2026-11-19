@@ -3505,6 +3505,23 @@ static __global__ void k_simple_gemm_T(int n, int nx, const src_t * x, const flo
     }
 }
 
+// Z6 (GGML_Z6_MMVQ_COLONNE=<9..16>, default spento): le matrici dense quantizzate restano su MMVQ fino a N colonne, a
+// lanci da 8 (vedi mmvq.cu), invece di passare a MMQ sopra 8. Serve alla verifica delle bozze da 8 token (9 colonne):
+// stessi kernel dei passi a un token e densi in parallelo (GGML_Z6_DENSA_TP) anche lì, bit a bit come senza divisione.
+// Rispetto a MMQ i numeri di quei batch cambiano: KLD e arena. Non tocca mul_mat_id né up/gate degli esperti.
+static int ggml_cuda_z6_mmvq_colonne(int cc) {
+    static const int v = [] {
+        const char * e = getenv("GGML_Z6_MMVQ_COLONNE");
+        const int n = e ? atoi(e) : 0;
+        if (n != 0 && (n < 9 || n > 16)) {
+            fprintf(stderr, "z6: GGML_Z6_MMVQ_COLONNE=%s fuori da 9-16, ignorata\n", e);
+            return 0;
+        }
+        return n;
+    }();
+    return std::max(v, ggml_cuda_mmvq_max_batch_size(cc));
+}
+
 static int ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
         const ggml_cgraph * cgraph, int node_n) {
 
@@ -3573,7 +3590,7 @@ static int ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor 
     bool          use_mul_mat_vec_q =  ggml_is_quantized(src0->type)
         && ggml_cuda_mmvq_type_supported(src0->type)
         && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
-        && src1->ne[1] <= ggml_cuda_mmvq_max_batch_size(cc);
+        && src1->ne[1] <= ggml_cuda_z6_mmvq_colonne(cc);
     bool              use_mul_mat_q =  ggml_is_quantized(src0->type) && !bad_padding_clear
         && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
 
@@ -3647,6 +3664,241 @@ static int ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor 
         ggml_cuda_op_mul_mat(ctx, src0, src1, dst, ggml_cuda_op_mul_mat_cublas, nullptr);
     }
     return node_n;
+}
+
+// Z6 (GGML_Z6_DENSA_TP=1): dense matrices split by rows over the two GPUs, see ggml_backend_cuda_z6_tp_register.
+// Everything stays inside the owner's op: no new scheduler piece and no host wait, so it is captured in the layer's
+// CUDA graph. The remote half joins through events; input and output travel through pinned RAM (the 3060s have no P2P,
+// and cudaMemcpyPeerAsync is refused inside a capture). Measured exchange: 54-56 us (z6/logs/sovrapposto-20261111).
+//
+// Up to 8 columns (MMVQ) each output row comes from the same kernel on the same input as the unsplit matrix, so the
+// result is bit-identical. From 9 to 16 columns the work goes to MMQ, whose stream-k partition cuts the sum of a tile
+// where the number of row tiles puts the cut: half the rows give other cuts and the last bits change. Those batches
+// stay on the unsplit path unless GGML_Z6_DENSA_TP_MMQ=1 (then KLD, not identity, is the gate).
+//
+// Consecutive mul_mat nodes on the same input (qkv and gate, or q, k and v) travel in one exchange: the exchange
+// costs as much as half of one of these matrices, so one per matrix would give back all the time the split saves.
+struct z6_tp_entry {
+    const ggml_tensor * w = nullptr;
+    int owner = -1, remote = -1;
+    int64_t r0 = 0, n = 0, k = 0;
+    ggml_tensor * w_r = nullptr, * x_r = nullptr, * y_r = nullptr, * y_l = nullptr;
+    float * hx = nullptr, * hy = nullptr;
+    float * hy_dev = nullptr;   // GGML_Z6_TP_MAPPATA: hy as the remote GPU sees it, nullptr when not mapped
+    cudaEvent_t ex = nullptr, ey = nullptr;
+    ggml_backend_cuda_context * rctx = nullptr;
+};
+static std::unordered_map<const void *, z6_tp_entry> & z6_tp_registry() {
+    static std::unordered_map<const void *, z6_tp_entry> m;
+    return m;
+}
+// one private context per remote device: its own stream and pool, never used by the scheduler. Its key in the
+// registry of contexts is private too, so it is never taken for the context of a model
+static ggml_backend_cuda_context * z6_tp_context(int device) {
+    static ggml_backend_cuda_context * c[GGML_CUDA_MAX_DEVICES] = {};
+    if (!c[device]) c[device] = new ggml_backend_cuda_context(device, c);
+    return c[device];
+}
+static bool z6_tp_mmq() {
+    static const bool v = [] { const char * e = getenv("GGML_Z6_DENSA_TP_MMQ"); return e && atoi(e) > 0; }();
+    return v;
+}
+// Z6 (GGML_Z6_TP_INGRESSO_S0=1): the owner copies the input of the group to pinned RAM on its own stream, before the
+// event the remote GPU waits for, instead of the remote stream reading the memory of the other device. Same bytes.
+static bool z6_tp_ingresso_s0() {
+    static const bool v = [] { const char * e = getenv("GGML_Z6_TP_INGRESSO_S0"); return e && atoi(e) > 0; }();
+    return v;
+}
+// Z6 (GGML_Z6_TP_MAPPATA=1): the pinned RAM of the remote rows is also mapped on the remote GPU and the MMVQ kernel
+// writes its rows straight there (one float per row), so the copy device -> RAM of the result leaves the exchange.
+// Up to 8 columns only (MMVQ); above, the result still goes through device memory. Same kernel, same values.
+static bool z6_tp_mappata() {
+    static const bool v = [] { const char * e = getenv("GGML_Z6_TP_MAPPATA"); return e && atoi(e) > 0; }();
+    return v;
+}
+static ggml_tensor z6_tp_cols(const ggml_tensor * t, int64_t ncols) {
+    ggml_tensor v = *t;
+    v.ne[1] = ncols;
+    v.nb[2] = v.nb[1]*ncols;
+    v.nb[3] = v.nb[2];
+    return v;
+}
+// x: the input already on the remote GPU (the buffer of the first matrix of the group)
+static void z6_tp_remote(z6_tp_entry & e, const ggml_tensor * x, int64_t nt, bool mappata = false) {
+    ggml_tensor xr = z6_tp_cols(x, nt), yr = z6_tp_cols(e.y_r, nt);
+    if (mappata) yr.data = e.hy_dev;   // same layout as y_r: (n - r0) rows per column
+    xr.op = GGML_OP_NONE; yr.op = GGML_OP_MUL_MAT;
+    yr.src[0] = e.w_r; yr.src[1] = &xr;
+    ggml_cuda_mul_mat(*e.rctx, e.w_r, &xr, &yr, nullptr, 0);
+}
+static bool z6_tp_on_device(const ggml_tensor * t, int device) {
+    return t->buffer && ggml_backend_buffer_is_cuda(t->buffer) &&
+        ((ggml_backend_cuda_buffer_context *) t->buffer->context)->device == device;
+}
+// the entry of node, when node is a mul_mat of a split matrix by src1 that this op can take
+static z6_tp_entry * z6_tp_find(ggml_backend_cuda_context & ctx, const ggml_tensor * node, const ggml_tensor * src1, int64_t nt_max) {
+    if (node->op != GGML_OP_MUL_MAT || node->src[1] != src1) return nullptr;
+    const ggml_tensor * src0 = node->src[0];
+    auto & reg = z6_tp_registry();
+    auto it = reg.find(src0->data);
+    if (it == reg.end()) return nullptr;
+    auto & e = it->second;
+    const int64_t nt = src1->ne[1];
+    if (e.owner != ctx.device || src0->type != e.w->type || src0->ne[0] != e.k || src0->ne[1] != e.n ||
+            src0->ne[2]*src0->ne[3] != 1 || !ggml_is_contiguous(src0) ||
+            nt < 1 || nt > nt_max || src1->type != GGML_TYPE_F32 || !ggml_is_contiguous(src1) || src1->ne[0] != e.k ||
+            src1->ne[2]*src1->ne[3] != 1 || !z6_tp_on_device(src1, ctx.device) ||
+            node->type != GGML_TYPE_F32 || !ggml_is_contiguous(node) || node->ne[0] != e.n || node->ne[1] != nt ||
+            node->ne[2]*node->ne[3] != 1 || !z6_tp_on_device(node, ctx.device)) {
+        return nullptr;
+    }
+    return &e;
+}
+static bool z6_tp_try(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const ggml_cgraph * cgraph, int & node_n) {
+    if (z6_tp_registry().empty()) return false;
+    const ggml_tensor * src1 = dst->src[1];
+    const int64_t nt_max = z6_tp_mmq() ? 16 : std::min(16, ggml_cuda_z6_mmvq_colonne(ggml_cuda_info().devices[ctx.device].cc));
+    z6_tp_entry * first = z6_tp_find(ctx, dst, src1, nt_max);
+    if (!first) return false;
+    const int64_t nt = src1->ne[1];
+    // the group: this node and the split matrices that follow it on the same input. The nodes in between do no work
+    // (the same ones ggml_cuda_mul_mat_q steps over when it shares the quantized input)
+    constexpr int max_group = 4;
+    z6_tp_entry * ge[max_group] = { first };
+    ggml_tensor * gd[max_group] = { dst };
+    int ng = 1, last = node_n;
+    for (int j = node_n + 1; cgraph && j < cgraph->n_nodes && ng < max_group; ++j) {
+        ggml_tensor * t = cgraph->nodes[j];
+        if (ggml_is_empty(t) || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_TRANSPOSE || t->op == GGML_OP_VIEW ||
+                t->op == GGML_OP_PERMUTE || t->op == GGML_OP_NONE) {
+            continue;
+        }
+        z6_tp_entry * e = z6_tp_find(ctx, t, src1, nt_max);
+        if (!e || e->remote != first->remote) break;
+        ge[ng] = e; gd[ng] = t; ++ng; last = j;
+    }
+    cudaStream_t s0 = ctx.stream();
+    cudaStream_t s1 = first->rctx->stream();
+    const size_t x_bytes = first->k*nt*sizeof(float);
+    // remote halves: wait for the input, bring it over once, multiply, send the rows back to pinned RAM
+    const bool ingresso_s0 = z6_tp_ingresso_s0();
+    if (ingresso_s0) CUDA_CHECK(cudaMemcpyAsync(first->hx, src1->data, x_bytes, cudaMemcpyDeviceToHost, s0));
+    CUDA_CHECK(cudaEventRecord(first->ex, s0));
+    ggml_cuda_set_device(first->remote);
+    CUDA_CHECK(cudaStreamWaitEvent(s1, first->ex, 0));
+    if (!ingresso_s0) CUDA_CHECK(cudaMemcpyAsync(first->hx, src1->data, x_bytes, cudaMemcpyDeviceToHost, s1));
+    CUDA_CHECK(cudaMemcpyAsync(first->x_r->data, first->hx, x_bytes, cudaMemcpyHostToDevice, s1));
+    for (int g = 0; g < ng; ++g) {
+        auto & e = *ge[g];
+        const bool mappata = e.hy_dev && nt <= 8;
+        z6_tp_remote(e, first->x_r, nt, mappata);
+        if (!mappata) CUDA_CHECK(cudaMemcpyAsync(e.hy, e.y_r->data, (e.n - e.r0)*nt*sizeof(float), cudaMemcpyDeviceToHost, s1));
+    }
+    CUDA_CHECK(cudaEventRecord(first->ey, s1));
+    ggml_cuda_set_device(ctx.device);
+    // local halves, meanwhile, on the first r0 rows of the same matrices
+    for (int g = 0; g < ng; ++g) {
+        auto & e = *ge[g];
+        const ggml_tensor * src0 = gd[g]->src[0];
+        ggml_tensor wl = *src0;
+        wl.ne[1] = e.r0;
+        wl.nb[2] = wl.nb[1]*e.r0;
+        wl.nb[3] = wl.nb[2];
+        if (nt == 1) {
+            ggml_tensor dl = *gd[g];
+            dl.ne[0] = e.r0;
+            dl.nb[1] = dl.nb[2] = dl.nb[3] = e.r0*sizeof(float);
+            dl.src[0] = &wl;
+            ggml_cuda_mul_mat(ctx, &wl, src1, &dl, nullptr, 0);
+        } else {
+            ggml_tensor yl = z6_tp_cols(e.y_l, nt);
+            yl.op = GGML_OP_MUL_MAT; yl.src[0] = &wl; yl.src[1] = const_cast<ggml_tensor *>(src1);
+            ggml_cuda_mul_mat(ctx, &wl, src1, &yl, nullptr, 0);
+            CUDA_CHECK(cudaMemcpy2DAsync(gd[g]->data, e.n*sizeof(float), yl.data, e.r0*sizeof(float),
+                    e.r0*sizeof(float), nt, cudaMemcpyDeviceToDevice, s0));
+        }
+    }
+    // join: the remote rows land after the local ones in every column
+    CUDA_CHECK(cudaStreamWaitEvent(s0, first->ey, 0));
+    for (int g = 0; g < ng; ++g) {
+        auto & e = *ge[g];
+        const int64_t nr = e.n - e.r0;
+        CUDA_CHECK(cudaMemcpy2DAsync((char *) gd[g]->data + e.r0*sizeof(float), e.n*sizeof(float), e.hy, nr*sizeof(float),
+                nr*sizeof(float), nt, cudaMemcpyHostToDevice, s0));
+    }
+    node_n = last;
+    return true;
+}
+
+GGML_CALL bool ggml_backend_cuda_z6_tp_register(const ggml_tensor * w, int64_t rows_local,
+        ggml_tensor * w_remote, ggml_tensor * x_remote, ggml_tensor * y_remote, ggml_tensor * y_local) {
+    if (!w || !w->buffer || !w_remote || !w_remote->buffer || !x_remote || !y_remote || !y_local) return false;
+    // only types with an MMVQ kernel: the others would fall to cuBLAS, where a row does depend on the other rows
+    if (!ggml_is_quantized(w->type) || !ggml_cuda_mmvq_type_supported(w->type) || z6_tp_registry().count(w->data)) return false;
+    z6_tp_entry e;
+    e.w = w;
+    e.owner  = ((ggml_backend_cuda_buffer_context *) w->buffer->context)->device;
+    e.remote = ((ggml_backend_cuda_buffer_context *) w_remote->buffer->context)->device;
+    if (e.owner == e.remote) return false;
+    e.r0 = rows_local; e.n = w->ne[1]; e.k = w->ne[0];
+    e.w_r = w_remote; e.x_r = x_remote; e.y_r = y_remote; e.y_l = y_local;
+    if (w_remote->ne[1] != e.n - e.r0 || x_remote->ne[0] != e.k || x_remote->ne[1] < 16 ||
+            y_remote->ne[0] != e.n - e.r0 || y_remote->ne[1] < 16 || y_local->ne[0] != e.r0 || y_local->ne[1] < 16) return false;
+    e.rctx = z6_tp_context(e.remote);
+    ggml_cuda_set_device(e.owner);
+    CUDA_CHECK(cudaEventCreateWithFlags(&e.ex, cudaEventDisableTiming));
+    ggml_cuda_set_device(e.remote);
+    CUDA_CHECK(cudaEventCreateWithFlags(&e.ey, cudaEventDisableTiming));
+    CUDA_CHECK(cudaHostAlloc((void **) &e.hx, e.k*16*sizeof(float), cudaHostAllocPortable));
+    CUDA_CHECK(cudaHostAlloc((void **) &e.hy, (e.n - e.r0)*16*sizeof(float),
+            z6_tp_mappata() ? cudaHostAllocPortable | cudaHostAllocMapped : cudaHostAllocPortable));
+    if (z6_tp_mappata()) {
+        // the current device is the remote one: its view of the pinned rows. Without it the exchange stays as it was
+        void * dev_ptr = nullptr;
+        if (cudaHostGetDevicePointer(&dev_ptr, e.hy, 0) == cudaSuccess && dev_ptr) {
+            e.hy_dev = (float *) dev_ptr;
+        } else {
+            (void) cudaGetLastError();
+            static bool detto = false;
+            if (!detto) { detto = true; fprintf(stderr, "z6 densa tp: RAM mappata non disponibile sulla GPU %d, GGML_Z6_TP_MAPPATA ignorata\n", e.remote); }
+        }
+    }
+    // warm the private pool (MMQ above 8 columns, MMVQ below) so no allocation happens inside a capture
+    for (int64_t nt : {16, 9, 8, 1}) z6_tp_remote(e, e.x_r, nt);
+    if (e.hy_dev) for (int64_t nt : {8, 1}) z6_tp_remote(e, e.x_r, nt, true);
+    CUDA_CHECK(cudaStreamSynchronize(e.rctx->stream()));
+    z6_tp_registry()[w->data] = e;
+    return true;
+}
+
+static void z6_tp_release(z6_tp_entry & e) {
+    ggml_cuda_set_device(e.remote);
+    cudaStreamSynchronize(e.rctx->stream());
+    if (e.hx) cudaFreeHost(e.hx);
+    if (e.hy) cudaFreeHost(e.hy);
+    if (e.ey) cudaEventDestroy(e.ey);
+    ggml_cuda_set_device(e.owner);
+    if (e.ex) cudaEventDestroy(e.ex);
+}
+
+GGML_CALL void ggml_backend_cuda_z6_tp_clear(void) {
+    auto & reg = z6_tp_registry();
+    for (auto & kv : reg) z6_tp_release(kv.second);
+    reg.clear();
+}
+
+// the types ggml_backend_cuda_z6_tp_register accepts, so the caller does not allocate a copy it cannot register
+GGML_CALL bool ggml_backend_cuda_z6_tp_type_ok(enum ggml_type type) {
+    return ggml_is_quantized(type) && ggml_cuda_mmvq_type_supported(type);
+}
+
+// one matrix only: the entries of another model stay
+GGML_CALL void ggml_backend_cuda_z6_tp_unregister(const ggml_tensor * w) {
+    auto & reg = z6_tp_registry();
+    auto it = w ? reg.find(w->data) : reg.end();
+    if (it == reg.end() || it->second.w != w) return;
+    z6_tp_release(it->second);
+    reg.erase(it);
 }
 
 struct mmid_row_mapping {
@@ -5119,7 +5371,7 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             if (dst->src[0]->ne[3] != dst->src[1]->ne[3]) {
                 GGML_CUDA_LOG_ERROR("%s: cannot compute %s: src0->ne[3] = %" PRId64 ", src1->ne[3] = %" PRId64 " - fallback to CPU\n", __func__, dst->name, dst->src[0]->ne[3], dst->src[1]->ne[3]);
                 return -1;
-            } else {
+            } else if (!z6_tp_try(ctx, dst, cgraph, i)) {
                 i = ggml_cuda_mul_mat(ctx, dst->src[0], dst->src[1], dst, cgraph, i);
             }
             break;
@@ -5660,7 +5912,23 @@ static bool check_node_graph_compatibility_and_refresh_copy_ops(ggml_cuda_graph 
             auto src0_1 = node->src[0];
             auto src0_2 = node->src[1];
             auto src1   = node->src[2];
-            if (src1->ne[1] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1 || src1->type != GGML_TYPE_F32 ||
+            // Z6 (GGML_Z6_GRAFI_CALDI_BATCH=1): with 2..8 tokens the fused up/gate (and the down product fused after it)
+            // runs the same per-token kernels as with one token, with the expert ids read on the device (the "Fast TG
+            // path" of ggml_cuda_moe_up_gate_unary): every launch is fixed by the shapes, so the split can be captured.
+            // Without this, each multi-token step (draft verification, MTP) launches these kernels one by one.
+            static const bool z6_grafi_batch = [] { const char * e = getenv("GGML_Z6_GRAFI_CALDI_BATCH"); return e && atoi(e) > 0; }();
+            auto z6_stessa_gpu = [&] {
+                for (const ggml_tensor * t : {(const ggml_tensor *)src0_1, (const ggml_tensor *)src0_2, (const ggml_tensor *)src1, (const ggml_tensor *)node}) {
+                    if (!t) continue;
+                    if (!t->buffer || !ggml_backend_buffer_is_cuda(t->buffer)) return false;
+                    if (((ggml_backend_cuda_buffer_context *)t->buffer->context)->device !=
+                        ((ggml_backend_cuda_buffer_context *)node->buffer->context)->device) return false;
+                }
+                return true;
+            };
+            const bool z6_pochi_token = z6_grafi_batch && src1->ne[1] == 1 && src1->ne[2] >= 2 && src1->ne[2] <= 8 &&
+                src1->ne[3] == 1 && z6_stessa_gpu();
+            if (((src1->ne[1] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1) && !z6_pochi_token) || src1->type != GGML_TYPE_F32 ||
                 !ggml_is_quantized(src0_1->type) || (src0_2 && !ggml_is_quantized(src0_2->type))) {
                 use_cuda_graph = false;
             } else {

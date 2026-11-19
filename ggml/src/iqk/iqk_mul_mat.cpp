@@ -286,6 +286,11 @@ struct MulMat {
         static const int n = [] { const char * e = getenv("GGML_Z6_IQ3S_CONV_MIN"); int v = e ? atoi(e) : 32; return v >= 8 ? v : 32; }();
         return n;
     }
+    // Z6, GGML_Z6_Q4K_CONV_MIN=<columns>: same for Q4_K and Q5_1 (both converted to Q8_1). Default 32, as before.
+    static inline int z6_q4k_conv_min() {
+        static const int n = [] { const char * e = getenv("GGML_Z6_Q4K_CONV_MIN"); int v = e ? atoi(e) : 32; return v >= 8 ? v : 32; }();
+        return n;
+    }
     static inline ggml_type is_dequant_better(ggml_type type, int nrc_y) {
         if (type == GGML_TYPE_F8_E4M3_KS) return nrc_y >= 32 ? GGML_TYPE_BF16 : type;
 #if defined __AVX2__ && !defined __AVX512F__
@@ -318,7 +323,7 @@ struct MulMat {
             case GGML_TYPE_Q2_K_R4: return nrc_y >= 32 ? q8_k_type : type;
             case GGML_TYPE_Q3_K   : return nrc_y >= 32 ? q8_k_type : type;
             case GGML_TYPE_Q3_K_R4: return nrc_y >= 32 ? q8_k_type : type;
-            case GGML_TYPE_Q4_K   : return nrc_y >= 32 ? GGML_TYPE_Q8_1    : type;
+            case GGML_TYPE_Q4_K   : return nrc_y >= z6_q4k_conv_min() ? GGML_TYPE_Q8_1    : type;
             case GGML_TYPE_Q4_K_R4: return nrc_y >= 32 ? q8_k_type : type;
             case GGML_TYPE_Q5_K   : return nrc_y >= 32 ? GGML_TYPE_Q8_1    : type;
             case GGML_TYPE_Q5_K_R4: return nrc_y >= 32 ? q8_k_type : type;
@@ -346,7 +351,7 @@ struct MulMat {
             case GGML_TYPE_IQ5_K_R4: return nrc_y >= 32 ? q8_k_type : type;
             case GGML_TYPE_IQ6_K  : return nrc_y >= k_min_nrc_y ? q8_k_type : type;
             case GGML_TYPE_Q4_1   : return nrc_y >= 32 ? GGML_TYPE_Q8_1    : type;
-            case GGML_TYPE_Q5_1   : return nrc_y >= 32 ? GGML_TYPE_Q8_1    : type;
+            case GGML_TYPE_Q5_1   : return nrc_y >= z6_q4k_conv_min() ? GGML_TYPE_Q8_1    : type;
 #ifdef HAVE_FANCY_SIMD
             case GGML_TYPE_Q4_0   : return nrc_y >= 32 ? GGML_TYPE_Q8_0_R16 : type;
             case GGML_TYPE_Q4_0_R8 : return nrc_y >= 128 ? GGML_TYPE_Q8_0_R16 : type;

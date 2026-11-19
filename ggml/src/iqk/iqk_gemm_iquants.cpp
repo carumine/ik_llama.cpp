@@ -738,6 +738,92 @@ struct DequantizerIQ3SZ6 final : public DequantizerIQ3S {
         sign_4_values(x[i].signs + 16*j, q8_quants);
     }
 };
+
+// Z6, GGML_TYPE_IQ3_S_Z6 (GGML_Z6_IQ3S_LUT=1): IQ3_S reordered at load time to 4 bits per weight, 3 for the
+// magnitude index and 1 for the sign (block_iq3_s_z6, 134 bytes instead of 110). 64 weights take one load and two
+// vpshufb instead of 16 gathered grid entries and a 64-bit sign mask: the gather was the limit of the single-column
+// kernel (32 indexed loads per 128 weights). The decoded bytes are those of DequantizerIQ3SZ6 in the same positions,
+// so the kernels built on this dequantizer return bit-identical results.
+struct DequantizerIQ3SLut final : public BaseDequantizer<block_iq3_s_z6> {
+    DequantizerIQ3SLut(const void * vx, size_t bx) : BaseDequantizer(vx, bx) {}
+
+    constexpr static int num_blocks = 8;
+    constexpr static int minv = 16;
+
+    IQK_ALWAYS_INLINE __m128i make_scales(int i, float& dd) const {
+        dd = GGML_FP16_TO_FP32(x[i].d);
+        uint32_t aux32[2];
+        std::memcpy(aux32, x[i].scales, 4);
+        aux32[1] = (aux32[0] >> 4) & 0x0f0f0f0f;
+        aux32[0] &= 0x0f0f0f0f;
+        auto scales8 = _mm_shuffle_epi8(_mm_loadl_epi64((const __m128i *)aux32), _mm_set1_epi64x(0x0703060205010400));
+        auto scales16 = _mm256_castsi256_si128(_mm256_cvtepi8_epi16(scales8));
+        return _mm_or_si128(_mm_slli_epi16(scales16, 1), _mm_set1_epi16(1));
+    }
+    IQK_ALWAYS_INLINE void new_block(int i, __m256i * scales) {
+        auto scales16 = make_scales(i, d);
+        scales[0] = MM256_SET1_M128I(scales16);
+    }
+    IQK_ALWAYS_INLINE float new_block(int i, __m256i * scales, __m256i& mins) {
+        auto scales16 = make_scales(i, d);
+        mins = scb.shuffle(scales16);
+        scales[0] = MM256_SET1_M128I(scales16);
+        return -minv*d;
+    }
+
+    // 64 weights: magnitudes of the low nibbles (weights 0..31) and of the high nibbles (weights 32..63)
+    static IQK_ALWAYS_INLINE void magnitudes(const __m256i raw, __m256i * values) {
+        const __m256i tab = _mm256_setr_epi8(1, 3, 5, 7, 9, 11, 13, 15, 1, 3, 5, 7, 9, 11, 13, 15,
+                                             1, 3, 5, 7, 9, 11, 13, 15, 1, 3, 5, 7, 9, 11, 13, 15);
+        const __m256i m15 = _mm256_set1_epi8(15);
+        values[0] = _mm256_shuffle_epi8(tab, _mm256_and_si256(raw, m15));
+        values[1] = _mm256_shuffle_epi8(tab, _mm256_and_si256(_mm256_srli_epi16(raw, 4), m15));
+    }
+    // 64 weights with their sign: what the Q8 conversion of the prefill stores
+    static IQK_ALWAYS_INLINE void signed_values(const __m256i raw, __m256i * values) {
+        const __m256i tab = _mm256_setr_epi8(1, 3, 5, 7, 9, 11, 13, 15, -1, -3, -5, -7, -9, -11, -13, -15,
+                                             1, 3, 5, 7, 9, 11, 13, 15, -1, -3, -5, -7, -9, -11, -13, -15);
+        const __m256i m15 = _mm256_set1_epi8(15);
+        values[0] = _mm256_shuffle_epi8(tab, _mm256_and_si256(raw, m15));
+        values[1] = _mm256_shuffle_epi8(tab, _mm256_and_si256(_mm256_srli_epi16(raw, 4), m15));
+    }
+    // signs moved to two vectors of 32 activations: bit 3 of the byte for the low nibbles, bit 7 for the high ones
+    static IQK_ALWAYS_INLINE void sign_2_values(const __m256i raw, __m256i * values) {
+        const __m256i m8 = _mm256_set1_epi8(8);
+        values[0] = _mm256_mask_sub_epi8(values[0], _mm256_test_epi8_mask(raw, m8), _mm256_setzero_si256(), values[0]);
+        values[1] = _mm256_mask_sub_epi8(values[1], _mm256_movepi8_mask(raw),       _mm256_setzero_si256(), values[1]);
+    }
+    IQK_ALWAYS_INLINE __m256i load(int i, int j, int h) const {
+        return _mm256_loadu_si256((const __m256i *)(x[i].nib + 64*j + 32*h));
+    }
+
+    // Kernels with 2 to 8 columns: signed value + 16, read straight from a table (16 +- magnitude).
+    IQK_ALWAYS_INLINE void prepare(int i, int j) {
+        const __m256i tab = _mm256_setr_epi8(17, 19, 21, 23, 25, 27, 29, 31, 15, 13, 11, 9, 7, 5, 3, 1,
+                                             17, 19, 21, 23, 25, 27, 29, 31, 15, 13, 11, 9, 7, 5, 3, 1);
+        const __m256i m15 = _mm256_set1_epi8(15);
+        for (int h = 0; h < 2; ++h) {
+            const __m256i raw = load(i, j, h);
+            bits.values[2*h+0] = _mm256_shuffle_epi8(tab, _mm256_and_si256(raw, m15));
+            bits.values[2*h+1] = _mm256_shuffle_epi8(tab, _mm256_and_si256(_mm256_srli_epi16(raw, 4), m15));
+        }
+    }
+    // Single column: magnitudes in bits.values, signs applied to the activations.
+    IQK_ALWAYS_INLINE void prepare(int i, int j, const Q8<1>& q8, __m256i * q8_quants) {
+        for (int k = 0; k < 4; ++k) q8_quants[k] = q8.load_quants(0, i, 4*j+k);
+        prepare(i, j, q8_quants);
+    }
+    IQK_ALWAYS_INLINE void prepare(int i, int j, __m256i * q8_quants) {
+        for (int h = 0; h < 2; ++h) {
+            const __m256i raw = load(i, j, h);
+            magnitudes(raw, bits.values + 2*h);
+            sign_2_values(raw, q8_quants + 2*h);
+        }
+    }
+
+    SimpleBits bits;
+    Scales8KBase scb;
+};
 #endif
 
 template <typename Bits>
@@ -3269,6 +3355,47 @@ void iqk_convert_iq3_s_q8_k_r8(int n, const void * vx, size_t bx, void * vy, int
     }
 }
 
+#ifdef HAVE_FANCY_SIMD
+// Z6, GGML_TYPE_IQ3_S_Z6: same Q8_K_R16 rows as iqk_convert_iq3_s_q8_k_r8 builds from the original IQ3_S block (the
+// signed values and the scales handed to the repacker are the same), with 4 loads and 8 vpshufb per block instead
+// of 8 gathers.
+void iqk_convert_iq3_s_z6_q8_k_r16(int n, const void * vx, size_t bx, void * vy, int nrc_x) {
+    constexpr int k_nr = 16;
+    GGML_ASSERT(n%QK_K == 0);
+    GGML_ASSERT(nrc_x%k_nr == 0);
+
+    int nb = n/QK_K;
+
+    const block_iq3_s_z6 * x8[k_nr];
+
+    block_q8_k_r16 * y = (block_q8_k_r16 *)vy;
+
+    int16_t ls[16];
+
+    Q8KRowRepacker<k_nr, 32> rp;
+    __m256i values[8];
+
+    for (int ix = 0; ix < nrc_x; ix += k_nr) {
+        for (int k = 0; k < k_nr; ++k) x8[k] = (const block_iq3_s_z6 *)((const char *)vx + (ix + k)*bx);
+        for (int i = 0; i < nb; ++i) {
+            for (int k = 0; k < k_nr; ++k) {
+                float d = GGML_FP16_TO_FP32(x8[k][i].d);
+                for (int h = 0; h < 4; ++h) {
+                    DequantizerIQ3SLut::signed_values(_mm256_loadu_si256((const __m256i *)(x8[k][i].nib + 32*h)), values + 2*h);
+                }
+                for (int ib32 = 0; ib32 < 8; ++ib32) {
+                    ls[2*ib32 + 0] = (2*((x8[k][i].scales[ib32/2] >> 4*(ib32%2)) & 0xf) + 1);
+                    ls[2*ib32 + 1] = ls[2*ib32 + 0];
+                }
+                rp.row(k, d, 1.f/127, values, ls, y[i].d, y[i].qs);
+            }
+            rp.flush(y[i].d, y[i].qs);
+        }
+        y += nb;
+    }
+}
+#endif
+
 void iqk_convert_iq3_s_r4_q8_k_r16(int n, const void * vx, size_t bx, void * vy, int nrc_x) {
 #ifdef HAVE_FANCY_SIMD
     constexpr int k_nr = 16;
@@ -3478,6 +3605,11 @@ bool iqk_set_kernels_iquants(int ne00, int typeA, int typeB, std::array<mul_mat_
 #endif
             set_functions<DequantizerIQ3S>(kernels);
             break;
+#ifdef HAVE_FANCY_SIMD
+        case GGML_TYPE_IQ3_S_Z6:
+            set_functions<DequantizerIQ3SLut>(kernels);
+            break;
+#endif
         case GGML_TYPE_IQ2_XXS_R4:
             IQK_SET_MUL_MAT_FUNCTIONS(mul_mat_iq2_xxs_r4_q8_k, kernels);
             func16 = mul_mat_iq2_xxs_r4_q8_k<16>;
@@ -3522,6 +3654,9 @@ bool iqk_convert_iquants_q80_r8(int type, int n, const void * vx, size_t bx, voi
         case GGML_TYPE_IQ3_XXS: iqk_convert_iq3_xxs_q8_k_r8(n, vx, bx, vy, nrc_x); break;
         case GGML_TYPE_IQ3_XXS_R4: iqk_convert_iq3_xxs_r4_q8_k_r16(n, vx, bx, vy, nrc_x); break;
         case GGML_TYPE_IQ3_S  : iqk_convert_iq3_s_q8_k_r8  (n, vx, bx, vy, nrc_x); break;
+#ifdef HAVE_FANCY_SIMD
+        case GGML_TYPE_IQ3_S_Z6: iqk_convert_iq3_s_z6_q8_k_r16(n, vx, bx, vy, nrc_x); break;
+#endif
         case GGML_TYPE_IQ3_S_R4: iqk_convert_iq3_s_r4_q8_k_r16(n, vx, bx, vy, nrc_x); break;
         default: return false;
     }

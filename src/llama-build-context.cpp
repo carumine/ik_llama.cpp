@@ -136,6 +136,8 @@ void llm_build_context::init() {
         lctx.inp_kpool_ape_slots = nullptr;
         lctx.inp_msa_cells       = nullptr;
         lctx.inp_msa_bias        = nullptr;
+        lctx.inp_kpool_win_cells = nullptr;
+        lctx.inp_kpool_win_pools = nullptr;
         lctx.inp_mtp_carry     = nullptr;
         lctx.inp_qsa.clear();
         lctx.z6_mask_append = {};

@@ -57,6 +57,19 @@ static ggml_tensor * glm5next_build_hc_pre(
 // the member keys) and returns top-k cell indices [n_sel*kpool, n_tokens] into the KV cache,
 // or nullptr for the dense fallback. The kr_l cache holds [key; gate] per token (2*d wide).
 
+// Z6 (GGML_Z6_DSA_CONCAT_GPU=1): CUDA has no I32 concat, so the scheduler sent these to the CPU (two more pieces per
+// MLA layer). Read the indices as F32 bits for the concat: it only copies 32-bit words, as qwen4exp already does for pad
+static ggml_tensor * glm5next_concat_i32(ggml_context * ctx0, ggml_tensor * a, ggml_tensor * b, int dim) {
+    static const bool z6_gpu = [] { const char * e = getenv("GGML_Z6_DSA_CONCAT_GPU"); return e && atoi(e) > 0; }();
+    if (!z6_gpu || a->type != GGML_TYPE_I32 || b->type != GGML_TYPE_I32 || !ggml_is_contiguous(a) || !ggml_is_contiguous(b)) {
+        return ggml_concat(ctx0, a, b, dim);
+    }
+    auto af = ggml_reshape_4d_ext(ctx0, a, GGML_TYPE_F32, a->ne[0], a->ne[1], a->ne[2], a->ne[3]);
+    auto bf = ggml_reshape_4d_ext(ctx0, b, GGML_TYPE_F32, b->ne[0], b->ne[1], b->ne[2], b->ne[3]);
+    auto cf = ggml_concat(ctx0, af, bf, dim);
+    return ggml_reshape_4d_ext(ctx0, cf, GGML_TYPE_I32, cf->ne[0], cf->ne[1], cf->ne[2], cf->ne[3]);
+}
+
 static ggml_tensor * build_glm5next_dsa_top_k(
         llm_build_context & llm,
         ggml_cgraph * gf, int il,
@@ -111,16 +124,21 @@ static ggml_tensor * build_glm5next_dsa_top_k(
     auto all = ggml_view_2d(ctx0, kv_self.kr_l[il], 2 * d, n_kv, kr_row, 0);
     cb(all, "dsa_cached_all", il);
 
+    // from kp_l. Same operators, row by row, on the same member rows: the cached keys are the ones recomputed today
+    ggml_tensor * kp_cache = il < (int) kv_self.kp_l.size() ? kv_self.kp_l[il] : nullptr;
+    const bool z6_win = kp_cache && lctx.inp_kpool_win_cells && lctx.inp_kpool_win_pools;
+    const int64_t n_built = z6_win ? lctx.inp_kpool_win_pools->ne[0] : n_pool;
+
     // ---- gather pool members: pool_cells indexes which cells belong to each pool ----
     // pool_cells is 1D [r*n_pool]: membership depends on cache positions, shared across all query tokens
-    auto members = ggml_get_rows(ctx0, all, pool_cells);     // [2*d, r*n_pool]
-    members = ggml_reshape_3d(ctx0, members, 2 * d, r, n_pool);
+    auto members = ggml_get_rows(ctx0, all, z6_win ? lctx.inp_kpool_win_cells : pool_cells);     // [2*d, r*n_built]
+    members = ggml_reshape_3d(ctx0, members, 2 * d, r, n_built);
     cb(members, "dsa_pool_members", il);
 
-    // split into keys [d, r, n_pool] and gates [d, r, n_pool] (packed along dim 0)
-    auto m_k = ggml_cont(ctx0, ggml_view_3d(ctx0, members, d, r, n_pool,
+    // split into keys [d, r, n_built] and gates [d, r, n_built] (packed along dim 0)
+    auto m_k = ggml_cont(ctx0, ggml_view_3d(ctx0, members, d, r, n_built,
             members->nb[1], members->nb[2], 0));
-    auto m_g = ggml_cont(ctx0, ggml_view_3d(ctx0, members, d, r, n_pool,
+    auto m_g = ggml_cont(ctx0, ggml_view_3d(ctx0, members, d, r, n_built,
             members->nb[1], members->nb[2], ggml_row_size(members->type, d)));
     cb(m_k, "dsa_pool_k", il);
     cb(m_g, "dsa_pool_g", il);
@@ -134,7 +152,13 @@ static ggml_tensor * build_glm5next_dsa_top_k(
     auto v = ggml_cont(ctx0, ggml_permute(ctx0, m_k, 1, 0, 2, 3));
     auto pooled = ggml_sum_rows(ctx0, ggml_mul(ctx0, v, w));
     pooled = ggml_cont(ctx0, ggml_permute(ctx0, pooled, 1, 0, 2, 3));
-    pooled = ggml_reshape_2d(ctx0, pooled, d, n_pool);
+    pooled = ggml_reshape_2d(ctx0, pooled, d, n_built);
+    if (z6_win) {
+        // score against the scatter's result, so the read depends on the write
+        auto kp_all = ggml_set_rows(ctx0, kp_cache, pooled, lctx.inp_kpool_win_pools);
+        cb(kp_all, "dsa_pool_scatter", il);
+        pooled = ggml_view_2d(ctx0, kp_all, d, n_pool, kp_all->nb[1], 0);
+    }
     cb(pooled, "dsa_indexer_k_pooled", il);
 
     // ---- indexer query (nope-only: no rope) ----
@@ -196,7 +220,7 @@ static ggml_tensor * build_glm5next_dsa_top_k(
             sc = ggml_add(ctx0, sc, pb_c);
 
             auto sel_c = ggml_cont(ctx0, ggml_top_k(ctx0, sc, n_sel));   // [n_sel, tc]
-            sel = sel == nullptr ? sel_c : ggml_concat(ctx0, sel, sel_c, 1);
+            sel = sel == nullptr ? sel_c : glm5next_concat_i32(ctx0, sel, sel_c, 1);
         }
         cb(sel, "dsa_top_k_pools", il);
     }
@@ -211,7 +235,7 @@ static ggml_tensor * build_glm5next_dsa_top_k(
     // index_kpool_always_select_tail: the trailing incomplete pool has no pool key and can
     // never be picked above, so its cells are appended instead of taking pool budget
     if (tail_cells) {
-        top_k = ggml_concat(ctx0, top_k, tail_cells, 0);
+        top_k = glm5next_concat_i32(ctx0, top_k, tail_cells, 0);
     }
     cb(top_k, "dsa_top_k", il);
 
@@ -568,6 +592,18 @@ ggml_cgraph * llm_build_context::build_glm5next() {
                 tail_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, r - 1, n_tokens);
                 ggml_set_input(tail_cells);
                 lctx.inp_kpool_tail = tail_cells;
+            }
+            // n_tokens/r pools, plus one when the run straddles a boundary
+            if (!lctx.kv_self.kp_l.empty()) {
+                const int64_t n_win_stretta = std::min<int64_t>(n_pool, (n_tokens + r - 1) / r + 1);
+                const int64_t n_win = lctx.qsa_pooled_stale ? n_pool : n_win_stretta;
+                if (!worst_case) lctx.z6_kpool_win_piena = n_win > n_win_stretta;
+                lctx.inp_kpool_win_cells = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, r * n_win);
+                lctx.inp_kpool_win_pools = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_win);
+                ggml_set_input(lctx.inp_kpool_win_cells);
+                ggml_set_input(lctx.inp_kpool_win_pools);
+                cb(lctx.inp_kpool_win_cells, "inp_kpool_win_cells", -1);
+                cb(lctx.inp_kpool_win_pools, "inp_kpool_win_pools", -1);
             }
             cb(pool_cells, "inp_kpool_cells", -1);
             cb(pool_bias,  "inp_kpool_bias",  -1);
