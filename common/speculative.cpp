@@ -2252,6 +2252,15 @@ bool common_speculative_prepare_mtp_runtime(
     params.cparams_dft.mtp_op_type = MTP_OP_WARMUP;
     params.cparams_dft.embeddings  = true;
 
+    // Z6 (IK_Z6_MTP_DENSA=1): the MTP context keeps dense attention when the target runs --dsa. With --dsa it would
+    // inherit the indexer without the pool cache (not allocated for the tail layer), rebuild every pool over n_kv at
+    // each step and never reuse its graph. The MTP layer only proposes: its attention changes the acceptance, not
+    // the text the target verifies
+    if (const char * e = getenv("IK_Z6_MTP_DENSA"); e && atoi(e) > 0 && params.cparams_dft.dsa) {
+        LOG_INF("%s: z6 MTP context with dense attention (target --dsa)\n", __func__);
+        params.cparams_dft.dsa = false;
+    }
+
     // Z6 (IK_Z6_MTP_UBATCH=<n>): microbatch of the MTP context only. Its compute buffer is reserved for the microbatch
     // of the target (432 MiB on CUDA1 with 1024 on GLM-5.3-Flash), but the context runs one layer: the warmup of a
     // prompt in smaller pieces costs little and the buffer shrinks with n. The batch size stays as it is, so the
